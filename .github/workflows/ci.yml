@@ -68,3 +68,40 @@ jobs:
             target/release/${{ matrix.ide_bin }}
             target/release/${{ matrix.tui_bin }}
           if-no-files-found: error
+
+  # Attaches the three platforms' binaries to an actual GitHub Release for
+  # this tag -- the `artifacts` job above only produces workflow-run
+  # artifacts, which need Actions UI/API access and expire; a release
+  # asset is a permanent, directly downloadable link.
+  release:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+      - name: Rename each platform's binaries so they don't collide once flattened into one release
+        run: |
+          set -euo pipefail
+          cd dist
+          for dir in ide-windows-*/ ide-macos-*/ ide-linux-*/; do
+            d="${dir%/}"
+            case "$d" in
+              ide-windows-*) platform=windows; ext=.exe ;;
+              ide-macos-*) platform=macos; ext= ;;
+              ide-linux-*) platform=linux; ext= ;;
+            esac
+            mv "$d/ide$ext" "$d/ide-$platform$ext"
+            mv "$d/ide-tui$ext" "$d/ide-tui-$platform$ext"
+            chmod +x "$d/ide-$platform$ext" "$d/ide-tui-$platform$ext"
+          done
+      - name: Create the release and upload all six binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            dist/*/ide-*
