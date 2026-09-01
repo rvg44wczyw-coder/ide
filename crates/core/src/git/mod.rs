@@ -64,6 +64,15 @@ pub const MAX_DIFF_LINES: usize = 20_000;
 /// silently stops at that many nodes — no separate truncation flag.
 pub const MAX_DIFF_FILES: usize = 2_000;
 
+/// Safety bound on how many commits `commit_graph`/`file_history`'s
+/// revwalk will *visit* while evaluating a filter, independent of
+/// `limit` (which bounds *matches*) -- see `git-log-viewer.md` §2.1.
+/// Without this, a narrow filter (or a `file_history` path that stopped
+/// appearing early in a long history) would walk the entire commit graph
+/// every call. Same "bound the other unbounded axis" reasoning as
+/// `MAX_DIFF_FILES` above, for a different axis.
+pub const MAX_COMMITS_SCANNED: usize = 200_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     pub old_path: Option<PathBuf>,
@@ -109,6 +118,34 @@ pub struct CommitNode {
     pub author: String,
     pub timestamp: i64,
     pub parents: Vec<String>,
+}
+
+/// Combinable filter for `GitRepo::commit_graph` (`git-log-viewer.md`
+/// §2.1). Every `Some` field is ANDed together;
+/// `CommitLogFilter::default()` matches every commit (walking from
+/// `HEAD`, same as the unfiltered graph).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitLogFilter {
+    /// Local branch name to walk from instead of `HEAD`. `None` means
+    /// `HEAD` -- this changes the walk's *starting point*, not a
+    /// post-hoc filter.
+    pub branch: Option<String>,
+    /// Case-insensitive substring match against the commit author's name
+    /// *or* email (either matching is enough).
+    pub author: Option<String>,
+    /// Repository-relative path. A commit matches if its diff against its
+    /// first parent (root commits: against an empty tree) touches this
+    /// exact path -- not a prefix/directory match, not rename-aware (see
+    /// `GitRepo::file_history` for the rename-following version).
+    pub path: Option<PathBuf>,
+    /// Inclusive lower bound, Unix seconds, compared against
+    /// `CommitNode::timestamp` (commit time, not author time).
+    pub since: Option<i64>,
+    /// Inclusive upper bound, Unix seconds.
+    pub until: Option<i64>,
+    /// Case-insensitive substring match against the commit's full message
+    /// (summary + body, i.e. the same text `git log --grep` searches).
+    pub query: Option<String>,
 }
 
 /// Full detail for one commit -- a superset of `CommitNode`, kept as its
@@ -315,10 +352,17 @@ impl GitRepo {
         Ok(files)
     }
 
-    /// Commit graph reachable from `HEAD`, newest first, capped at
-    /// `limit` commits. Empty (not an error) for a repository with no
-    /// commits yet.
-    pub fn commit_graph(&self, limit: usize) -> Result<Vec<CommitNode>, GitError> {
+    /// Commit graph reachable from `filter.branch` (or `HEAD` if `None`),
+    /// newest first, matching every `Some` field of `filter`, capped at
+    /// `limit` *matching* commits (visits at most `MAX_COMMITS_SCANNED`
+    /// commits regardless of how many match). Empty (not an error) for a
+    /// repository with no commits yet, or for a filter matching nothing.
+    /// `git-log-viewer.md` §2.1/§3.1.
+    pub fn commit_graph(
+        &self,
+        limit: usize,
+        filter: &CommitLogFilter,
+    ) -> Result<Vec<CommitNode>, GitError> {
         // A brand-new repository has no commit for HEAD to resolve to at
         // all — libgit2 reports this in ways that vary (an unborn-branch
         // error, or a plain "reference not found" for whatever the
@@ -329,38 +373,138 @@ impl GitRepo {
             return Ok(Vec::new());
         }
         let mut revwalk = self.repo.revwalk()?;
+        match &filter.branch {
+            Some(name) => {
+                let branch = self.repo.find_branch(name, git2::BranchType::Local)?;
+                let oid = branch
+                    .get()
+                    .target()
+                    .ok_or_else(|| git2::Error::from_str("branch has no target"))?;
+                revwalk.push(oid)?;
+            }
+            None => revwalk.push_head()?,
+        }
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+
+        let target_path = filter.path.as_ref().map(|p| normalize(p));
+        let author_query = filter.author.as_ref().map(|a| a.to_lowercase());
+        let message_query = filter.query.as_ref().map(|q| q.to_lowercase());
+
+        let mut nodes = Vec::new();
+        for oid in revwalk.take(MAX_COMMITS_SCANNED) {
+            if nodes.len() >= limit {
+                break;
+            }
+            let oid = oid?;
+            let commit = self.repo.find_commit(oid)?;
+            let timestamp = commit.time().seconds();
+            if filter.since.is_some_and(|since| timestamp < since) {
+                continue;
+            }
+            if filter.until.is_some_and(|until| timestamp > until) {
+                continue;
+            }
+            if let Some(query) = &author_query {
+                let signature = commit.author();
+                let name = signature.name().ok().unwrap_or_default().to_lowercase();
+                let email = signature.email().ok().unwrap_or_default().to_lowercase();
+                if !name.contains(query.as_str()) && !email.contains(query.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(query) = &message_query {
+                let message = commit.message().ok().unwrap_or_default().to_lowercase();
+                if !message.contains(query.as_str()) {
+                    continue;
+                }
+            }
+            if let Some(target) = &target_path {
+                if !self.commit_touches_path(&commit, target)? {
+                    continue;
+                }
+            }
+            nodes.push(commit_node(&commit, oid));
+        }
+        Ok(nodes)
+    }
+
+    /// `path`'s repository-relative diff against its first parent (empty
+    /// tree for a root commit), tested for membership only -- no line
+    /// content is built, unlike `diff_commit`/`diff_file`. Used by
+    /// `commit_graph`'s `path` filter (`git-log-viewer.md` §3.1: this is
+    /// deliberately *not* rename-aware -- `file_history` is the
+    /// rename-following counterpart).
+    fn commit_touches_path(&self, commit: &git2::Commit, target: &Path) -> Result<bool, GitError> {
+        let tree = commit.tree()?;
+        let parent_tree = match commit.parent(0) {
+            Ok(parent) => Some(parent.tree()?),
+            Err(_) => None,
+        };
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        Ok(diff
+            .deltas()
+            .any(|d| d.old_file().path() == Some(target) || d.new_file().path() == Some(target)))
+    }
+
+    /// History of `path` (repository-relative), newest first, following
+    /// renames the same way `git log --follow` does: each visited
+    /// commit's diff against its parent is inspected with rename
+    /// detection enabled, and if the currently-tracked path appears as
+    /// either side of a changed entry, that commit is included; if this
+    /// commit is where a rename happened, the tracked path becomes that
+    /// entry's *old* path for the rest of the (older-going) walk. Always
+    /// walks from `HEAD` -- no `branch`/other-filter composition
+    /// (`git-log-viewer.md` §3.3). Capped at `limit` matches and
+    /// `MAX_COMMITS_SCANNED` visits, same two-cap shape as
+    /// `commit_graph`. `Ok(vec![])` for a path never present in any
+    /// commit reachable from `HEAD` (not an error).
+    pub fn file_history(
+        &self,
+        path: impl AsRef<Path>,
+        limit: usize,
+    ) -> Result<Vec<CommitNode>, GitError> {
+        if self.repo.head().is_err() {
+            return Ok(Vec::new());
+        }
+        let mut revwalk = self.repo.revwalk()?;
         revwalk.push_head()?;
         revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
 
+        let mut tracked = normalize(path.as_ref());
         let mut nodes = Vec::new();
-        for oid in revwalk.take(limit) {
+        for oid in revwalk.take(MAX_COMMITS_SCANNED) {
+            if nodes.len() >= limit {
+                break;
+            }
             let oid = oid?;
             let commit = self.repo.find_commit(oid)?;
-            // Display-only fields degrade to a fallback instead of failing
-            // the whole graph over one commit with unusual (non-UTF-8)
-            // metadata — id/parents (used for selection and edges) always
-            // come from `Oid`, which never has this problem.
-            let short_id = commit
-                .as_object()
-                .short_id()
-                .ok()
-                .and_then(|buf| buf.as_str().ok().map(str::to_string))
-                .unwrap_or_else(|| oid.to_string());
-            let summary = commit
-                .summary()
-                .ok()
-                .flatten()
-                .unwrap_or_default()
-                .to_string();
-            let author = commit.author().name().ok().unwrap_or_default().to_string();
-            nodes.push(CommitNode {
-                id: oid.to_string(),
-                short_id,
-                summary,
-                author,
-                timestamp: commit.time().seconds(),
-                parents: commit.parent_ids().map(|id| id.to_string()).collect(),
+            let tree = commit.tree()?;
+            let parent_tree = match commit.parent(0) {
+                Ok(parent) => Some(parent.tree()?),
+                Err(_) => None,
+            };
+            let mut diff = self
+                .repo
+                .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+            let mut find_opts = git2::DiffFindOptions::new();
+            find_opts.renames(true);
+            diff.find_similar(Some(&mut find_opts))?;
+
+            let matched = diff.deltas().find(|d| {
+                d.new_file().path() == Some(tracked.as_path())
+                    || d.old_file().path() == Some(tracked.as_path())
             });
+            let Some(delta) = matched else {
+                continue;
+            };
+            nodes.push(commit_node(&commit, oid));
+            if delta.status() == git2::Delta::Renamed {
+                if let Some(old_path) = delta.old_file().path() {
+                    tracked = old_path.to_path_buf();
+                }
+            }
         }
         Ok(nodes)
     }
@@ -1281,6 +1425,34 @@ fn normalize(path: &Path) -> PathBuf {
     PathBuf::from(path.to_string_lossy().replace('\\', "/"))
 }
 
+/// Shared `CommitNode` construction for `commit_graph`/`file_history` --
+/// same display-only-fields-degrade-to-a-fallback reasoning either way
+/// (a commit with unusual, non-UTF-8 metadata shouldn't fail the whole
+/// call over one row).
+fn commit_node(commit: &git2::Commit, oid: git2::Oid) -> CommitNode {
+    let short_id = commit
+        .as_object()
+        .short_id()
+        .ok()
+        .and_then(|buf| buf.as_str().ok().map(str::to_string))
+        .unwrap_or_else(|| oid.to_string());
+    let summary = commit
+        .summary()
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .to_string();
+    let author = commit.author().name().ok().unwrap_or_default().to_string();
+    CommitNode {
+        id: oid.to_string(),
+        short_id,
+        summary,
+        author,
+        timestamp: commit.time().seconds(),
+        parents: commit.parent_ids().map(|id| id.to_string()).collect(),
+    }
+}
+
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
 }
@@ -1683,7 +1855,10 @@ mod tests {
     fn commit_graph_empty_repo_returns_empty() {
         let (dir, _repo) = init_repo();
         let git = GitRepo::open(dir.path()).unwrap();
-        assert_eq!(git.commit_graph(100).unwrap(), Vec::new());
+        assert_eq!(
+            git.commit_graph(100, &CommitLogFilter::default()).unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
@@ -1693,7 +1868,7 @@ mod tests {
         let second = commit_file(&repo, "f.txt", "two\n", "second");
 
         let git = GitRepo::open(dir.path()).unwrap();
-        let graph = git.commit_graph(100).unwrap();
+        let graph = git.commit_graph(100, &CommitLogFilter::default()).unwrap();
 
         assert_eq!(graph.len(), 2);
         assert_eq!(graph[0].id, second.to_string());
@@ -1710,7 +1885,386 @@ mod tests {
             commit_file(&repo, "f.txt", &format!("v{i}\n"), &format!("commit {i}"));
         }
         let git = GitRepo::open(dir.path()).unwrap();
-        assert_eq!(git.commit_graph(2).unwrap().len(), 2);
+        assert_eq!(
+            git.commit_graph(2, &CommitLogFilter::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    fn commit_file_as(
+        repo: &Repository,
+        path: &str,
+        content: &str,
+        message: &str,
+        name: &str,
+        email: &str,
+    ) -> git2::Oid {
+        let workdir = repo.workdir().unwrap();
+        fs::write(workdir.join(path), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(path)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = Signature::now(name, email).unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.as_ref().into_iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .unwrap()
+    }
+
+    fn commit_file_at(
+        repo: &Repository,
+        path: &str,
+        content: &str,
+        message: &str,
+        timestamp: i64,
+    ) -> git2::Oid {
+        let workdir = repo.workdir().unwrap();
+        fs::write(workdir.join(path), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(path)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = Signature::new(
+            "Test User",
+            "test@example.com",
+            &git2::Time::new(timestamp, 0),
+        )
+        .unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.as_ref().into_iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .unwrap()
+    }
+
+    fn rename_file(repo: &Repository, old: &str, new: &str, message: &str) -> git2::Oid {
+        let workdir = repo.workdir().unwrap();
+        let content = fs::read(workdir.join(old)).unwrap();
+        fs::remove_file(workdir.join(old)).unwrap();
+        fs::write(workdir.join(new), &content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new(old)).unwrap();
+        index.add_path(Path::new(new)).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = sig();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&parent],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn commit_graph_filters_by_author_name_substring_case_insensitive() {
+        let (dir, repo) = init_repo();
+        commit_file_as(
+            &repo,
+            "f.txt",
+            "one\n",
+            "first",
+            "Alice Adams",
+            "alice@x.com",
+        );
+        let bob = commit_file_as(&repo, "f.txt", "two\n", "second", "Bob Brown", "bob@x.com");
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let filter = CommitLogFilter {
+            author: Some("BOB".to_string()),
+            ..Default::default()
+        };
+        let graph = git.commit_graph(100, &filter).unwrap();
+
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0].id, bob.to_string());
+    }
+
+    #[test]
+    fn commit_graph_filters_by_author_email_substring_when_name_does_not_match() {
+        let (dir, repo) = init_repo();
+        let target = commit_file_as(
+            &repo,
+            "f.txt",
+            "one\n",
+            "first",
+            "Alice Adams",
+            "carol@example.com",
+        );
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let filter = CommitLogFilter {
+            author: Some("carol@".to_string()),
+            ..Default::default()
+        };
+        let graph = git.commit_graph(100, &filter).unwrap();
+
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0].id, target.to_string());
+    }
+
+    #[test]
+    fn commit_graph_filters_by_exact_path_not_rename_aware() {
+        let (dir, repo) = init_repo();
+        let a = commit_file(&repo, "a.txt", "one\n", "touch a");
+        commit_file(&repo, "b.txt", "two\n", "touch b");
+        let renamed = rename_file(&repo, "a.txt", "c.txt", "rename a to c");
+
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let filter_a = CommitLogFilter {
+            path: Some(PathBuf::from("a.txt")),
+            ..Default::default()
+        };
+        // The rename commit itself touches "a.txt" (as the deleted side of
+        // a delete+add pair without rename detection enabled), so it
+        // matches too -- but no earlier-renamed-from-a.txt commit does,
+        // since plain `path` filtering isn't rename-aware (§3.1).
+        let graph_a = git.commit_graph(100, &filter_a).unwrap();
+        assert_eq!(graph_a.len(), 2);
+        assert_eq!(graph_a[0].id, renamed.to_string());
+        assert_eq!(graph_a[1].id, a.to_string());
+
+        let filter_c = CommitLogFilter {
+            path: Some(PathBuf::from("c.txt")),
+            ..Default::default()
+        };
+        let graph_c = git.commit_graph(100, &filter_c).unwrap();
+        assert_eq!(graph_c.len(), 1);
+        assert_eq!(graph_c[0].id, renamed.to_string());
+    }
+
+    #[test]
+    fn commit_graph_filters_by_inclusive_date_range() {
+        let (dir, repo) = init_repo();
+        commit_file_at(&repo, "f.txt", "one\n", "first", 1_000_000);
+        let middle = commit_file_at(&repo, "f.txt", "two\n", "second", 2_000_000);
+        commit_file_at(&repo, "f.txt", "three\n", "third", 3_000_000);
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let filter = CommitLogFilter {
+            since: Some(1_500_000),
+            until: Some(2_500_000),
+            ..Default::default()
+        };
+        let graph = git.commit_graph(100, &filter).unwrap();
+
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0].id, middle.to_string());
+    }
+
+    #[test]
+    fn commit_graph_filters_by_query_matches_body_not_just_summary() {
+        let (dir, repo) = init_repo();
+        let workdir = repo.workdir().unwrap();
+        fs::write(workdir.join("f.txt"), "one\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("f.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = sig();
+        let target = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "summary line\n\nfixes a rare panic on empty input",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        commit_file(&repo, "f.txt", "two\n", "unrelated commit");
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let filter = CommitLogFilter {
+            query: Some("RARE PANIC".to_string()),
+            ..Default::default()
+        };
+        let graph = git.commit_graph(100, &filter).unwrap();
+
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0].id, target.to_string());
+    }
+
+    #[test]
+    fn commit_graph_combines_author_and_path_filters_as_and() {
+        let (dir, repo) = init_repo();
+        commit_file_as(
+            &repo,
+            "a.txt",
+            "one\n",
+            "alice touches a",
+            "Alice",
+            "a@x.com",
+        );
+        commit_file_as(
+            &repo,
+            "b.txt",
+            "two\n",
+            "alice touches b",
+            "Alice",
+            "a@x.com",
+        );
+        let target = commit_file_as(
+            &repo,
+            "a.txt",
+            "three\n",
+            "alice touches a again",
+            "Alice",
+            "a@x.com",
+        );
+        commit_file_as(&repo, "a.txt", "four\n", "bob touches a", "Bob", "b@x.com");
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let filter = CommitLogFilter {
+            author: Some("alice".to_string()),
+            path: Some(PathBuf::from("a.txt")),
+            ..Default::default()
+        };
+        let graph = git.commit_graph(100, &filter).unwrap();
+
+        assert_eq!(graph.len(), 2);
+        assert_eq!(graph[0].id, target.to_string());
+    }
+
+    #[test]
+    fn commit_graph_branch_filter_walks_from_named_branch_not_head() {
+        let (dir, repo) = init_repo();
+        let base = commit_file(&repo, "f.txt", "one\n", "base");
+        let base_commit = repo.find_commit(base).unwrap();
+        repo.branch("feature", &base_commit, false).unwrap();
+        // HEAD (default branch) moves ahead; "feature" stays at `base`.
+        commit_file(&repo, "f.txt", "two\n", "only on default branch");
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let filter = CommitLogFilter {
+            branch: Some("feature".to_string()),
+            ..Default::default()
+        };
+        let graph = git.commit_graph(100, &filter).unwrap();
+
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph[0].id, base.to_string());
+    }
+
+    #[test]
+    fn commit_graph_unresolvable_branch_errors() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "f.txt", "one\n", "first");
+        let git = GitRepo::open(dir.path()).unwrap();
+        let filter = CommitLogFilter {
+            branch: Some("does-not-exist".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            git.commit_graph(100, &filter),
+            Err(GitError::Git2(_))
+        ));
+    }
+
+    #[test]
+    fn commit_graph_stops_at_limit_matches_not_at_visited_commits() {
+        let (dir, repo) = init_repo();
+        // Interleave matching and non-matching commits so a naive
+        // "filter after taking `limit` from the revwalk" implementation
+        // would return fewer than `limit` matches.
+        for i in 0..6 {
+            let message = if i % 2 == 0 {
+                "keep this one"
+            } else {
+                "skip this one"
+            };
+            commit_file(&repo, "f.txt", &format!("v{i}\n"), message);
+        }
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let filter = CommitLogFilter {
+            query: Some("keep".to_string()),
+            ..Default::default()
+        };
+        let graph = git.commit_graph(2, &filter).unwrap();
+
+        assert_eq!(graph.len(), 2);
+        assert!(graph.iter().all(|c| c.summary == "keep this one"));
+    }
+
+    #[test]
+    fn file_history_empty_repo_returns_empty() {
+        let (dir, _repo) = init_repo();
+        let git = GitRepo::open(dir.path()).unwrap();
+        assert_eq!(git.file_history("f.txt", 100).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn file_history_on_never_existing_path_returns_empty() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "f.txt", "one\n", "first");
+        let git = GitRepo::open(dir.path()).unwrap();
+        assert_eq!(git.file_history("nope.txt", 100).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn file_history_returns_every_commit_touching_a_never_renamed_file() {
+        let (dir, repo) = init_repo();
+        let first = commit_file(&repo, "f.txt", "one\n", "first");
+        commit_file(&repo, "unrelated.txt", "x\n", "unrelated");
+        let second = commit_file(&repo, "f.txt", "two\n", "second");
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let history = git.file_history("f.txt", 100).unwrap();
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].id, second.to_string());
+        assert_eq!(history[1].id, first.to_string());
+    }
+
+    #[test]
+    fn file_history_follows_a_rename_across_commits() {
+        let (dir, repo) = init_repo();
+        let created = commit_file(&repo, "old_name.rs", "content\n", "create old_name.rs");
+        let renamed = rename_file(&repo, "old_name.rs", "new_name.rs", "rename to new_name.rs");
+        let edited = commit_file(&repo, "new_name.rs", "content\nmore\n", "edit new_name.rs");
+
+        let git = GitRepo::open(dir.path()).unwrap();
+        let history = git.file_history("new_name.rs", 100).unwrap();
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].id, edited.to_string());
+        assert_eq!(history[1].id, renamed.to_string());
+        assert_eq!(history[2].id, created.to_string());
+    }
+
+    #[test]
+    fn file_history_respects_limit() {
+        let (dir, repo) = init_repo();
+        for i in 0..5 {
+            commit_file(&repo, "f.txt", &format!("v{i}\n"), &format!("commit {i}"));
+        }
+        let git = GitRepo::open(dir.path()).unwrap();
+        assert_eq!(git.file_history("f.txt", 2).unwrap().len(), 2);
     }
 
     #[test]
