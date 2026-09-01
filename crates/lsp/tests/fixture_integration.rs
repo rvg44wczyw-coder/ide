@@ -238,9 +238,22 @@ fn flooding_large_messages_stays_responsive_and_delivers_final_state() {
     // the condition finding 3 needed to trigger reader-task backpressure.
     std::thread::sleep(Duration::from_millis(300));
 
+    // 30s, not 10s: a loaded/contended runner (e.g. CI running the whole
+    // workspace's tests concurrently) genuinely needs more wall-clock time
+    // to parse and deliver 30 x 20,000-diagnostic messages, and this test
+    // is checking for "no hang / no dropped final state" under
+    // backpressure, not a specific latency budget (seen failing on a real
+    // CI run -- v0.1.2 tag, run 33503375677 -- stuck at message 23/30
+    // when the old 10s window closed, while a local, uncontended run took
+    // ~10.3s just for the happy path). Exits as soon as the expected
+    // final message arrives, so an uncontended run isn't slowed down by
+    // this bump.
     let mut last_message_for_main_rs = None;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
+        if last_message_for_main_rs.as_deref() == Some("flood-large-29") {
+            break;
+        }
         match client.try_recv() {
             Some(LspEvent::Diagnostics { path, diagnostics }) if path == main_rs => {
                 last_message_for_main_rs = Some(diagnostics[0].message.clone());
