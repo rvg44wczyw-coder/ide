@@ -46,7 +46,107 @@ use std::path::{Path, PathBuf};
 mod menu;
 mod render;
 
-const LAST_PROJECT_STORAGE_KEY: &str = "ide_last_project";
+/// Supersedes the old single-slot `ide_last_project` `eframe::Storage` key
+/// (`docs/features/git-worktrees.md` §2.2.3): once "Open in New Window"
+/// makes multiple simultaneous `ide` processes a normal workflow, one
+/// global "last project" slot shared across every process racing to
+/// overwrite it on exit is nondeterministic. This key stores the list of
+/// every currently-open project's canonicalized root instead, and
+/// startup resolves 0/1/2+ entries differently (`resolve_startup_restore`
+/// below).
+///
+/// Deliberately **not** an `eframe::Storage` key like its predecessor was:
+/// `register_open_project`/`deregister_open_project` need synchronous,
+/// `&self`-callable read-modify-write access from arbitrary call sites --
+/// including `on_exit(&mut self)`, which (verified against eframe 0.36.1's
+/// source: `crates/ui`'s dependency has no `glow` feature enabled, so
+/// `on_exit` takes no storage/context parameter at all) never receives a
+/// storage handle, and eframe's own `FileStorage` type isn't reachable
+/// outside the `cc.storage`/`App::save` lifecycle callbacks that provide
+/// one. Used instead as the filename of a small, hand-rolled registry file
+/// under `eframe::storage_dir("ide")` (the one piece of eframe's native
+/// persistence machinery that *is* public standalone) -- see
+/// `open_projects_registry_path`/`read_open_projects_registry_at`/
+/// `write_open_projects_registry_at` below, addressed via `IdeApp`'s own
+/// `open_projects_registry_path` field rather than recomputed on every
+/// call, so tests can point it at a tempdir instead of this OS's real,
+/// shared app-data directory. No new dependency: NUL-separated plain text,
+/// not RON/JSON, since neither `ron` nor `serde_json` is a dependency of
+/// this crate.
+const OPEN_PROJECTS_STORAGE_KEY: &str = "ide_open_projects";
+
+/// See `OPEN_PROJECTS_STORAGE_KEY`'s doc for why this isn't an
+/// `eframe::Storage` key. `None` when eframe can't determine a data
+/// directory for this platform (`docs/features/git-worktrees.md` §3: the
+/// registry is best-effort, never a hard error).
+fn open_projects_registry_path() -> Option<PathBuf> {
+    Some(eframe::storage_dir("ide")?.join(OPEN_PROJECTS_STORAGE_KEY))
+}
+
+/// Pure parse side of the NUL-separated on-disk format -- split out from
+/// `read_open_projects_registry_at` so it's unit-testable without any
+/// filesystem I/O.
+fn parse_open_projects_registry(contents: &str) -> Vec<PathBuf> {
+    contents
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Pure serialize side, mirroring `parse_open_projects_registry`.
+fn serialize_open_projects_registry(projects: &[PathBuf]) -> String {
+    let mut contents = String::new();
+    for project in projects {
+        contents.push_str(&project.to_string_lossy());
+        contents.push('\0');
+    }
+    contents
+}
+
+/// A missing or unreadable file reads as "no projects open" rather than
+/// erroring -- consistent with the registry's best-effort semantics. Takes
+/// an explicit path (rather than calling `open_projects_registry_path`
+/// itself) so tests can point it at a tempdir instead of this OS's real,
+/// shared app-data directory.
+fn read_open_projects_registry_at(path: &Path) -> Vec<PathBuf> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_open_projects_registry(&contents),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A failed write (unwritable data dir, disk full) is silently dropped --
+/// same as `eframe::Storage`'s own `flush()` already only logs and moves
+/// on rather than surfacing an error to its caller. See
+/// `read_open_projects_registry_at` for why `path` is explicit.
+fn write_open_projects_registry_at(path: &Path, projects: &[PathBuf]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serialize_open_projects_registry(projects));
+}
+
+/// Pure list-mutation logic behind `IdeApp::register_open_project`, split
+/// out so it's unit-testable without touching any registry file.
+fn registry_after_register(
+    mut projects: Vec<PathBuf>,
+    previous: Option<&Path>,
+    path: PathBuf,
+) -> Vec<PathBuf> {
+    if let Some(previous) = previous {
+        projects.retain(|p| p != previous);
+    }
+    projects.retain(|p| p != &path);
+    projects.push(path);
+    projects
+}
+
+/// Pure list-mutation logic behind `IdeApp::deregister_open_project`.
+fn registry_after_deregister(mut projects: Vec<PathBuf>, path: &Path) -> Vec<PathBuf> {
+    projects.retain(|p| p != path);
+    projects
+}
 
 /// Caps how many `open_tabs` entries `load_project_settings` restores.
 /// `.ide/workspace.json` can arrive hand-edited or from a cloned
@@ -613,6 +713,89 @@ struct OpenTabState {
     cursor_offset: usize,
 }
 
+/// Set at startup when `OPEN_PROJECTS_STORAGE_KEY` has 2+ entries and
+/// there's no explicit `initial_project` to fall back on -- the render
+/// loop shows a blocking modal ("N projects were open last time") until
+/// `resolve_startup_restore` clears this (`git-worktrees.md` §2.2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartupRestorePromptState {
+    /// Candidate paths read from the registry at startup. Always `len >=
+    /// 2` -- this state only exists at all when there's a real choice.
+    candidates: Vec<PathBuf>,
+}
+
+/// The three answers `render_startup_restore_prompt` can produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreChoice {
+    All,
+    One(usize),
+    None,
+}
+
+/// The pure decision behind `resolve_startup_restore`, for a given
+/// `RestoreChoice` over a given candidate list: what the registry should
+/// become, and which project(s) to open where. Split out from
+/// `resolve_startup_restore` itself so this logic is unit-testable without
+/// ever writing the real open-projects registry file or spawning a real
+/// process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreAction {
+    /// Open `here` in the current window, then `open_in_new_window` for
+    /// each of `spawn` (`RestoreChoice::All`, `candidates` non-empty).
+    OpenHereThenSpawn { here: PathBuf, spawn: Vec<PathBuf> },
+    /// Open only this one path in the current window (`RestoreChoice::One`
+    /// with a valid index).
+    OpenHere(PathBuf),
+    /// Nothing to open: `RestoreChoice::None`, an empty `candidates`
+    /// (shouldn't happen given `StartupRestorePromptState`'s own
+    /// invariant, but handled rather than panicking), or `One(i)` with `i`
+    /// out of range.
+    None,
+}
+
+/// `docs/features/git-worktrees.md` §2.2.3's "the registry is rewritten to
+/// contain **exactly** the path(s) that choice results in being open ...
+/// *before* any of the resulting `open_project`/`open_in_new_window` calls
+/// run" ordering invariant lives in the first tuple element here, computed
+/// before `resolve_startup_restore` ever calls `write_open_projects_registry`.
+fn plan_startup_restore(
+    candidates: Vec<PathBuf>,
+    choice: RestoreChoice,
+) -> (Vec<PathBuf>, RestoreAction) {
+    match choice {
+        RestoreChoice::All => {
+            let registry = candidates.clone();
+            let mut remaining = candidates.into_iter();
+            match remaining.next() {
+                Some(here) => (
+                    registry,
+                    RestoreAction::OpenHereThenSpawn {
+                        here,
+                        spawn: remaining.collect(),
+                    },
+                ),
+                None => (registry, RestoreAction::None),
+            }
+        }
+        RestoreChoice::One(i) => match candidates.get(i).cloned() {
+            Some(path) => (vec![path.clone()], RestoreAction::OpenHere(path)),
+            None => (Vec::new(), RestoreAction::None),
+        },
+        RestoreChoice::None => (Vec::new(), RestoreAction::None),
+    }
+}
+
+/// The command `open_in_new_window` spawns, split out so its argument-
+/// vector construction (`docs/features/git-worktrees.md` §4: "spawns only
+/// `std::env::current_exe()` -- never a user-configurable program name",
+/// and always a single explicit path argument, never a shell string) is
+/// assertable without actually spawning a process.
+fn new_window_command(exe: PathBuf, path: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(path);
+    cmd
+}
+
 pub struct IdeApp {
     theme: Theme,
     view_mode: ViewMode,
@@ -636,6 +819,20 @@ pub struct IdeApp {
     lsp: LspBridge,
     cargo: CargoPanel,
     clone: CloneState,
+    /// `Some` only between startup and `resolve_startup_restore` clearing
+    /// it, and only when the registry had 2+ entries (`git-worktrees.md`
+    /// §2.2.3) -- `None` for every other frame this app ever renders.
+    startup_restore_prompt: Option<StartupRestorePromptState>,
+    /// Where `register_open_project`/`deregister_open_project`/
+    /// `resolve_startup_restore` read/write the open-projects registry.
+    /// `None` makes all three a no-op (used by every test that doesn't
+    /// specifically exercise this registry -- see `app_without_gui`) --
+    /// production always sets this from `open_projects_registry_path()` in
+    /// `new`, never leaving it `None` on a platform where eframe can
+    /// resolve a data directory. A field rather than always calling
+    /// `open_projects_registry_path()` directly so tests can point it at a
+    /// tempdir instead of this OS's real, shared app-data directory.
+    open_projects_registry_path: Option<PathBuf>,
     /// `None` when no project is open. Replaced (dropping the old one)
     /// every time `load_project` runs (`file-watcher.md` §3.6).
     watcher: Option<FileWatcher>,
@@ -945,7 +1142,15 @@ pub struct IdeApp {
 }
 
 impl IdeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// `initial_project` is `Some` for an explicit CLI path -- typically
+    /// another window's "Open in New Window" spawning this process, but
+    /// equally a user typing `ide /some/path` directly -- and skips the
+    /// registry's lookup-and-prompt branching below entirely, opening it
+    /// immediately instead (`git-worktrees.md` §2.2.3). This doesn't mean
+    /// the registry is left untouched: opening that path is still an
+    /// ordinary `load_project` call, which unconditionally registers
+    /// whatever it opens (`register_open_project`'s own doc comment).
+    pub fn new(cc: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
         // Theme/custom_languages/keymap/format_on_save are no longer read
         // from global `eframe::Storage` (`project-settings.md` §4): they
         // start at the same hardcoded defaults the welcome screen (no
@@ -957,9 +1162,11 @@ impl IdeApp {
         let custom_languages = Vec::new();
         let keymap = KeymapOverlay::default();
         let format_on_save = false;
-        let last_project = cc
-            .storage
-            .and_then(|s| eframe::get_value::<std::path::PathBuf>(s, LAST_PROJECT_STORAGE_KEY));
+        let registry_path = open_projects_registry_path();
+        let open_projects: Vec<PathBuf> = registry_path
+            .as_deref()
+            .map(read_open_projects_registry_at)
+            .unwrap_or_default();
         let mut app = Self {
             active_cursor_offset: None,
             theme,
@@ -984,6 +1191,8 @@ impl IdeApp {
             lsp: LspBridge::default(),
             cargo: CargoPanel::default(),
             clone: CloneState::default(),
+            startup_restore_prompt: None,
+            open_projects_registry_path: registry_path,
             watcher: None,
             pending_cursor_offset: None,
             hover_link: None,
@@ -1077,7 +1286,21 @@ impl IdeApp {
             pending_rename_focus: false,
             pending_rename_preview: None,
         };
-        app.restore_last_project(last_project, &cc.egui_ctx);
+        if let Some(path) = initial_project {
+            app.restore_last_project(Some(path), &cc.egui_ctx);
+        } else {
+            match open_projects.len() {
+                0 => {}
+                1 => {
+                    app.restore_last_project(open_projects.into_iter().next(), &cc.egui_ctx);
+                }
+                _ => {
+                    app.startup_restore_prompt = Some(StartupRestorePromptState {
+                        candidates: open_projects,
+                    });
+                }
+            }
+        }
         menu::install_native_menu();
         app
     }
@@ -1230,12 +1453,14 @@ impl IdeApp {
         }
     }
 
-    /// Reopens the remembered `LAST_PROJECT_STORAGE_KEY` path at startup
-    /// (`shell-polish-and-last-project.md` §2.2). Silent on failure --
-    /// unlike `open_project`/`create_project`, this wasn't a user-
-    /// initiated action this session, so a moved/deleted/invalid
-    /// remembered path just falls through to the normal welcome screen
-    /// instead of surfacing an error the user never asked for.
+    /// Reopens a remembered path at startup (`shell-polish-and-last-
+    /// project.md` §2.2) -- either the sole entry in `OPEN_PROJECTS_
+    /// STORAGE_KEY`, or an explicit `initial_project` CLI path
+    /// (`git-worktrees.md` §2.2.3). Silent on failure -- unlike
+    /// `open_project`/`create_project`, this wasn't a user-initiated
+    /// action this session, so a moved/deleted/invalid remembered path
+    /// just falls through to the normal welcome screen instead of
+    /// surfacing an error the user never asked for.
     fn restore_last_project(&mut self, path: Option<std::path::PathBuf>, ctx: &egui::Context) {
         if let Some(path) = path {
             if let Ok(project) = Project::open(&path) {
@@ -1255,8 +1480,13 @@ impl IdeApp {
     /// settings/workspace (`project-settings.md` §3.1) -- `ctx` is needed
     /// to re-apply a restored theme immediately.
     fn load_project(&mut self, project: Project, ctx: &egui::Context) {
-        if let Some(old_root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
-            self.flush_project_settings(&old_root);
+        // Captured in an outer-scoped binding (not just inside the `if
+        // let` below) so it's still available for `register_open_project`
+        // further down, after `self.project` has already been reassigned
+        // to the new project (`git-worktrees.md` §2.2.3).
+        let old_root = self.project.as_ref().map(|p| p.root().to_path_buf());
+        if let Some(old_root) = &old_root {
+            self.flush_project_settings(old_root);
         }
         self.tree = None;
         self.git.refresh(project.root());
@@ -1286,6 +1516,7 @@ impl IdeApp {
         // since `project` moves into `self.project` on the next line.
         let root = project.root().to_path_buf();
         self.project = Some(project);
+        self.register_open_project(old_root.as_deref(), &root);
         self.error = watcher_error;
         self.tabs = Vec::new();
         self.active_tab = None;
@@ -1300,6 +1531,81 @@ impl IdeApp {
         // `poll_tree_scan`.
         self.search.discard_in_flight();
         self.search.discard_replace_in_flight();
+    }
+
+    /// `docs/features/git-worktrees.md` §2.2.3. Called from `load_project`
+    /// with `previous` set to the project this window was on before (if
+    /// any) and `path` the newly-assigned project's root -- the one and
+    /// only call site (every path that loads a project already funnels
+    /// through `load_project`). `&self`, not `&mut self`: reads/writes the
+    /// on-disk registry file directly rather than any `IdeApp` field --
+    /// see `OPEN_PROJECTS_STORAGE_KEY`'s doc for why.
+    fn register_open_project(&self, previous: Option<&Path>, path: &Path) {
+        let Some(registry_path) = &self.open_projects_registry_path else {
+            return;
+        };
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let projects = registry_after_register(
+            read_open_projects_registry_at(registry_path),
+            previous,
+            path,
+        );
+        write_open_projects_registry_at(registry_path, &projects);
+    }
+
+    /// `docs/features/git-worktrees.md` §2.2.3. Called from `on_exit`.
+    /// Best-effort: a crash or force-quit simply skips this, same as any
+    /// other write to this registry (§3's "self-corrects rather than
+    /// needing active cleanup").
+    fn deregister_open_project(&self, path: &Path) {
+        let Some(registry_path) = &self.open_projects_registry_path else {
+            return;
+        };
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let projects =
+            registry_after_deregister(read_open_projects_registry_at(registry_path), &path);
+        write_open_projects_registry_at(registry_path, &projects);
+    }
+
+    /// `docs/features/git-worktrees.md` §2.2.3, wired to the blocking
+    /// startup-restore modal's Restore All / pick one / Open None answer.
+    /// The registry is rewritten to contain exactly the resulting set
+    /// *before* `restore_last_project`/`open_in_new_window` run, so their
+    /// own `load_project`-driven `register_open_project` calls only ever
+    /// add back a path already in that rewritten set (§4's ordering
+    /// invariant).
+    fn resolve_startup_restore(&mut self, choice: RestoreChoice, ctx: &egui::Context) {
+        let Some(prompt) = self.startup_restore_prompt.take() else {
+            return;
+        };
+        let (registry, action) = plan_startup_restore(prompt.candidates, choice);
+        if let Some(registry_path) = &self.open_projects_registry_path {
+            write_open_projects_registry_at(registry_path, &registry);
+        }
+        match action {
+            RestoreAction::OpenHereThenSpawn { here, spawn } => {
+                self.open_project(&here, ctx);
+                for extra in spawn {
+                    self.open_in_new_window(&extra);
+                }
+            }
+            RestoreAction::OpenHere(path) => self.open_project(&path, ctx),
+            RestoreAction::None => {}
+        }
+    }
+
+    /// `docs/features/git-worktrees.md` §2.2.3. An explicit single-element
+    /// argument vector (the project path), never a shell string. The
+    /// spawned child is never waited on -- the new window is meant to
+    /// outlive this process.
+    fn open_in_new_window(&mut self, path: &Path) {
+        match std::env::current_exe() {
+            Ok(exe) => match new_window_command(exe, path).spawn() {
+                Ok(_child) => {}
+                Err(e) => self.error = Some(e.to_string()),
+            },
+            Err(e) => self.error = Some(e.to_string()),
+        }
     }
 
     /// Unlike `load_project`, doesn't clear `self.tree` -- the
@@ -4324,6 +4630,7 @@ impl IdeApp {
             CommandAction::ToggleBlameAnnotations => self
                 .active_tab
                 .is_some_and(|idx| self.tabs[idx].buffer.path().is_some()),
+            CommandAction::GitWorktrees => self.project.is_some(),
         }
     }
 
@@ -4434,6 +4741,11 @@ impl IdeApp {
                 }
             }
             CommandAction::ToggleBlameAnnotations => self.toggle_blame_annotations(),
+            CommandAction::GitWorktrees => {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    self.git.open_worktrees_popup(&root);
+                }
+            }
         }
     }
 
@@ -4798,6 +5110,8 @@ mod tests {
             lsp: LspBridge::default(),
             cargo: CargoPanel::default(),
             clone: CloneState::default(),
+            startup_restore_prompt: None,
+            open_projects_registry_path: None,
             watcher: None,
             pending_cursor_offset: None,
             hover_link: None,
@@ -5371,6 +5685,52 @@ c
         app.run_command(CommandAction::GitBranches, &ctx);
 
         assert!(app.git.branches_popup.open);
+    }
+
+    #[test]
+    fn is_command_enabled_git_worktrees_needs_a_project() {
+        let app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::GitWorktrees));
+    }
+
+    #[test]
+    fn run_command_git_worktrees_opens_the_popup_when_a_project_is_open() {
+        let dir = git_init_repo();
+        git_commit(
+            dir.path(),
+            "f.txt",
+            "a
+",
+        );
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::GitWorktrees, &ctx);
+
+        assert!(app.git.worktrees_popup.open);
+    }
+
+    #[test]
+    fn run_command_git_worktrees_defensively_picks_up_a_repo_initialized_after_project_open() {
+        // A project directory opened before it was ever `git init`'d --
+        // `is_command_enabled` only checks `self.project.is_some()`, so
+        // the command is reachable with `app.git.repo` still `None`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        assert!(!app.git.is_repo());
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::GitWorktrees, &ctx);
+
+        assert!(app.git.is_repo());
+        assert!(app.git.worktrees_popup.open);
     }
 
     #[test]
@@ -6483,6 +6843,263 @@ b
 
         assert!(app.project.is_none());
         assert!(app.error.is_none());
+    }
+
+    // ---- Open-projects registry (`docs/features/git-worktrees.md` §2.2.3)
+    // ----
+    //
+    // `app_without_gui()` sets `open_projects_registry_path: None`, so
+    // every one of the hundreds of other tests that call `load_project`/
+    // `restore_last_project` (which call `register_open_project`
+    // internally) makes it a no-op rather than mutating this OS's real,
+    // shared `eframe::storage_dir("ide")` app-data directory. The tests
+    // below that need real read/write behaviour point the field at a
+    // tempdir instead -- never at the real path (`open_projects_registry_
+    // path()` itself, and the two-line real-path field-initialization in
+    // `new`, are the only places that ever call it).
+
+    #[test]
+    fn parse_open_projects_registry_round_trips_through_serialize() {
+        let projects = vec![PathBuf::from("/a/b"), PathBuf::from("/c/d e")];
+
+        let serialized = serialize_open_projects_registry(&projects);
+
+        assert_eq!(parse_open_projects_registry(&serialized), projects);
+    }
+
+    #[test]
+    fn parse_open_projects_registry_of_empty_string_is_empty() {
+        assert_eq!(parse_open_projects_registry(""), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn read_write_open_projects_registry_at_round_trips_through_a_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry");
+        let projects = vec![PathBuf::from("/one"), PathBuf::from("/two")];
+
+        write_open_projects_registry_at(&path, &projects);
+
+        assert_eq!(read_open_projects_registry_at(&path), projects);
+    }
+
+    #[test]
+    fn read_open_projects_registry_at_a_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist");
+
+        assert_eq!(read_open_projects_registry_at(&path), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn registry_after_register_pushes_a_new_path() {
+        let projects = registry_after_register(Vec::new(), None, PathBuf::from("/a"));
+
+        assert_eq!(projects, vec![PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn registry_after_register_removes_previous_and_dedups() {
+        let existing = vec![PathBuf::from("/old"), PathBuf::from("/other")];
+
+        let projects =
+            registry_after_register(existing, Some(Path::new("/old")), PathBuf::from("/new"));
+
+        assert_eq!(
+            projects,
+            vec![PathBuf::from("/other"), PathBuf::from("/new")]
+        );
+    }
+
+    #[test]
+    fn registry_after_register_re_registering_the_same_path_does_not_duplicate_it() {
+        let existing = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+
+        let projects = registry_after_register(existing, None, PathBuf::from("/a"));
+
+        assert_eq!(projects, vec![PathBuf::from("/b"), PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn registry_after_deregister_removes_the_exact_path() {
+        let existing = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+
+        let projects = registry_after_deregister(existing, Path::new("/a"));
+
+        assert_eq!(projects, vec![PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn registry_after_deregister_of_an_absent_path_is_a_no_op() {
+        let existing = vec![PathBuf::from("/a")];
+
+        let projects = registry_after_deregister(existing.clone(), Path::new("/absent"));
+
+        assert_eq!(projects, existing);
+    }
+
+    #[test]
+    fn plan_startup_restore_all_opens_the_first_and_spawns_the_rest() {
+        let candidates = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
+
+        let (registry, action) = plan_startup_restore(candidates.clone(), RestoreChoice::All);
+
+        assert_eq!(registry, candidates);
+        assert_eq!(
+            action,
+            RestoreAction::OpenHereThenSpawn {
+                here: PathBuf::from("/a"),
+                spawn: vec![PathBuf::from("/b"), PathBuf::from("/c")],
+            }
+        );
+    }
+
+    #[test]
+    fn plan_startup_restore_one_opens_only_the_chosen_candidate() {
+        let candidates = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+
+        let (registry, action) = plan_startup_restore(candidates, RestoreChoice::One(1));
+
+        assert_eq!(registry, vec![PathBuf::from("/b")]);
+        assert_eq!(action, RestoreAction::OpenHere(PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn plan_startup_restore_one_with_an_out_of_range_index_opens_nothing() {
+        let candidates = vec![PathBuf::from("/a")];
+
+        let (registry, action) = plan_startup_restore(candidates, RestoreChoice::One(5));
+
+        assert_eq!(registry, Vec::<PathBuf>::new());
+        assert_eq!(action, RestoreAction::None);
+    }
+
+    #[test]
+    fn plan_startup_restore_none_clears_the_registry_and_opens_nothing() {
+        let candidates = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+
+        let (registry, action) = plan_startup_restore(candidates, RestoreChoice::None);
+
+        assert_eq!(registry, Vec::<PathBuf>::new());
+        assert_eq!(action, RestoreAction::None);
+    }
+
+    #[test]
+    fn new_window_command_passes_the_path_as_a_single_argument_not_a_shell_string() {
+        let cmd = new_window_command(
+            PathBuf::from("/usr/bin/ide"),
+            Path::new("/tmp/some project"),
+        );
+
+        let debug = format!("{cmd:?}");
+
+        assert!(debug.contains("/usr/bin/ide"));
+        assert!(debug.contains("some project"));
+    }
+
+    #[test]
+    fn register_open_project_writes_the_canonicalized_path_to_the_registry_file() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry");
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.open_projects_registry_path = Some(registry_path.clone());
+
+        app.register_open_project(None, project_dir.path());
+
+        let expected = project_dir.path().canonicalize().unwrap();
+        assert_eq!(
+            read_open_projects_registry_at(&registry_path),
+            vec![expected]
+        );
+    }
+
+    #[test]
+    fn register_open_project_with_none_path_never_touches_any_file() {
+        let mut app = app_without_gui();
+        app.open_projects_registry_path = None;
+
+        // Would panic on a filesystem error if this touched a real path;
+        // simply not panicking demonstrates the no-op.
+        app.register_open_project(None, Path::new("/wherever"));
+    }
+
+    #[test]
+    fn deregister_open_project_removes_the_path_from_the_registry_file() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry");
+        let project_dir = tempfile::tempdir().unwrap();
+        let canonical = project_dir.path().canonicalize().unwrap();
+        write_open_projects_registry_at(&registry_path, std::slice::from_ref(&canonical));
+        let mut app = app_without_gui();
+        app.open_projects_registry_path = Some(registry_path.clone());
+
+        app.deregister_open_project(project_dir.path());
+
+        assert_eq!(
+            read_open_projects_registry_at(&registry_path),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn resolve_startup_restore_one_opens_the_chosen_project_and_writes_only_it_to_the_registry() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry");
+        let project_a = tempfile::tempdir().unwrap();
+        let project_b = tempfile::tempdir().unwrap();
+        // Candidates come from a prior registry read in real use, which
+        // `register_open_project` always writes canonicalized -- construct
+        // the test's candidates the same way, or `register_open_project`'s
+        // own re-canonicalize-on-add below would (correctly) treat a raw,
+        // non-canonical duplicate as a distinct path.
+        let project_a_canonical = project_a.path().canonicalize().unwrap();
+        let project_b_canonical = project_b.path().canonicalize().unwrap();
+        let mut app = app_without_gui();
+        app.open_projects_registry_path = Some(registry_path.clone());
+        app.startup_restore_prompt = Some(StartupRestorePromptState {
+            candidates: vec![project_a_canonical, project_b_canonical.clone()],
+        });
+
+        app.resolve_startup_restore(RestoreChoice::One(1), &egui::Context::default());
+
+        assert!(app.startup_restore_prompt.is_none());
+        assert_eq!(
+            app.project.as_ref().map(|p| p.root().to_path_buf()),
+            Some(project_b_canonical.clone())
+        );
+        // register_open_project's own call (from the load_project this
+        // triggers) re-adds the now-current project on top of resolve_
+        // startup_restore's registry rewrite -- still just the one path.
+        assert_eq!(
+            read_open_projects_registry_at(&registry_path),
+            vec![project_b_canonical]
+        );
+    }
+
+    #[test]
+    fn resolve_startup_restore_none_clears_the_prompt_and_the_registry_opens_nothing() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry");
+        let project_a = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.open_projects_registry_path = Some(registry_path.clone());
+        app.startup_restore_prompt = Some(StartupRestorePromptState {
+            candidates: vec![project_a.path().to_path_buf()],
+        });
+
+        app.resolve_startup_restore(RestoreChoice::None, &egui::Context::default());
+
+        assert!(app.startup_restore_prompt.is_none());
+        assert!(app.project.is_none());
+        assert_eq!(
+            read_open_projects_registry_at(&registry_path),
+            Vec::<PathBuf>::new()
+        );
     }
 
     #[test]

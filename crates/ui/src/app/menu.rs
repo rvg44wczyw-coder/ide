@@ -106,7 +106,11 @@ const MENU_GROUPS: &[MenuGroup] = &[
     },
     MenuGroup {
         title: "Git",
-        items: &[Some("GitBranches"), Some("ToggleBlameAnnotations")],
+        items: &[
+            Some("GitBranches"),
+            Some("ToggleBlameAnnotations"),
+            Some("GitWorktrees"),
+        ],
     },
     MenuGroup {
         title: "Window",
