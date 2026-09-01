@@ -2,8 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ['v*']
 
 jobs:
   build:
@@ -12,13 +11,60 @@ jobs:
       # The UI's font assets are Git LFS objects; without this the runner
       # checks out ~130-byte pointer files and `crates/ui/src/theme/fonts.rs`
       # fails its compile-time TrueType assertion.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           lfs: true
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned (not `stable`, which floats to whatever is newest at run
+      # time) so a new Rust/clippy release can never break this job on its
+      # own -- a brand-new lint (e.g. `chunks_exact_to_as_chunks`, added in
+      # 1.98) failing `-D warnings` here with no code change at all is
+      # exactly the failure mode this avoids. Bump deliberately, in the
+      # same commit as whatever lint fixes the new version needs.
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+
+  # Release binaries for both frontends (`ide` -- the unified GUI binary,
+  # `--tui` included -- and the standalone `ide-tui`) on every platform the
+  # project targets (root `CLAUDE.md`: macOS/Linux/Windows). Runs only
+  # after `build` passes; the whole workflow already only fires on a
+  # `v*` tag push (above), so no separate branch/event gate is needed here.
+  artifacts:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+            ide_bin: ide
+            tui_bin: ide-tui
+          - os: ubuntu-latest
+            platform: linux
+            ide_bin: ide
+            tui_bin: ide-tui
+          - os: windows-latest
+            platform: windows
+            ide_bin: ide.exe
+            tui_bin: ide-tui.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          lfs: true
+      - uses: dtolnay/rust-toolchain@1.97.0
+      # `--bins` builds only the workspace's two `[[bin]]` targets (`ide`
+      # from ide-ui, `ide-tui` from ide-tui) -- not `ide-core`'s benches/
+      # examples, which a release build has no use packaging.
+      - run: cargo build --release --workspace --bins
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ide-${{ matrix.platform }}-${{ github.ref_name }}
+          path: |
+            target/release/${{ matrix.ide_bin }}
+            target/release/${{ matrix.tui_bin }}
+          if-no-files-found: error
