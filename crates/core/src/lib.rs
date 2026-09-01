@@ -35,7 +35,7 @@ pub use fuzzy::{
 pub use git::{
     diff_text, BlameLine, BranchInfo, ChangeKind, CommitDetail, CommitNode, ConflictSides,
     DiffHunk, DiffLine, DiffSpan, FileDiff, GitError, GitRepo, MergeOutcome, StatusEntry,
-    WorkingTreeStatus, MAX_BLAME_LINES, MAX_DIFF_LINES,
+    WorkingTreeStatus, WorktreeInfo, MAX_BLAME_LINES, MAX_DIFF_LINES,
 };
 pub use language::{
     detect_active_languages, detect_language, detect_language_suggestions, language_for_path,
