@@ -7,7 +7,7 @@
 //! near-verbatim from `crates/ui/src/git_panel.rs`, which has zero
 //! `egui`/`eframe` dependency itself.
 
-use ide_core::{CommitNode, ConflictSides, FileDiff, GitRepo};
+use ide_core::{CommitLogFilter, CommitNode, ConflictSides, FileDiff, GitRepo};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -68,7 +68,9 @@ impl GitPanel {
     pub fn refresh(&mut self, project_root: &Path) {
         match GitRepo::open(project_root) {
             Ok(repo) => {
-                self.graph = repo.commit_graph(COMMIT_GRAPH_LIMIT).unwrap_or_default();
+                self.graph = repo
+                    .commit_graph(COMMIT_GRAPH_LIMIT, &CommitLogFilter::default())
+                    .unwrap_or_default();
                 self.conflicts = repo.conflicts().unwrap_or_default();
                 self.current_branch = repo.current_branch();
                 self.repo = Some(repo);
