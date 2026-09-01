@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+
+# project-local orchestration files (carried into worktrees by dev-chain, not shipped code)
+/CLAUDE.md
+/.claude/skills/
+/.claude/agents/
+/.claude/settings.local.json
+.ide/
+
+# documentation kept locally, not tracked
+/docs/
