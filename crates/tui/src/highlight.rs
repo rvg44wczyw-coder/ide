@@ -375,16 +375,30 @@ pub fn styled_line(
     Line::from(spans)
 }
 
+/// A `char`'s on-screen width exactly as ratatui's own `Buffer::set_stringn`
+/// computes it (`unicode-width`, ambiguous-width characters counted as
+/// narrow -- ratatui's own default, not configurable from this crate). No
+/// direct `unicode-width` dependency needed: `Span::width()` already wraps
+/// it, and a single `char` borrowed into a `Span` costs no allocation
+/// (`encode_utf8` writes into a stack buffer). Wide CJK characters are 2
+/// here, not 1 -- getting this wrong is exactly what let the block cursor
+/// drift away from the caret's real on-screen position on a line
+/// containing them; `ui.rs`'s cursor placement re-derives its column the
+/// same way, via `expand_tabs`'s returned end column.
+fn char_display_width(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    Span::raw(ch.encode_utf8(&mut buf) as &str).width()
+}
+
 /// Expands every literal tab in `text` into spaces, advancing to the next
-/// multiple of `tab_width` from `start_col` -- mirrors
-/// `ide_core::IndentUnit::columns_of`'s tab-stop math, duplicated here
-/// (rather than reused) since that function measures a column count and
-/// this one needs the expanded text itself. Returns the expanded text and
+/// multiple of `tab_width` from `start_col`. Returns the expanded text and
 /// the column just past it, so callers can thread the running column
-/// across a line's several spans/chips. `tab_width` of `0` would make the
-/// "next multiple" step meaningless, so it's floored to `1`, same as
-/// `columns_of`'s own guard.
-fn expand_tabs(text: &str, start_col: usize, tab_width: usize) -> (String, usize) {
+/// across a line's several spans/chips -- tracked in real display columns
+/// (`char_display_width`), not a raw `char` count, so a tab stop after a
+/// run of wide CJK characters lands in the right place too. `tab_width` of
+/// `0` would make the "next multiple" step meaningless, so it's floored to
+/// `1`.
+pub(crate) fn expand_tabs(text: &str, start_col: usize, tab_width: usize) -> (String, usize) {
     let stop = tab_width.max(1);
     let mut col = start_col;
     let mut out = String::with_capacity(text.len());
@@ -395,7 +409,7 @@ fn expand_tabs(text: &str, start_col: usize, tab_width: usize) -> (String, usize
             col = next;
         } else {
             out.push(ch);
-            col += 1;
+            col += char_display_width(ch);
         }
     }
     (out, col)

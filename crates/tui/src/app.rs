@@ -11534,4 +11534,82 @@ mod tests {
             "tab before `name` must still reserve display columns, not collapse to 0: {indented_row:?}"
         );
     }
+
+    /// Regression test for the sibling bug the tab-collapse fix (above)
+    /// exposed: a wide CJK character is 2 screen columns, not 1, so
+    /// re-deriving the caret's screen column from a raw `char` count (as
+    /// `cursor_line_column` alone gives) drifted the block cursor left of
+    /// where it belonged on any line containing one -- e.g. landing mid-
+    /// string on a `"中文字符串"` literal instead of just past its closing
+    /// quote. Renders a real frame via `TestBackend`, same as
+    /// `tab_indented_lines_keep_their_indentation_on_screen`, since this is
+    /// specifically about `ui::render`'s cursor-placement code, not
+    /// `styled_line` in isolation (`highlight.rs` has its own unit tests
+    /// for the tab/width math itself).
+    #[test]
+    fn cursor_lands_after_a_wide_cjk_character_not_mid_glyph() {
+        let dir = tempfile::tempdir().unwrap();
+        // No trailing newline -- end-of-buffer must land right after the
+        // closing quote, not on a following empty line.
+        fs::write(dir.path().join("f.go"), "package p\n\nx := \"中文字符串\"").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(dir.path().join("f.go")).unwrap();
+        app.focus = Focus::Editor;
+        // End of the buffer is right after the closing quote.
+        let end = app
+            .active_buffer()
+            .unwrap()
+            .buffer
+            .text_buffer()
+            .text()
+            .len();
+        set_caret(&mut app, end);
+
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row_chars: Vec<String> = (0..buf.area.width)
+            .map(|x| buf[(x, cursor.y)].symbol().to_string())
+            .collect();
+        let closing_quote_col = row_chars.iter().rposition(|c| c == "\"").unwrap();
+
+        assert_eq!(
+            cursor.x as usize,
+            closing_quote_col + 1,
+            "cursor should land immediately after the closing quote, not drift left from undercounting wide CJK columns: {row_chars:?}"
+        );
+    }
+
+    /// Not a width/alignment assertion (this crate renders logical/storage
+    /// byte order, not a bidi-reordered visual order -- a known, accepted
+    /// limitation, not a bug) -- just confirms a line of Arabic text
+    /// doesn't panic or corrupt neighboring rows on its way through
+    /// `styled_line`'s boundary-walk and tab-expansion logic.
+    #[test]
+    fn arabic_text_renders_without_panicking_or_corrupting_the_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("f.go"),
+            "package p\n\n// تعليق بالعربية من اليمين لليسار\nfunc f() {}\n",
+        )
+        .unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(dir.path().join("f.go")).unwrap();
+        app.focus = Focus::Editor;
+
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rendered: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(
+            rendered.contains("تعليق"),
+            "the Arabic comment must still appear on screen"
+        );
+    }
 }

@@ -307,19 +307,22 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect) {
             if (screen_line as u16) < text_area.height {
                 // `column` is a `char` count (`cursor_line_column`'s own
                 // contract, unchanged -- editing/movement code elsewhere
-                // relies on that). The screen column a tab-containing line
-                // actually renders at is wider, per `styled_line`'s own
-                // tab expansion above -- re-derive it the same way, via the
-                // buffer's resolved `IndentUnit`, so the caret lands on the
-                // character it's actually next to instead of drifting left
-                // by however many tabs preceded it.
+                // relies on that). The screen column a line actually
+                // renders at can be wider (a tab, or -- unlike
+                // `IndentUnit::columns_of`, which only ever measures plain
+                // whitespace -- a wide CJK character counting for 2
+                // columns) -- re-derive it via the exact same
+                // `expand_tabs` call `styled_line` renders this line with
+                // above, so the caret lands on the character it's actually
+                // next to rather than drifting from either one.
                 let line_text = text_buffer.line_text(line).unwrap_or("");
                 let byte_col = line_text
                     .char_indices()
                     .nth(column)
                     .map(|(i, _)| i)
                     .unwrap_or(line_text.len());
-                let screen_column = buf.indent.columns_of(&line_text[..byte_col]);
+                let (_, screen_column) =
+                    crate::highlight::expand_tabs(&line_text[..byte_col], 0, buf.indent.width);
                 frame.set_cursor_position((
                     text_area.x + screen_column as u16,
                     text_area.y + screen_line as u16,
