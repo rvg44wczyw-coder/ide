@@ -1544,6 +1544,17 @@ mod tests {
     fn init_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
+        // Local, not global: `GitRepo::commit`/`merge_branch` (the
+        // production methods several tests exercise directly, unlike
+        // `commit_file` below which builds commits with its own explicit
+        // `sig()`) resolve their signature via `Repository::signature()`,
+        // which falls through to the ambient git config -- a CI runner
+        // has no global user.name/user.email set, so these tests must not
+        // depend on one existing (`config value 'user.name' was not
+        // found`, seen on a real run: v0.1.0 tag, run 33501916808).
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test User").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
         (dir, repo)
     }
 
