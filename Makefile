@@ -1,4 +1,4 @@
-.PHONY: all configure build release run run-tui test fmt fmt-fix clippy check ci clean install uninstall bench bench-mem
+.PHONY: all configure build release run run-tui test fmt fmt-fix clippy check ci clean install uninstall install-tui uninstall-tui bench bench-mem
 
 all: build
 
@@ -79,6 +79,16 @@ install: configure
 
 uninstall:
 	cargo uninstall ide-ui
+
+# Same as `install`, but for the standalone `ide-tui` binary -- distinct
+# from `ide --tui` (also installed by plain `make install`, workspace-
+# layout note in root CLAUDE.md): this one has no GUI-crate dependency at
+# all, useful if you only ever want the terminal frontend on PATH.
+install-tui: configure
+	cargo install --path crates/tui --locked
+
+uninstall-tui:
+	cargo uninstall ide-tui
 
 # CPU micro-benchmarks (docs/features/perf-baseline.md); criterion prints
 # a run-over-run percentage change against the previous `bench` run.

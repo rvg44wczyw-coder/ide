@@ -86,7 +86,8 @@ covers your platform.
 | `make fmt` / `make fmt-fix` | Checks / applies `cargo fmt`. |
 | `make clippy` | Runs clippy with warnings denied. |
 | `make check` (alias `make ci`) | `fmt` + `clippy` + `build` + `test`, in the same order CI runs them — reproduces a CI failure locally. |
-| `make install` / `make uninstall` | Installs/uninstalls the `ide` binary via `cargo install`. |
+| `make install` / `make uninstall` | Installs/uninstalls the `ide` binary via `cargo install` (also puts `ide-tui` on `PATH`, via `ide --tui`). |
+| `make install-tui` / `make uninstall-tui` | Installs/uninstalls the standalone `ide-tui` binary via `cargo install` — no GUI-crate dependency at all. |
 | `make bench` / `make bench-mem` | CPU / peak-memory benchmarks (`docs/features/perf-baseline.md`). |
 | `make clean` | `cargo clean`. |
 
