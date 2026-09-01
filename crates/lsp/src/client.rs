@@ -2312,10 +2312,8 @@ fn decode_semantic_tokens(raw: &[u32], legend: &[String]) -> Vec<SemanticToken> 
     let mut tokens = Vec::new();
     let mut line = 0u32;
     let mut character = 0u32;
-    for chunk in raw.chunks_exact(5) {
-        let [delta_line, delta_start, length, token_type, _modifiers] = chunk else {
-            unreachable!("chunks_exact(5) always yields length-5 slices");
-        };
+    for chunk in raw.as_chunks::<5>().0 {
+        let [delta_line, delta_start, length, token_type, _modifiers] = chunk;
         // A malicious/buggy server can send an arbitrary delta -- e.g.
         // `delta_line: u32::MAX` on two consecutive tokens overflows a
         // plain `+=`. `saturating_add` degrades that to "this token (and
