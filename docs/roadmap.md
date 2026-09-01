@@ -1005,6 +1005,62 @@ UI (`annotations_from_blame` и `GitPanel::commit_detail`); второй
 (`git-branches-and-blame-2026-09-01.md` для core, `git-branches-and-
 blame-ui-2026-09-01.md` для ui, второй — с разделом «Fix verification»).
 
+Прогон №27 (`E8 git-worktrees`) выполнен и смержен 2026-09-01, обеими
+половинами: `core`-роль добавила в `crates/core/src/git/mod.rs`
+`WorktreeInfo` и четыре метода `GitRepo` (`worktrees`/`add_worktree`/
+`remove_worktree`, плюс новые варианты `GitError`:
+`WorktreeNameTaken`/`InvalidWorktreeName`/`WorktreeInsideRepo`/
+`WorktreeHasUncommittedChanges`); `hacker`-проход по `core`-диффу нашёл
+две реальные находки (`git-worktrees-core-2026-09-01.md`): непроверенный
+Unicode bidi-override в имени worktree (тот же класс «Trojan Source»,
+что и в Прогоне №26 — принимался и становился и регистрационным именем,
+и настоящим именем ветки, Medium) и `WorktreeInsideRepo`, канонизировавший
+только `path.parent()`, но не сам `path` — заранее существующий симлинк
+на месте конечного листа обходил проверку (перехватывалось лишь
+случайно, самой ошибкой `git2` про «каталог уже существует», Low).
+Исправлено переиспользованием того же `strip_bidi_controls`-диапазона,
+что уже есть в `blame_gutter.rs`, и канонизацией `path` целиком (когда он
+уже существует), в дополнение к `path.parent()`; повторный `hacker`-проход
+живыми атаками (те же и вариативные bidi-имена, тот же симлинк-сценарий,
+с разбором конкретного `GitError`-варианта, а не просто «что-то
+отклонило») подтвердил закрытие обеих находок и не сломал легитимные
+случаи — чисто.
+
+`ui`-роль расширила `GitPanel` (`crates/ui/src/git_panel.rs`) полем
+`worktrees_popup: WorktreesPopupState` и методами
+`open_worktrees_popup`/`close_worktrees_popup`/`refresh_worktrees`/
+`create_worktree`/`remove_worktree`; новая категория палитры команд и
+пункт меню «Git» → Worktrees, доступный при открытом проекте (см. §2.2
+дока). `rev` по первой реализации нашёл три находки, все устранены одним
+раундом фиксов (коммит `7122d93`): (1) `resolve_startup_restore` вызывал
+молчаливый `restore_last_project` вместо `open_project` для обеих веток
+разрешения multi-window стартового промпта — собственный псевдокод дока
+явно требует `open_project`, чтобы ошибка открытия дошла до
+пользователя; путь настоящего молчаливого авто-restore при старте
+(`IdeApp::new`, единственный вспомненный проект или явный CLI-путь) не
+тронут — там молчание намеренное; (2) `open_worktrees_popup`, в отличие
+от зеркального `open_branches_popup`, не подхватывал защитно
+`self.repo`, если оно ещё `None` — реальная дыра, поскольку
+`is_command_enabled` для `GitWorktrees` проверяет только
+`self.project.is_some()`, а не наличие git-репозитория, так что `git
+init`, выполненный извне уже после открытия проекта, навсегда оставлял
+попап с пустым списком; исправлено тем же `if self.repo.is_none() {
+self.refresh(project_root) }`, что уже есть у `open_branches_popup`; (3)
+ноль тестового покрытия на все пять новых методов `GitPanel` и на
+диспетчеризацию `CommandAction::GitWorktrees` — добавлено 12 тестов, в
+т.ч. сквозной тест через реальный `run_command`, доказывающий, что
+находка (2) была реальной (список остаётся пустым на пред-фикс коде).
+Независимая переверификация (`rev`, затем `hacker`, поскольку
+`git_panel.rs` — security-sensitive путь) переподтвердила все три фикса
+и покрытие (app.rs 95.67%/97.35%, git_panel.rs 97.98%/93.38%) заново
+запущенными `fmt`/`clippy`/`test`/`llvm-cov`, а не на слово роли;
+`hacker`-проход по фикс-раунду — чисто (плумбинг `project_root` идёт
+через уже канонизированный `Project::root()`, новое место, где
+всплывает `open_project`'s ошибка, не раскрывает ничего чувствительнее
+уже показанного в UI пути). Findings-документы: `docs/security-findings/
+git-worktrees-core-2026-09-01.md` (core) и `git-worktrees-ui-fixround-
+2026-09-01.md` (ui fix round, чисто).
+
 ## 8. Решения по платформе (согласовано 2026-08-17)
 
 Все пять открытых вопросов закрыты; `CLAUDE.md` уже приведён в
