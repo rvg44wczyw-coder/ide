@@ -14,18 +14,81 @@ crates/tui/    ide-tui    -- ratatui/crossterm terminal UI (lib + standalone bin
 crates/ui/     ide-ui     -- egui/eframe GUI (lib + the unified bin `ide`, depends on ide-tui for `--tui`)
 ```
 
+## Prerequisites
+
+- **Rust 1.97.0** — pinned by `rust-toolchain.toml`, so a plain `cargo
+  build`/`cargo run` via `rustup` fetches and selects it automatically.
+  Not floating `stable` on purpose: a brand-new lint or API change in a
+  newer compiler could otherwise break this repo's build with no code
+  change at all.
+- **Git LFS** — the GUI's embedded font assets
+  (`crates/ui/assets/fonts/*.ttf`) are stored as LFS objects. A clone or
+  checkout without LFS set up leaves ~130-byte pointer files in their
+  place, which fails a compile-time assertion in
+  `crates/ui/src/theme/fonts.rs`.
+- **A C/C++ compiler** — `ide-core`'s `git2` dependency vendors and
+  compiles libgit2 + OpenSSL itself (no system libgit2/OpenSSL needed),
+  which still needs a C/C++ toolchain to build: Xcode Command Line Tools
+  on macOS, `build-essential` (or your distro's equivalent) on Linux, the
+  MSVC Build Tools on Windows.
+
+`make configure` installs/checks all three (see [Makefile
+targets](#makefile-targets) below) — run it once after cloning:
+
+```bash
+git clone <this repo>
+cd ide
+make configure
+```
+
 ## Building and running
 
 ```bash
 # GUI (default)
 cargo run -p ide-ui --bin ide
+# or: make run
 
 # Terminal UI, via the same binary
 cargo run -p ide-ui --bin ide -- --tui <project-directory>
+# or: make run-tui ARGS=<project-directory>
 
 # Terminal UI, standalone binary (equivalent, still built and works on its own)
 cargo run -p ide-tui --bin ide-tui -- <project-directory>
+
+# GUI, opening a project directly (skips the multi-window restore prompt)
+cargo run -p ide-ui --bin ide -- <project-directory>
 ```
+
+A release build (`cargo build --release --workspace --bins`, or `make
+release`) produces `target/release/ide` and `target/release/ide-tui`.
+`make install` builds a release binary and installs it as `ide` into
+`~/.cargo/bin` (on `PATH` for anyone using `rustup`), running `configure`
+first.
+
+### Prebuilt binaries
+
+Every tagged release (`vX.Y.Z`) is built for macOS, Linux, and Windows by
+CI and attached to that tag's [GitHub
+Release](../../releases) as `ide-<platform>` and
+`ide-tui-<platform>` — no local Rust toolchain needed if a prebuilt binary
+covers your platform.
+
+## Makefile targets
+
+| Target | What it does |
+|---|---|
+| `make configure` | Installs the pinned Rust toolchain + `rustfmt`/`clippy`, sets up Git LFS and pulls the font assets, checks for a C/C++ compiler. Safe to re-run. |
+| `make build` | Debug build of the whole workspace. |
+| `make release` | Optimized build. |
+| `make run` | Runs the GUI (`cargo run -p ide-ui`). |
+| `make run-tui ARGS=<dir>` | Runs the TUI via the unified binary's `--tui` flag. |
+| `make test` | Runs the workspace test suite. |
+| `make fmt` / `make fmt-fix` | Checks / applies `cargo fmt`. |
+| `make clippy` | Runs clippy with warnings denied. |
+| `make check` (alias `make ci`) | `fmt` + `clippy` + `build` + `test`, in the same order CI runs them — reproduces a CI failure locally. |
+| `make install` / `make uninstall` | Installs/uninstalls the `ide` binary via `cargo install`. |
+| `make bench` / `make bench-mem` | CPU / peak-memory benchmarks (`docs/features/perf-baseline.md`). |
+| `make clean` | `cargo clean`. |
 
 ## `ide-tui`: supported terminals
 
