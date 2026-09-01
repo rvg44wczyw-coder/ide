@@ -603,6 +603,17 @@ mod tests {
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         run(dir.path(), &["init", "-q"]);
+        // Local, not just `run`'s per-invocation `GIT_AUTHOR_*`/
+        // `GIT_COMMITTER_*` env vars: those only affect commits made
+        // through the `git` CLI here (`commit()` below), but `GitPanel::
+        // commit` (the production path several tests exercise) goes
+        // through `ide_core::GitRepo::commit`, which resolves its
+        // signature via `git2::Repository::signature()` -- pure config-
+        // file lookup, unaffected by those env vars. A CI runner with no
+        // global git identity set hits `config value 'user.name' was not
+        // found` there without this (v0.1.1 tag, run 33502675537).
+        run(dir.path(), &["config", "user.name", "Test User"]);
+        run(dir.path(), &["config", "user.email", "test@example.com"]);
         dir
     }
 
