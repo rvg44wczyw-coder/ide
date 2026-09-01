@@ -278,7 +278,7 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = (visible_start..visible_end)
         .map(|row| {
             let line = visual.buffer_line(row);
-            let mut styled = styled_line(text_buffer, line, &overlays);
+            let mut styled = styled_line(text_buffer, line, &overlays, buf.indent.width);
             // The collapsed-fold placeholder (`tui-code-folding.md` §3.4)
             // -- appended here, not inside `styled_line`, so folding stays
             // a concern this file alone knows about. Checking
@@ -305,8 +305,23 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect) {
         let (line, column) = cursor_line_column(buf.buffer.text_buffer(), offset);
         if let Some(screen_line) = visual.row_of(line).checked_sub(buf.scroll as usize) {
             if (screen_line as u16) < text_area.height {
+                // `column` is a `char` count (`cursor_line_column`'s own
+                // contract, unchanged -- editing/movement code elsewhere
+                // relies on that). The screen column a tab-containing line
+                // actually renders at is wider, per `styled_line`'s own
+                // tab expansion above -- re-derive it the same way, via the
+                // buffer's resolved `IndentUnit`, so the caret lands on the
+                // character it's actually next to instead of drifting left
+                // by however many tabs preceded it.
+                let line_text = text_buffer.line_text(line).unwrap_or("");
+                let byte_col = line_text
+                    .char_indices()
+                    .nth(column)
+                    .map(|(i, _)| i)
+                    .unwrap_or(line_text.len());
+                let screen_column = buf.indent.columns_of(&line_text[..byte_col]);
                 frame.set_cursor_position((
-                    text_area.x + column as u16,
+                    text_area.x + screen_column as u16,
                     text_area.y + screen_line as u16,
                 ));
             }

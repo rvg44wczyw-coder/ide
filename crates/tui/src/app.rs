@@ -11488,4 +11488,50 @@ mod tests {
         assert!(app.k8s_panel.as_ref().unwrap().picker.is_none());
         assert!(app.k8s_panel.as_ref().unwrap().context.is_none());
     }
+
+    /// Regression test for a real bug report: a tab-indented file (Go's
+    /// convention) rendered with every tab-indented line's leading
+    /// whitespace collapsed and its content shifted left, since ratatui's
+    /// `Buffer::set_stringn` silently drops literal tabs as control
+    /// characters (`highlight.rs::expand_tabs`'s own doc comment has the
+    /// full mechanism). Renders a real frame via `TestBackend` -- unlike
+    /// `highlight.rs`'s own unit tests of `styled_line` in isolation, this
+    /// exercises the full `ui::render` path (buffer indent resolution,
+    /// scroll, tab strip, cursor) the way a user would actually hit it.
+    #[test]
+    fn tab_indented_lines_keep_their_indentation_on_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("f.go"),
+            "package p\n\ntype T struct {\n\tname string\n}\n",
+        )
+        .unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(dir.path().join("f.go")).unwrap();
+        app.focus = Focus::Editor;
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let row_text = |y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        // Row 6 is "\tname string" (row 0: top border, 1: tab strip, 2:
+        // "package p", 3: blank, 4: "type T struct {", 5: the tab line) --
+        // asserted indirectly below via content rather than a hardcoded
+        // row index, so this doesn't break if the layout above shifts.
+        let indented_row = (0..buf.area.height)
+            .map(row_text)
+            .find(|line| line.contains("name") && line.contains("string"))
+            .expect("the struct field line is visible in this small file");
+        let name_col = indented_row.find("name").unwrap();
+        assert!(
+            name_col > 0,
+            "tab before `name` must still reserve display columns, not collapse to 0: {indented_row:?}"
+        );
+    }
 }

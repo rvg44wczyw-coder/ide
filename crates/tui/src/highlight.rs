@@ -242,10 +242,18 @@ pub struct LineOverlays<'a> {
 /// tokenizer output; an LSP `Position` that resolves to a byte offset via
 /// `position_to_byte_offset` is guaranteed on a char boundary by that
 /// function's own contract.
+///
+/// `tab_width` expands every literal tab in the line into spaces
+/// (`expand_tabs`) before it reaches a `Span` -- ratatui's own
+/// `Buffer::set_stringn` filters out `char::is_control` symbols, which
+/// silently drops a raw tab (and, with it, an entire tab-indented line's
+/// leading whitespace) rather than reserving any columns for it, collapsing
+/// and misaligning every character after it on screen.
 pub fn styled_line(
     text_buffer: &TextBuffer,
     line: usize,
     overlays: &LineOverlays<'_>,
+    tab_width: usize,
 ) -> Line<'static> {
     let line_text = text_buffer.line_text(line).unwrap_or("");
     let Some(line_start) = text_buffer.lines().line_start(line) else {
@@ -316,18 +324,31 @@ pub fn styled_line(
     boundaries.sort_unstable();
     boundaries.dedup();
 
-    let chip_spans_at = |offset: usize| -> Vec<Span<'static>> {
-        chips
-            .iter()
-            .filter(|(o, _)| *o == offset)
-            .map(|(_, label)| Span::styled(label.clone(), Style::default().fg(Color::DarkGray)))
-            .collect()
-    };
+    // Tracks the running *display* column across the whole line (not reset
+    // per span/chip), since a tab's expansion depends on how much has
+    // already been printed before it -- an inlay-hint chip inserted earlier
+    // on the line shifts every tab stop after it, same as it would on a
+    // real terminal.
+    let mut col = 0usize;
+    fn push_chips_at(
+        chips: &[&(usize, String)],
+        offset: usize,
+        spans: &mut Vec<Span<'static>>,
+        col: &mut usize,
+    ) {
+        for (_, label) in chips.iter().filter(|(o, _)| *o == offset) {
+            spans.push(Span::styled(
+                label.clone(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            *col += label.chars().count();
+        }
+    }
 
     let mut spans = Vec::new();
     for pair in boundaries.windows(2) {
         let (b0, b1) = (pair[0], pair[1]);
-        spans.extend(chip_spans_at(b0));
+        push_chips_at(&chips, b0, &mut spans, &mut col);
         if b1 > b0 {
             let mut style = tokens
                 .iter()
@@ -343,15 +364,41 @@ pub fn styled_line(
             if bracket_pair.iter().any(|p| p.start <= b0 && b1 <= p.end) {
                 style = style.bg(Color::Blue);
             }
-            spans.push(Span::styled(
-                line_text[b0 - line_start..b1 - line_start].to_string(),
-                style,
-            ));
+            let (expanded, new_col) =
+                expand_tabs(&line_text[b0 - line_start..b1 - line_start], col, tab_width);
+            col = new_col;
+            spans.push(Span::styled(expanded, style));
         }
     }
-    spans.extend(chip_spans_at(line_end));
+    push_chips_at(&chips, line_end, &mut spans, &mut col);
 
     Line::from(spans)
+}
+
+/// Expands every literal tab in `text` into spaces, advancing to the next
+/// multiple of `tab_width` from `start_col` -- mirrors
+/// `ide_core::IndentUnit::columns_of`'s tab-stop math, duplicated here
+/// (rather than reused) since that function measures a column count and
+/// this one needs the expanded text itself. Returns the expanded text and
+/// the column just past it, so callers can thread the running column
+/// across a line's several spans/chips. `tab_width` of `0` would make the
+/// "next multiple" step meaningless, so it's floored to `1`, same as
+/// `columns_of`'s own guard.
+fn expand_tabs(text: &str, start_col: usize, tab_width: usize) -> (String, usize) {
+    let stop = tab_width.max(1);
+    let mut col = start_col;
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\t' {
+            let next = col + stop - col % stop;
+            out.extend(std::iter::repeat_n(' ', next - col));
+            col = next;
+        } else {
+            out.push(ch);
+            col += 1;
+        }
+    }
+    (out, col)
 }
 
 #[cfg(test)]
@@ -406,7 +453,7 @@ mod tests {
     #[test]
     fn styled_line_on_untokenized_buffer_is_one_plain_span() {
         let b = buffer("plain text", None);
-        let line = styled_line(&b, 0, &no_overlays());
+        let line = styled_line(&b, 0, &no_overlays(), 4);
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].content, "plain text");
         assert_eq!(line.spans[0].style, Style::default());
@@ -415,7 +462,7 @@ mod tests {
     #[test]
     fn styled_line_on_out_of_range_line_is_a_safe_fallback() {
         let b = buffer("only one line", None);
-        let line = styled_line(&b, 5, &no_overlays());
+        let line = styled_line(&b, 5, &no_overlays(), 4);
         let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, "", "an out-of-range line has no text");
     }
@@ -423,7 +470,7 @@ mod tests {
     #[test]
     fn styled_line_colors_a_keyword_and_leaves_the_rest_plain() {
         let b = buffer("let x = 1;", Some(&ide_core::RUST));
-        let line = styled_line(&b, 0, &no_overlays());
+        let line = styled_line(&b, 0, &no_overlays(), 4);
         let keyword_span = line
             .spans
             .iter()
@@ -442,7 +489,7 @@ mod tests {
         let b = buffer("/* one\ntwo */\n", Some(&ide_core::RUST));
         assert_eq!(b.lines().line_count(), 3);
 
-        let line0 = styled_line(&b, 0, &no_overlays());
+        let line0 = styled_line(&b, 0, &no_overlays(), 4);
         let rebuilt0: String = line0.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt0, "/* one");
         assert!(line0
@@ -450,7 +497,7 @@ mod tests {
             .iter()
             .all(|s| s.style == style_for(TokenKind::Comment)));
 
-        let line1 = styled_line(&b, 1, &no_overlays());
+        let line1 = styled_line(&b, 1, &no_overlays(), 4);
         let rebuilt1: String = line1.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt1, "two */");
         assert!(line1
@@ -462,9 +509,56 @@ mod tests {
     #[test]
     fn styled_line_handles_multibyte_utf8_tokens() {
         let b = buffer("// héllo wörld\n", Some(&ide_core::RUST));
-        let line = styled_line(&b, 0, &no_overlays());
+        let line = styled_line(&b, 0, &no_overlays(), 4);
         let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, "// héllo wörld");
+    }
+
+    #[test]
+    fn expand_tabs_a_leading_tab_advances_to_the_next_stop() {
+        assert_eq!(expand_tabs("\tx", 0, 4), ("    x".to_string(), 5));
+    }
+
+    #[test]
+    fn expand_tabs_from_a_nonzero_start_column_still_lands_on_the_next_stop() {
+        // Starting at column 2 (e.g. after two chars already on the line),
+        // a tab advances only to column 4, not a full extra `tab_width`.
+        assert_eq!(expand_tabs("\t", 2, 4), ("  ".to_string(), 4));
+    }
+
+    #[test]
+    fn expand_tabs_a_tab_exactly_on_a_stop_advances_a_full_width() {
+        assert_eq!(expand_tabs("\t", 4, 4), ("    ".to_string(), 8));
+    }
+
+    #[test]
+    fn expand_tabs_zero_width_is_floored_to_one() {
+        assert_eq!(expand_tabs("\t", 0, 0), (" ".to_string(), 1));
+    }
+
+    #[test]
+    fn expand_tabs_non_tab_characters_pass_through_unchanged() {
+        assert_eq!(expand_tabs("abc", 0, 4), ("abc".to_string(), 3));
+    }
+
+    /// Regression test: ratatui's own `Buffer::set_stringn` drops literal
+    /// tabs as control characters, so a line whose regex-tokenizer span
+    /// still contained a raw `'\t'` used to collapse that tab to nothing
+    /// on screen -- `styled_line` must expand it into spaces first.
+    #[test]
+    fn styled_line_expands_a_leading_tab_instead_of_dropping_it() {
+        let b = buffer("\tname string\n", Some(&ide_core::RUST));
+        let line = styled_line(&b, 0, &no_overlays(), 4);
+        let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rebuilt, "    name string");
+    }
+
+    #[test]
+    fn styled_line_a_tab_after_a_token_still_advances_to_the_next_stop() {
+        let b = buffer("ab\tc\n", Some(&ide_core::RUST));
+        let line = styled_line(&b, 0, &no_overlays(), 4);
+        let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rebuilt, "ab  c");
     }
 
     #[test]
@@ -494,6 +588,7 @@ mod tests {
                 bracket_pair: &[],
                 selections: &[],
             },
+            4,
         );
         let foo_span = line
             .spans
@@ -831,7 +926,7 @@ mod tests {
             bracket_pair: &[],
             selections: &[],
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "let x = 1;");
         let x_span = line
             .spans
@@ -859,7 +954,7 @@ mod tests {
             bracket_pair: &[],
             selections: &[],
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         let chip_index = line
             .spans
             .iter()
@@ -896,7 +991,7 @@ mod tests {
             bracket_pair: &[],
             selections: &[],
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "let x = 1;");
     }
 
@@ -916,7 +1011,7 @@ mod tests {
             bracket_pair: &[],
             selections: &[],
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         let foo_span = line
             .spans
             .iter()
@@ -942,7 +1037,7 @@ mod tests {
             bracket_pair: &[],
             selections: &[],
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         // Reconstructing every span *except* the two pure-insertion chips
         // must exactly reproduce the original line, with nothing lost or
         // duplicated -- the no-gap/no-overlap covering invariant §4
@@ -968,7 +1063,7 @@ mod tests {
             bracket_pair: &bracket_pair,
             selections: &[],
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "let x = (1);");
         for content in ["(", ")"] {
             let span = line
@@ -998,7 +1093,7 @@ mod tests {
             bracket_pair: &[],
             selections: &selections,
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         let x_span = line
             .spans
             .iter()
@@ -1031,7 +1126,7 @@ mod tests {
             bracket_pair: &[],
             selections: &selections,
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "let x = 1;");
         assert!(line.spans.iter().all(|s| s.style.bg != Some(Color::Yellow)));
     }
@@ -1050,7 +1145,7 @@ mod tests {
             bracket_pair: &[],
             selections: &selections,
         };
-        let line = styled_line(&b, 0, &overlays);
+        let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "abcdef");
         // The shared boundary at offset 3 splits the two selections into
         // their own spans ("bc", "de") -- neither merges into the other nor
