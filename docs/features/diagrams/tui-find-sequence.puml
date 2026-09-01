@@ -1,0 +1,44 @@
+@startuml
+title Opening, typing, and jumping to a match (T4)
+
+actor User
+participant "App::handle_key" as HandleKey
+participant "App::handle_find_key" as HandleFind
+participant "FindState" as Find
+participant "ide_core::find_matches" as FindMatches
+participant "App::jump_to_match" as Jump
+
+User -> HandleKey: Ctrl+F
+HandleKey -> HandleKey: Action::Find\n(active tab? yes)
+HandleKey -> Find: FindState::new()
+note right of HandleKey
+  self.focus = Focus::Editor
+end note
+
+User -> HandleKey: types "f", "o", "o"
+loop each character
+  HandleKey -> HandleFind: self.find.is_some() -> route here
+  HandleFind -> Find: push_char(c, buffer.text())
+  Find -> FindMatches: SearchQuery::compile + find_matches
+  FindMatches --> Find: MatchResults { matches, truncated }
+  Find -> Find: current = Some(0) if any match
+end
+note right of Find
+  status_text() == "Find: foo  (1 of 3)"
+  shown on the status line
+end note
+
+User -> HandleFind: Ctrl+G
+HandleFind -> Find: next()
+Find --> HandleFind: Some(range) (wraps at the end)
+HandleFind -> Jump: jump_to_match(Some(range))
+Jump -> Jump: set_selections(range)\nbuf.scroll = line(range.start)
+note right of HandleFind
+  bar stays open -- Ctrl+G again
+  advances further
+end note
+
+User -> HandleFind: Enter
+HandleFind -> Jump: jump_to_match(find.current_match())
+HandleFind -> HandleFind: self.find = None
+@enduml

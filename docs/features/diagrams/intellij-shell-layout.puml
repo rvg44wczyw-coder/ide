@@ -1,0 +1,64 @@
+@startuml intellij-shell-layout
+skinparam componentStyle rectangle
+title B2b — IntelliJ shell layout (chrome only; A2 editor widget unchanged inside)
+
+package "Main toolbar (render_top_bar)" {
+  [Nav back/forward + project name]
+  [Context label -> command palette]
+  [Branch label]
+}
+
+package "Left stripe" {
+  [Project stripe icon\n(render_stripe_icon)]
+}
+package "Project tool window" {
+  [Header: "Project"]
+  [Tree (render_tree_entry, unchanged)]
+}
+
+package "Right stripe" {
+  [Claude stripe icon]
+}
+package "Claude tool window" {
+  [Header: "Claude"]
+  [Claude panel content (unchanged)]
+}
+
+package "Bottom stripe" {
+  [Problems / Run / Find stripe icons]
+}
+package "Bottom tool window (unchanged BottomView)" {
+  [Boxed tabs: Problems | Cargo Output | Usages | Search]
+  [Selected tab content (unchanged)]
+}
+
+package "Editor region (CentralPanel)" {
+  [Boxed editor tabs\n(render_boxed_tab)]
+  [A2 editor widget -- untouched by B2b]
+}
+
+package "Status bar (render_status_bar)" {
+  [Cursor pos, COLUMN badge, charset/EOL/indent]
+  [Errors/Warnings -> Problems]
+  [Branch]
+  [Smart Mode -- moved here from toolbar]
+}
+
+[Project stripe icon\n(render_stripe_icon)] ..> [Project tool window] : toggle_tool_window
+[Claude stripe icon] ..> [Claude tool window] : toggle_tool_window
+[Problems / Run / Find stripe icons] ..> [Bottom tool window (unchanged BottomView)] : toggle_bottom_tool_window
+[Context label -> command palette] ..> [Boxed editor tabs\n(render_boxed_tab)]
+
+note bottom of [Status bar (render_status_bar)]
+  Smart Mode block moved verbatim
+  from render_top_bar (§2.1, §2.6)
+end note
+
+note right of [A2 editor widget -- untouched by B2b]
+  Out of scope for B2b:
+  editor geometry/cursor/input,
+  Search Everywhere/Find Action,
+  keymap, BottomView split into
+  4 separate tool windows.
+end note
+@enduml

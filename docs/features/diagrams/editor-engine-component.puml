@@ -1,0 +1,55 @@
+@startuml editor-engine-component
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+
+title Editor Engine v1 (roadmap A1) — ide-core
+
+package "ide-core" {
+
+  package "text" as textpkg {
+    [TextBuffer] as TB
+    [LineIndex] as LI
+    [Transaction\n+ Change] as TX
+    [Selections\n+ Selection] as SEL
+    [History] as HIST
+  }
+
+  [Buffer\n(path, dirty, save)] as BUF
+  [syntax\ntokenize_range, LineState] as SYN
+}
+
+package "crates/ui (phase A2 — not this phase)" {
+  [editor widget] as UI
+}
+
+BUF --> TB : delegates\n(public API unchanged)
+UI ..> BUF : today
+UI ..> TB : A2: lines, selections,\ntokens per viewport
+
+TB --> TX : apply (atomic,\nback-to-front)
+TB --> LI : incremental\nreindex
+TB --> SEL : map through\ntransaction
+TB --> HIST : grouped undo\n+ selections
+TB --> SYN : retokenize\naffected lines
+
+HIST --> TX : stores inverse
+SEL ..> TX : map_offset(bias)
+LI ..> SYN : line ranges +\nper-line LineState
+
+note right of SYN
+  Only cross-line state is
+  "inside block comment":
+  strings stop at \n,
+  line comments end at \n.
+end note
+
+note bottom of TB
+  Single mutation entry point.
+  Invariants: selections non-empty
+  and non-overlapping; line index
+  equals a full rebuild; every
+  offset on a char boundary.
+end note
+
+@enduml

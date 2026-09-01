@@ -1,0 +1,75 @@
+@startuml claude-terminal-component
+title Claude terminal tabs — component relationships
+
+package "crates/ui/src/app.rs" {
+  class IdeApp {
+    claude: ClaudePanel
+    claude_terminals: ClaudeTerminalPanel
+    claude_view: ClaudeRailView
+  }
+}
+
+package "crates/ui/src/claude_terminal.rs (new)" {
+  class ClaudeTerminalPanel {
+    tabs: Vec<ClaudeTerminalTab>
+    active: Option<usize>
+    +open_tab(cwd, rows, cols)
+    +close_tab(index)
+    +poll(): bool
+  }
+  class ClaudeTerminalTab {
+    id: u64
+    cwd: PathBuf
+    title: String
+    exited: bool
+  }
+  class TerminalGrid {
+    +feed(bytes)
+    +resize(rows, cols)
+    +visible_rows()
+    +scrollback_rows()
+    +plain_text()
+  }
+  class PtySession {
+    +spawn(cwd, rows, cols)
+    +write(bytes)
+    +resize(rows, cols)
+    -poll(): Vec<PtyEvent>
+  }
+  class "key_event_to_bytes()" as KeyFn
+}
+
+package "portable-pty (new dependency)" {
+  class MasterPty
+  class Child
+}
+
+package "crates/ui/src/claude_panel.rs (unchanged)" {
+  class ClaudePanel
+}
+
+IdeApp *-- ClaudeTerminalPanel
+IdeApp *-- ClaudePanel : untouched by this feature
+ClaudeTerminalPanel *-- "0..*" ClaudeTerminalTab
+ClaudeTerminalTab *-- TerminalGrid
+ClaudeTerminalTab *-- PtySession
+PtySession o-- MasterPty
+PtySession o-- Child : killed on Drop
+KeyFn ..> PtySession : bytes written via
+
+note right of TerminalGrid
+  Pure, no I/O: hand-rolled
+  ANSI/CSI subset (§3.2 of
+  claude-terminal.md), not
+  a full xterm emulator.
+end note
+
+note right of PtySession
+  Program is always the fixed
+  literal "claude" — no shell,
+  no user-editable command
+  string. cwd re-checked with
+  is_dir() before spawn.
+end note
+
+@enduml

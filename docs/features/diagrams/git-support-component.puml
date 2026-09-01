@@ -1,0 +1,30 @@
+@startuml git-support-component
+title Git Support v1 — Component Overview
+
+package "ide-core" {
+  [Project] as Project
+  [GitRepo] as GitRepo
+  [git2 (libgit2)] as Git2
+}
+
+package "ide-ui" {
+  [IdeApp] as IdeApp
+  [GitPanel] as GitPanel
+}
+
+database "Working tree\n(.git + files on disk)" as Disk
+
+IdeApp --> Project : project.root()
+IdeApp --> GitPanel : view-mode toggle\n"Source Control"
+GitPanel --> GitRepo : commit_graph()\ndiff_file() / diff_commit()\nconflicts() / conflict_sides()\nresolve_conflict()
+GitRepo --> Git2 : wraps
+GitRepo ..> Project : opened from project.root()
+Git2 --> Disk : read commits/trees/index\nwrite resolved file + stage
+
+note right of GitRepo
+  No subprocess execution, no
+  network I/O. All access is
+  through the git2 library API.
+end note
+
+@enduml

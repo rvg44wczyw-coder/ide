@@ -1,0 +1,50 @@
+@startuml rust-language-support-component
+title Rust Language Support v1 — Component Overview
+
+package "ide-core" {
+  [Project] as Project
+  [Buffer / Tab] as Buffer
+}
+
+package "ide-lsp" {
+  [LspClient] as LspClient
+  [JSON-RPC event loop\n(tokio, background thread)] as EventLoop
+}
+
+package "ide-ui" {
+  [IdeApp] as IdeApp
+  [LspBridge] as LspBridge
+  [CargoPanel] as CargoPanel
+  [Problems panel] as Problems
+  [Editor squiggle layouter] as Squiggles
+}
+
+node "rust-analyzer\n(subprocess, stdio)" as RA
+node "cargo\n(subprocess, stdout/stderr)" as Cargo
+
+IdeApp --> Project : project.root()\nCargo.toml detection
+IdeApp --> LspBridge : owns
+IdeApp --> CargoPanel : owns
+LspBridge --> LspClient : start()/send()/try_recv()
+LspClient --> EventLoop : drives
+EventLoop --> RA : spawn + LSP over stdio
+LspBridge --> Problems : diagnostics map
+LspBridge --> Buffer : per-tab diagnostics
+Buffer --> Squiggles : tab.scratch + tab.diagnostics
+CargoPanel --> Cargo : spawn (explicit argv)\nstream stdout/stderr
+
+note right of LspClient
+  Paths validated against
+  project_root before send;
+  publishDiagnostics paths
+  validated before emitting
+  LspEvent::Diagnostics.
+end note
+
+note right of Cargo
+  One command in flight at a
+  time; current_dir = project
+  root; no shell interpretation.
+end note
+
+@enduml

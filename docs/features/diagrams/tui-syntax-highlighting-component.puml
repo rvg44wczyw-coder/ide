@@ -1,0 +1,40 @@
+@startuml
+title ide-tui -- T3 component relationships (syntax highlighting)
+
+skinparam componentStyle rectangle
+
+package "crates/tui" {
+  component "app.rs\nopen_or_focus_tab" as App
+  component "ui.rs\nstyled_line / style_for" as Ui
+}
+
+package "ide-core" {
+  component "syntax_for_path" as SyntaxForPath
+  component "Buffer::set_syntax" as SetSyntax
+  component "TextBuffer::apply\n(incremental retokenize)" as Apply
+  component "TextBuffer::tokens_in_lines" as TokensInLines
+  component "TokenKind / Token" as TokenKind
+}
+
+App --> SyntaxForPath : resolve from path\n(tab-open time)
+App --> SetSyntax : install rules once
+SetSyntax --> Apply : every later edit\nretokenizes incrementally
+Ui --> TokensInLines : per line, per frame
+TokensInLines --> TokenKind : returns overlapping tokens\n(may cross line boundary)
+Ui --> TokenKind : style_for(kind)
+
+note right of Ui
+  styled_line clamps each token's
+  absolute byte range to the current
+  line's own [line_start, line_end]
+  before slicing line_text -- a block
+  comment token can legitimately span
+  multiple lines.
+end note
+
+note bottom of App
+  Same syntax_for_path + set_syntax
+  pattern crates/ui/src/app.rs's
+  Tab::from_buffer already uses.
+end note
+@enduml

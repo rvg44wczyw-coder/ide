@@ -1,0 +1,44 @@
+@startuml
+title Replace All with a truncation notice (T6)
+
+actor User
+participant "App::handle_find_key" as HandleFind
+participant "App::replace_all_matches" as ReplaceAll
+participant "FindState" as Find
+participant "ide_core::replace_all" as CoreReplaceAll
+participant "Buffer::apply" as Apply
+
+User -> HandleFind: Ctrl+Shift+R
+HandleFind -> ReplaceAll: replace_all_matches()
+ReplaceAll -> Find: replace_all(text)
+Find -> CoreReplaceAll: replace_all(text, query,\nreplacement, None)
+CoreReplaceAll --> Find: Some(ReplaceResult {\ntransaction, truncated: true })
+Find --> ReplaceAll: Some(ReplaceResult)
+ReplaceAll -> Apply: buf.buffer.apply(transaction)
+note right of Apply
+  one undo step for
+  every match at once
+end note
+ReplaceAll -> Find: enable_replace_mode()
+ReplaceAll -> Find: resync(new text)
+note right of Find
+  refresh() resets
+  replace_all_truncated = false
+  as a side effect
+end note
+ReplaceAll -> Find: note_replace_all_result(true)
+note right of Find
+  must run *after* resync,
+  or resync's refresh()
+  would clobber it back
+  to false
+end note
+ReplaceAll -> ReplaceAll: jump_to_match(find.current_match())
+note right of HandleFind
+  status_text() now shows:
+  "... Replace: ...  (N of M)
+   (capped at 1000, run again)"
+  bar stays open
+end note
+
+@enduml

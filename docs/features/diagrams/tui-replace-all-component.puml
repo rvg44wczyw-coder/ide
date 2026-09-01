@@ -1,0 +1,22 @@
+@startuml
+title In-buffer replace all -- component relationships (T6)
+
+package "ide-tui" {
+  component "App\n(app.rs)" as App
+  component "FindState\n(find.rs, extended)" as FindState
+  component "ui::render_status\n(ui.rs, unchanged)" as RenderStatus
+}
+
+package "ide-core" {
+  component "buffer_search\n(replace_all, ReplaceResult)" as BufferSearch
+  component "Buffer / TextBuffer" as Buffer
+}
+
+App -> FindState : Ctrl+Shift+R (find-bar-local,\nnever a global command)
+FindState -> BufferSearch : replace_all(text, query,\nreplacement, None)
+BufferSearch --> FindState : ReplaceResult { transaction, truncated }
+App -> Buffer : buffer.apply(transaction)\n(one undo step for all matches)
+App -> FindState : resync(new text)\nthen note_replace_all_result(truncated)
+RenderStatus -> FindState : status_text()\n(replace-mode format +\ntruncation notice)
+
+@enduml

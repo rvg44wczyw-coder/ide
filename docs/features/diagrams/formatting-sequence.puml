@@ -1,0 +1,54 @@
+@startuml formatting-sequence
+title Formatting (A9) -- manual Reformat Code vs. Format on Save
+
+participant "ide-ui\n(IdeApp)" as UI
+participant "ide-lsp\n(LspClient)" as LSP
+participant "rust-analyzer" as Server
+
+== Manual Reformat Code (Cmd+Alt+L) ==
+UI -> UI : trigger_reformat_code()\n(tab_size/insert_spaces from IndentUnit)
+UI -> LSP : LspRequest::Format { path, tab_size, insert_spaces }
+
+alt documentFormattingProvider not negotiated
+  LSP --> UI : LspEvent::FormatReady { path, edit: None }\n(no wire traffic)
+else negotiated
+  LSP -> Server : textDocument/formatting
+  Server --> LSP : TextEdit[] | null
+  LSP -> LSP : wrap into a single-FileEdit WorkspaceEdit,\nor None if null/empty
+  LSP --> UI : LspEvent::FormatReady { path, edit }
+end
+
+UI -> UI : handle_format_ready()\nBuffer::apply (one more undo step, dirty, not auto-saved)
+
+== Format on Save ==
+UI -> UI : try_save_active() -- synchronous save,\ncompletely unchanged, runs to completion first
+note right of UI
+  Save is never delayed by LSP.
+  Only after it succeeds does the
+  follow-up formatting request fire.
+end note
+UI -> UI : format_on_save_target = Some(path)
+UI -> LSP : LspRequest::Format { path, tab_size, insert_spaces }
+LSP -> Server : textDocument/formatting
+Server --> LSP : TextEdit[] | null
+LSP --> UI : LspEvent::FormatReady { path, edit }
+
+UI -> UI : handle_format_ready()\nlocate tab by response's format_path -> idx
+alt edit is Some and idx found
+  UI -> UI : tabs[idx].buffer.apply(edit) -- buffer now formatted, dirty
+  UI -> UI : format_on_save_target matches idx's path\n-> save_tab_at(idx) again, silently\n(by index -- never self.active_tab)
+  note right of UI
+    File on disk was briefly unformatted
+    between the two saves -- accepted,
+    see doc §3.4 for why blocking the
+    first save was rejected instead.
+    save_tab_at(idx) targets the tab that
+    was actually reformatted, even if a
+    different tab is active by now.
+  end note
+else edit is None, or tab closed meanwhile
+  UI -> UI : nothing to reapply or resave
+end
+UI -> UI : format_on_save_target = None
+
+@enduml

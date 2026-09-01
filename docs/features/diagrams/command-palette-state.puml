@@ -1,0 +1,21 @@
+@startuml command-palette-state
+title Command palette lifecycle
+
+[*] --> Closed
+
+Closed --> Open : Cmd+Shift+A\n(open_command_palette)
+
+state Open {
+  [*] --> Filtering
+  Filtering --> Filtering : query edited\n(filtered_commands)
+  Filtering --> Filtering : Up/Down\n(command_palette_move_selection)
+}
+
+Open --> Closed : Escape\n(consumes key, top of\nescape-arbitration chain)
+Open --> Closed : window close control
+Open --> Executing : Enter / row click,\nselected row enabled\n(command_palette_confirm)
+Open --> Open : Enter / row click,\nselected row disabled\n(no-op, stays open)
+
+Executing --> Closed : run_command(action)
+
+@enduml

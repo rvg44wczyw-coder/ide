@@ -1,0 +1,26 @@
+@startuml global-search-and-languages-language-detect
+title Additional Languages — detection and server startup flow
+
+start
+:project opened / tree refreshed;
+:tree = project.scan_tree();
+if (root.join("Cargo.toml").exists()?) then (yes)
+  :active_language = Some(LanguageConfig::rust())\n(name "Rust", command "rust-analyzer");
+else (no)
+  :walk custom_languages in order;
+  if (any file in tree has\na custom config's extension?) then (yes)
+    :active_language = Some(that LanguageConfig);
+  else (no)
+    :active_language = None;
+  endif
+endif
+
+if (active_language is Some?) then (yes)
+  :lsp.start_with_command(\n  project.root(),\n  active_language.command\n);
+  note right: e.g. "gopls" for a\nuser-added Go config,\nno argument vector (v1)
+else (no)
+  :lsp.stop();
+endif
+stop
+
+@enduml

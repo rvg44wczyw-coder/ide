@@ -1,0 +1,36 @@
+@startuml git-branches-and-blame-component
+title E2 — Component Overview
+
+package "ide-core" {
+  [GitRepo] as GitRepo
+  [git2 (libgit2)] as Git2
+}
+
+package "ide-ui" {
+  [IdeApp] as IdeApp
+  [GitPanel] as GitPanel
+  [editor::blame_gutter\n(pure logic)] as BlameGutter
+  [editor::geometry] as Geometry
+  [EditorTab] as EditorTab
+}
+
+database "Working tree\n(.git + files on disk)" as Disk
+
+IdeApp --> GitPanel : branch-widget click\nopens branches popup
+GitPanel --> GitRepo : branches() / create_branch()\nswitch_branch() / delete_branch()\nmerge_branch() / commit()
+IdeApp --> EditorTab : toggle blame\n(gutter context menu\n/ command palette)
+EditorTab --> GitRepo : blame_file(path)
+EditorTab --> BlameGutter : annotations_from_blame()
+BlameGutter --> Geometry : reserved lane width\n(toggle-scoped, not\nper-frame recomputed)
+IdeApp --> GitRepo : commit_detail(id)\n(blame popup)
+GitRepo --> Git2 : wraps
+Git2 --> Disk : read history/blame,\nwrite branch refs,\ncheckout working tree,\nwrite merge commit
+
+note right of GitRepo
+  Local-only: no fetch/pull/push,
+  no remote-tracking info. Same
+  "no subprocess, no network I/O"
+  guarantee as git-support-component.
+end note
+
+@enduml

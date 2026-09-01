@@ -1,0 +1,35 @@
+@startuml global-search-and-languages-search-sequence
+title Global Search — query flow
+
+actor User
+participant "IdeApp\n(app.rs)" as UI
+participant "SearchPanel\n(search_panel.rs)" as Panel
+participant "background\nthread" as Thread
+participant "ide_core::search_tree" as Core
+
+User -> UI: type query, press Enter\n(or click "Search",\nor Cmd+Shift+F / Ctrl+Shift+F)
+UI -> UI: trigger_search()\n(no-op if no project open\nor query is blank)
+UI -> Panel: run(tree.clone(), query)
+
+alt already searching
+  Panel -> Panel: no-op (v1 runs at most\none search at a time)
+else idle
+  Panel -> Panel: searching = true
+  Panel -> Thread: spawn
+  Thread -> Core: search_tree(&tree, &query)
+  Core -> Core: walk tree depth-first\n(skip .git/target/node_modules,\nfiles > MAX_SEARCHABLE_FILE_BYTES,\nfiles that fail read_to_string)
+  Core -> Core: case-insensitive substring\nmatch, first hit per line,\nstop at MAX_SEARCH_RESULTS\n(truncated = true if hit)
+  Core --> Thread: SearchResults { matches, truncated }
+  Thread -> Panel: send via channel
+end
+
+loop every frame
+  UI -> Panel: poll()
+end
+Panel -> Panel: recv from channel\nresults = Some(...)\nsearching = false
+UI -> UI: Search panel re-renders\n("Searching…" / "No results."\n/ rows grouped by file)
+
+User -> UI: click a result row
+UI -> UI: open_search_result(path, byte_offset)\n(open_file + pending_cursor_offset)
+
+@enduml

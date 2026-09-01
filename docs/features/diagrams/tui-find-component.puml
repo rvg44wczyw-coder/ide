@@ -1,0 +1,26 @@
+@startuml
+title In-buffer find -- component relationships (T4)
+
+package "ide-tui" {
+  component "App\n(app.rs)" as App
+  component "FindState\n(find.rs, new)" as FindState
+  component "ui::render_status\n(ui.rs)" as RenderStatus
+  component "editor::cursor_line_column\n(editor.rs)" as Editor
+  component "commands.rs" as Commands
+}
+
+package "ide-core" {
+  component "buffer_search\n(find_matches, SearchQuery,\nSearchOptions)" as BufferSearch
+  component "Buffer / TextBuffer" as Buffer
+}
+
+App -> FindState : owns Option<FindState>
+App -> BufferSearch : push_char/pop_char call\nfind_matches via FindState
+FindState -> BufferSearch : SearchQuery::compile\n+ find_matches
+App -> Buffer : buffer.text()\n(search input)
+App -> Editor : cursor_line_column\n(jump_to_match scroll)
+App -> Buffer : set_selections\n(jump_to_match)
+Commands -> App : Action::Find (Ctrl+F)
+RenderStatus -> FindState : status_text()
+
+@enduml

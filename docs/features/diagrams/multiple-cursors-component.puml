@@ -1,0 +1,65 @@
+@startuml multiple-cursors-component
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+
+title Multiple Cursors (roadmap A3) — what each role adds
+
+package "crates/ui (role 2)" {
+  package "editor" {
+    [input.rs\nIntent + 5 variants,\nintent_for, apply_intent] as IN
+    [double_tap.rs\nDoubleTap\npress / is_armed / disarm] as DT
+    [geometry.rs\ncolumn_of,\ncolumn_selections] as GEO
+    [mod.rs\nhandle_mouse: ⌥Click,\ncolumn-mode drag] as W
+    [EditorState\n+ alt_tap, column_mode,\ncolumn_anchor] as ST
+  }
+  [render.rs\ntab strip: COLUMN chip] as APP
+}
+
+package "crates/core (role 1)" {
+  [text/find.rs\nnext_occurrence,\nall_occurrences\n(capped at MAX_OCCURRENCES)] as FIND
+  [Selections\n+ push_primary, remove_primary,\n+ remove_at, index_at] as SEL
+  [Selections::new\nsort + merge + re-point primary] as NORM
+  [TextBuffer\ntype_text / apply\n(one Transaction)] as TB
+}
+
+IN --> FIND : needle -> ranges
+IN --> SEL : add / remove / collapse
+IN --> TB : edits, unchanged from A2
+W --> ST
+W --> DT : ⌥ edge + frame time
+W --> GEO : drag rectangle ->\none Selection per line
+W --> SEL : ⌥Click -> push_primary
+DT --> IN : armed? ↑/↓ becomes CloneCaret
+GEO --> SEL
+SEL --> NORM
+APP --> ST : column_mode()
+
+note bottom of NORM
+  Every operation is expressed through
+  Selections::new — so "sorted, merged,
+  non-empty, primary re-pointed" holds
+  without any new normalisation (§4.1-4.2).
+end note
+
+note right of TB
+  A3 adds no edit path: N cursors already
+  produce one Transaction and one undo
+  step since A1/A2 (§3.7).
+end note
+
+note right of FIND
+  MAX_OCCURRENCES = 1000, same value and
+  reason as search::MAX_SEARCH_RESULTS:
+  a one-character needle in a large file
+  would otherwise make ⌃⌘G a UI hang (§4.8).
+end note
+
+note left of DT
+  The minimal double-tap detector
+  roadmap §5.1 assigns to A3;
+  G2 generalises it into the
+  command registry.
+end note
+
+@enduml

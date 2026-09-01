@@ -1,0 +1,43 @@
+@startuml find-usages-sequence
+title Find Usages — query flow
+
+actor User
+participant "IdeApp\n(app.rs)" as UI
+participant "LspBridge" as Bridge
+participant "LspClient\nevent loop" as Client
+participant "rust-analyzer" as Server
+
+User -> UI: click "Find Usages"\n(or Alt+F7 / Option+F7,\nor Cmd+Click a symbol)
+UI -> UI: find_usages()\n(byte_offset_to_position)
+UI -> Bridge: find_references(path, position)
+Bridge -> Bridge: references.clear()\nfinding_references = true
+Bridge -> Client: send(LspRequest::References)
+
+alt not yet initialized
+  Client -> Client: queue in pending[]
+else ready
+  Client -> Client: allocate id N\npending_references_id = N
+  Client -> Server: textDocument/references\n(id=N, includeDeclaration=true)
+end
+
+== later: a second query supersedes the first ==
+User -> UI: click "Find Usages" again (different symbol)
+UI -> Bridge: find_references(path2, position2)
+Bridge -> Client: send(LspRequest::References)
+Client -> Client: allocate id N+1\npending_references_id = N+1
+Client -> Server: textDocument/references (id=N+1)
+
+Server --> Client: response id=N (stale)
+Client -> Client: id != pending_references_id\n=> dropped, no event
+
+Server --> Client: response id=N+1
+Client -> Client: parse result (permissive:\nnull/empty/unparseable => [])
+Client -> Client: validate each Location's path\nagainst project_root; skip failures
+Client -> Bridge: LspEvent::References { locations }
+Bridge -> Bridge: references = locations\nfinding_references = false
+UI -> UI: Usages panel re-renders
+
+User -> UI: click a usage row
+UI -> UI: open_usage(path, position)\n(open_file + pending_cursor_offset)
+
+@enduml

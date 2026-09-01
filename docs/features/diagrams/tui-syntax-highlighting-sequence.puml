@@ -1,0 +1,42 @@
+@startuml
+title Opening and rendering a highlighted file (T3)
+
+actor User
+participant "App::open_or_focus_tab" as Open
+participant "ide_core::syntax_for_path" as SFP
+participant "ide_core::Buffer" as Buffer
+participant "ui::render_editor" as Render
+participant "ui::styled_line" as Styled
+participant "TextBuffer::tokens_in_lines" as Tokens
+
+User -> Open: Enter on main.rs (not yet open)
+Open -> Buffer: Buffer::open(path)
+Buffer --> Open: Ok(buffer)
+Open -> SFP: syntax_for_path(path)
+SFP --> Open: Some(&RUST)
+Open -> Buffer: buffer.set_syntax(Some(&RUST))
+note right of Buffer
+  Retokenizes from scratch.
+  Does NOT mark the buffer dirty.
+end note
+Open -> Open: push OpenBuffer, active_tab = Some(idx)
+
+User -> Render: (next frame)
+Render -> Render: visible_start..visible_end =\nbuf.scroll..buf.scroll+text_area.height
+loop for each line in visible_start..visible_end
+  Render -> Styled: styled_line(text_buffer, line)
+  Styled -> Tokens: tokens_in_lines(line..line+1)
+  Tokens --> Styled: tokens overlapping this line\n(may extend past line_end)
+  Styled -> Styled: clamp each token to\n[line_start, line_end]
+  Styled --> Render: styled Line (colored spans)
+end
+Render -> Render: Paragraph::new(lines)\n(no .scroll() -- already the visible slice)
+
+User -> Open: types a character
+Open -> Buffer: text_buffer_mut().type_text(...)
+note right of Buffer
+  TextBuffer::apply retokenizes only
+  the affected line span -- no
+  explicit re-highlight call needed.
+end note
+@enduml

@@ -1,0 +1,53 @@
+@startuml inlay-hints-and-hover-sequence
+title Inlay Hints and Hover — the three query shapes
+
+actor User
+participant "IdeApp\n(app.rs)" as UI
+participant "LspBridge" as Bridge
+participant "LspClient\nevent loop" as Client
+participant "rust-analyzer" as Server
+
+== Hover: explicit gesture, own pending-id slot ==
+User -> UI: F1 / Ctrl+Q
+UI -> UI: trigger_quick_documentation()\nshow_hover_popup = true
+UI -> Bridge: request_hover(path, position)
+Bridge -> Bridge: hover = None\nfinding_hover = true
+Bridge -> Client: send(LspRequest::Hover{..})
+Client -> Client: allocate id H\npending_hover_id = H
+Client -> Server: textDocument/hover (id=H)
+Server --> Client: result: { contents, range? }
+Client -> Client: flatten contents to plain text\n(Markup.value as-is, no markdown parsing;\nrange ignored)
+Client -> Bridge: LspEvent::Hover { contents }
+Bridge -> Bridge: hover = contents\nfinding_hover = false
+UI -> Bridge: poll() (next frame)
+UI -> UI: popup shows self.lsp.hover\n(or "Loading..." while finding_hover)
+
+== DocumentHighlight: ambient, re-fired on caret move ==
+User -> UI: moves caret to a new position
+UI -> UI: sync_document_highlights()\nfind_usages_target() != last_highlighted_target
+UI -> Bridge: request_document_highlight(path, position)
+Bridge -> Bridge: document_highlights.clear()
+Bridge -> Client: send(LspRequest::DocumentHighlight{..})
+Client -> Client: allocate id D\npending_document_highlight_id = D
+Client -> Server: textDocument/documentHighlight (id=D)
+Server --> Client: result: DocumentHighlight[] | null
+Client -> Client: BoundedRanges-deserialize,\ndiscard .kind
+Client -> Bridge: LspEvent::DocumentHighlight { ranges }
+Bridge -> Bridge: document_highlights = ranges
+UI -> UI: paint_document_highlights\n(background wash per range, symbol_highlight_bg)
+
+== InlayHint: ambient, re-fired on edit/open ==
+User -> UI: types a character (editor widget reports changed)
+UI -> UI: notify_lsp_changed(idx)  ' existing: DidChange
+UI -> UI: sync_inlay_hints(idx)    ' new: whole-document range
+UI -> Bridge: request_inlay_hints(path, {0,0}..end)
+Bridge -> Client: send(LspRequest::InlayHint{..})
+Client -> Client: allocate id I\npending_inlay_hint_id = I
+Client -> Server: textDocument/inlayHint (id=I)
+Server --> Client: result: InlayHint[] | null
+Client -> Client: BoundedInlayHints-deserialize,\nflatten label (String or LabelParts joined)
+Client -> Bridge: LspEvent::InlayHint { path, hints }
+Bridge -> Bridge: inlay_hints[path] = hints\n(old hints keep rendering until this replaces them)
+UI -> UI: paint chips via x_of(galley, ..)\n-- overlay only, never mutates the row's Galley
+
+@enduml

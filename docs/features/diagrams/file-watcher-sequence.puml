@@ -1,0 +1,37 @@
+@startuml file-watcher-sequence
+title File Watcher — event flow from OS to UI
+
+participant "OS / notify" as OS
+participant "debounce thread\n(FileWatcher)" as Debounce
+participant "IdeApp\n(UI thread)" as App
+participant "Tab" as Tab
+
+App -> Debounce : FileWatcher::new(root)
+activate Debounce
+
+App -> Debounce : save_active(): suppress(path)
+App -> App : Buffer::save_with(...)
+
+OS -> Debounce : raw create/write/rename events
+Debounce -> Debounce : fold into pending set\n(§3.2), check suppress map\n(§3.3), wait DEBOUNCE_WINDOW
+
+alt burst settles
+  Debounce -> Debounce : flush pending set\ninto WatchEvent list
+end
+
+App -> Debounce : poll_watcher(): poll()
+Debounce --> App : Vec<WatchEvent>
+
+alt TreeChanged
+  App -> App : refresh_tree()
+else FileModified(path), tab clean
+  App -> Tab : reload_active_from_disk()
+else FileModified(path), tab dirty
+  App -> Tab : external_change = Modified
+else FileRemoved(path)
+  App -> Tab : external_change = Deleted
+end
+
+App -> Debounce : (project switch) drop
+deactivate Debounce
+@enduml

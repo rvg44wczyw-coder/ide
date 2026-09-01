@@ -1,0 +1,27 @@
+@startuml search-in-path-v2-precedence
+title Search in Path v2 — per-entry include/exclude/.gitignore precedence
+
+start
+:entry (file or dir) reached during walk_filtered;
+if (name in SKIPPED_DIR_NAMES\n(.git, target, node_modules)?) then (yes, and is a dir)
+  :prune — never descend;
+  stop
+endif
+:Override::matched(path, is_dir);
+if (Match::Whitelist?) then (yes)
+  :included;
+  stop
+elseif (Match::Ignore?) then (yes)
+  :excluded\n(implicit-ignore-for-unmatched-file\nrule lives inside Override::matched itself);
+  stop
+else (Match::None)
+  :Gitignore::matched(path, is_dir)\n(root .gitignore only);
+  if (is_ignore?) then (yes)
+    :excluded;
+    stop
+  else (no)
+    :included;
+    stop
+  endif
+endif
+@enduml

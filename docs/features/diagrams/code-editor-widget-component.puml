@@ -1,0 +1,57 @@
+@startuml code-editor-widget-component
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+
+title Code Editor Widget (roadmap A2) — crates/ui
+
+package "crates/ui" {
+  package "editor" {
+    [CodeEditor::show] as W
+    [geometry.rs\nMetrics, visible_lines,\noffset_at_pos] as GEO
+    [input.rs\nIntent, intent_for,\napply_intent] as IN
+    [paint.rs\nline_layout_job,\ngalley cache] as PAINT
+    [EditorState\ndesired_column, cache,\npending_scroll, last_click] as ST
+  }
+  [IdeApp / render.rs] as APP
+  [theme::Tokens] as TOK
+}
+
+package "ide-core (A1, merged)" {
+  [TextBuffer] as TB
+  [LineIndex] as LI
+  [Selections] as SEL
+  [Transaction] as TX
+  [tokens_in_lines] as TOKS
+}
+
+APP --> W : buffer, state, tokens,\ndiagnostics, link, goto_offset
+W --> APP : EditorOutput\ncursor_offset, changed,\nhovered_word, clicked_link
+
+W --> GEO : visible range,\nclick -> offset
+W --> IN : events -> Intent
+W --> PAINT : one galley per\nvisible line
+W --> ST
+
+IN --> TB : type_text / apply /\nundo / redo
+IN --> TX
+GEO --> LI
+PAINT --> TOKS
+PAINT --> TOK : colours only —\nno literals (§4.4)
+W --> SEL : paint every caret\nand selection
+
+note bottom of W
+  ScrollArea::show_viewport +
+  ui.set_height(row_height * line_count):
+  only the visible lines are laid out,
+  so frame cost is O(visible), not O(file).
+end note
+
+note right of ST
+  Galley cache stores each line's
+  text next to its galley — reuse only
+  on an exact match, so nothing can
+  go stale (§4.2).
+end note
+
+@enduml

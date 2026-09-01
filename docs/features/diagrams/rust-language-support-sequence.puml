@@ -1,0 +1,32 @@
+@startuml rust-language-support-sequence
+title Rust Language Support v1 — Diagnostics Flow
+
+actor User
+participant "Tab\n(ide-ui)" as Tab
+participant "LspBridge\n(ide-ui)" as Bridge
+participant "LspClient\n(ide-lsp)" as Client
+participant "rust-analyzer" as RA
+participant "Problems panel\n(ide-ui)" as Problems
+
+User -> Tab : types in editor
+Tab -> Tab : reconcile()\n(scratch != buffer text)
+Tab -> Bridge : LspRequest::DidChange { path, text }
+Bridge -> Client : send(request)
+Client -> Client : validate path against\nproject_root
+Client -> RA : textDocument/didChange\n(JSON-RPC, full text)
+RA -> RA : re-analyze file
+
+RA -> Client : textDocument/publishDiagnostics\n(uri, [Diagnostic])
+Client -> Client : uri -> PathBuf,\nvalidate against project_root
+Client -> Bridge : LspEvent::Diagnostics { path, diagnostics }
+Bridge -> Bridge : replace path's entry\nin workspace map
+
+alt frame loop poll (every frame)
+  Bridge -> Tab : update tab.diagnostics\n(if path is open)
+  Tab -> Tab : layouter converts Position\n(UTF-16) -> byte offset,\nrenders squiggles
+  Bridge -> Problems : refresh row list
+  User -> Problems : click a row
+  Problems -> Tab : open_file(path),\nseek to diagnostic start
+end
+
+@enduml

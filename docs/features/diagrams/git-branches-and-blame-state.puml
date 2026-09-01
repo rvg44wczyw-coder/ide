@@ -1,0 +1,24 @@
+@startuml git-branches-and-blame-state
+title E2 — merge_branch Decision Flow
+
+[*] --> Analyzing : merge_branch(name)
+
+Analyzing --> UpToDate : name's tip already\nan ancestor of HEAD
+UpToDate --> [*]
+
+Analyzing --> FastForward : fast-forward possible\n(HEAD is an ancestor of name)
+FastForward --> [*] : HEAD ref moved,\nsafe checkout run,\nno commit created
+
+Analyzing --> RealMerge : neither up-to-date\nnor fast-forwardable
+
+RealMerge --> Conflicted : repo.merge() leaves\nindex conflicts
+RealMerge --> CleanMerge : repo.merge() leaves\na clean index
+
+CleanMerge --> Merged : commit()\n(MERGE_HEAD-aware,\ndefault message)
+Merged --> [*]
+
+Conflicted --> Resolving : returned to caller\nas MergeOutcome::Conflicts(paths)
+Resolving --> Resolving : resolve_conflict()\nper path\n(existing E1 flow,\nsee git-support-state.puml)
+Resolving --> Merged : every path resolved,\nuser presses Commit\n(same commit() call,\nMERGE_HEAD-aware)
+
+@enduml

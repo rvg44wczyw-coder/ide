@@ -1,0 +1,58 @@
+@startuml code-actions-sequence
+title Code Actions (A8) -- two ways into one apply sequence
+
+participant "ide-ui\n(IdeApp)" as UI
+participant "ide-lsp\n(LspClient)" as LSP
+participant "rust-analyzer" as Server
+participant "ide-core\n(apply_workspace_edit_to_disk)" as Core
+
+== Ambient refresh (every frame, caret-driven) ==
+UI -> LSP : LspRequest::CodeAction { path, position }
+LSP -> Server : textDocument/codeAction
+Server --> LSP : (Command | CodeAction)[] | null
+LSP -> LSP : cache raw entries as last_code_actions
+LSP --> UI : LspEvent::CodeAction { path, actions }
+UI -> UI : gutter lightbulb reflects actions.is_empty()
+
+== User selects an action (Alt+Enter) ==
+UI -> UI : trigger_show_intention_actions()\n(shows already-cached actions, no request)
+UI -> LSP : LspRequest::ApplyCodeAction { index }
+
+alt entry already has an edit
+  LSP -> LSP : convert_workspace_edit(...)
+else entry needs resolving (resolveProvider: true)
+  LSP -> Server : codeAction/resolve (raw cached JSON, verbatim)
+  Server --> LSP : CodeAction { edit }
+  LSP -> LSP : convert_workspace_edit(...)
+else unsupported (bare Command, or unresolvable)
+  LSP -> LSP : edit = None
+end
+
+LSP --> UI : LspEvent::WorkspaceEditReady { edit, label }
+
+== Server-initiated (e.g. tail of workspace/executeCommand) ==
+Server -> LSP : workspace/applyEdit { label?, edit }
+LSP -> LSP : convert_workspace_edit(...)
+LSP --> Server : { applied: true | false, failureReason? }
+LSP --> UI : LspEvent::WorkspaceEditReady { edit, label }
+
+== Converged: applying edit (handle_workspace_edit_ready) ==
+UI -> UI : partition edit.edits: open tabs vs. no open tab
+UI -> Core : apply_workspace_edit_to_disk(disk subset)
+note right of Core
+  fresh read -> check offsets fit ->
+  write every file, or roll back
+  every already-written file and
+  fail the whole disk subset
+end note
+Core --> UI : Ok | Err(rolled back)
+
+alt disk phase succeeded (or nothing to write)
+  UI -> UI : Buffer::apply for each open-tab file\n(one more undo step, dirty, not auto-saved)
+else disk phase failed
+  UI -> UI : no buffer touched -- report failure
+end
+
+UI -> UI : self.error = one-line summary
+
+@enduml

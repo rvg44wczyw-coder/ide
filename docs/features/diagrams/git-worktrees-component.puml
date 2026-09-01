@@ -1,0 +1,64 @@
+@startuml git-worktrees-component
+title Git Worktrees (E8) -- component relationships
+
+package "ide-core" {
+  class GitRepo {
+    +worktrees(): Vec<WorktreeInfo>
+    +add_worktree(name, path, branch)
+    +remove_worktree(name, force)
+  }
+  class WorktreeInfo {
+    +name: String
+    +path: PathBuf
+    +branch: Option<String>
+    +is_locked: bool
+  }
+  GitRepo ..> WorktreeInfo : returns
+}
+
+package "ide-ui" {
+  class GitPanel {
+    +worktrees_popup: WorktreesPopupState
+    +open_worktrees_popup()
+    +refresh_worktrees()
+    +create_worktree()
+    +remove_worktree(name, force)
+  }
+  class WorktreesPopupState
+  class App {
+    +project: Option<Project>
+    +open_project(path, ctx)
+    +open_in_new_window(path)
+  }
+  class MainRs <<main.rs>> {
+    +main()
+  }
+  class LibRs <<lib.rs>> {
+    +run(initial_project: Option<PathBuf>)
+  }
+
+  GitPanel *-- WorktreesPopupState
+  GitPanel --> GitRepo : calls
+  App --> GitPanel
+  App --> "std::process::Command" : spawns current_exe()
+  MainRs --> LibRs : run(path)
+  LibRs --> App : App::new / open_project
+}
+
+note right of App::open_in_new_window
+  Spawns std::env::current_exe()
+  with a single path argument --
+  no shell, no user-configurable
+  program name.
+end note
+
+note right of GitRepo::add_worktree
+  Validates name + destination
+  path before any git2 call
+  (InvalidWorktreeName,
+  WorktreeNameTaken,
+  DestinationNotEmpty,
+  WorktreeInsideRepo).
+end note
+
+@enduml

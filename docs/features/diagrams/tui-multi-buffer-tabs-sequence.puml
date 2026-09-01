@@ -1,0 +1,47 @@
+@startuml
+title Opening a second file while the first tab is dirty (T2)
+
+actor User
+participant "App::handle_key" as HK
+participant "App::open_or_focus_tab" as Open
+participant "tabs: Vec<OpenBuffer>" as Tabs
+participant "ide_core::Buffer" as Buffer
+
+User -> HK: Enter on a.txt (tree row)
+HK -> Open: open_or_focus_tab(a.txt)
+Open -> Tabs: any tab.path == a.txt?
+Tabs --> Open: no
+Open -> Buffer: Buffer::open(a.txt)
+Buffer --> Open: Ok(buffer)
+Open -> Tabs: push OpenBuffer { a.txt, ... }
+Open -> Open: active_tab = Some(0)
+
+User -> HK: Ctrl+T, type '!' (dirties tab 0)
+HK -> Tabs: active_buffer_mut().buffer.mark_dirty()
+
+User -> HK: Ctrl+T, Down, Enter on b.txt
+HK -> Open: open_or_focus_tab(b.txt)
+Open -> Tabs: any tab.path == b.txt?
+Tabs --> Open: no
+Open -> Buffer: Buffer::open(b.txt)
+Buffer --> Open: Ok(buffer)
+Open -> Tabs: push OpenBuffer { b.txt, ... }
+Open -> Open: active_tab = Some(1)
+note right of Tabs
+  tab 0 (a.txt) untouched --
+  still dirty, edit intact.
+  T1 would have refused this
+  whole step with a status message.
+end note
+
+User -> HK: Enter on a.txt again
+HK -> Open: open_or_focus_tab(a.txt)
+Open -> Tabs: any tab.path == a.txt?
+Tabs --> Open: yes, index 0
+Open -> Open: active_tab = Some(0)
+note right of Open
+  No Buffer::open call --
+  the in-memory dirty edit
+  is never re-read from disk.
+end note
+@enduml

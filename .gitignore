@@ -8,5 +8,6 @@
 /.claude/settings.local.json
 .ide/
 
-# documentation kept locally, not tracked
-/docs/
+# security-review findings (hacker skill output) -- working notes on real,
+# potentially still-relevant vulnerabilities; not meant to be published
+/docs/security-findings/

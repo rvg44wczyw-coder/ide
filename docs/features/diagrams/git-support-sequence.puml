@@ -1,0 +1,35 @@
+@startuml git-support-sequence
+title Git Support v1 — Conflict Resolution Sequence
+
+actor User
+participant "GitPanel\n(ide-ui)" as Panel
+participant "GitRepo\n(ide-core)" as Repo
+participant "git2 / libgit2" as Git2
+
+User -> Panel : open Source Control view
+Panel -> Repo : conflicts()
+Repo -> Git2 : read index conflict entries
+Git2 --> Repo : [path, ...]
+Repo --> Panel : [path, ...]
+Panel -> User : show Conflicts list
+
+User -> Panel : select conflicted path
+Panel -> Repo : conflict_sides(path)
+Repo -> Git2 : read base/ours/theirs blobs
+Git2 --> Repo : ConflictSides
+Repo --> Panel : ConflictSides
+Panel -> User : show Base | Ours | Theirs\n+ editable Result (seeded from Ours)
+
+User -> Panel : edit Result / click Accept Ours|Theirs
+User -> Panel : click "Mark Resolved"
+Panel -> Repo : resolve_conflict(path, result_text)
+Repo -> Repo : canonicalize path,\nverify inside workdir()
+Repo -> Git2 : write blob to working tree
+Repo -> Git2 : stage path (index.add)
+Git2 --> Repo : ok
+Repo --> Panel : Ok(())
+Panel -> Repo : conflicts()  ' re-query
+Repo --> Panel : [remaining paths]
+Panel -> User : path removed from Conflicts list\n+ "commit to finish the merge" hint
+
+@enduml

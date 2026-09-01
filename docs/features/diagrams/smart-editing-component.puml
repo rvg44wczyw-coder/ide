@@ -1,0 +1,55 @@
+@startuml
+skinparam componentStyle rectangle
+skinparam defaultFontName Helvetica
+skinparam shadowing false
+skinparam ArrowColor #555555
+skinparam componentBorderColor #888888
+skinparam packageBorderColor #AAAAAA
+
+title A4a Smart Editing — language-aware typing and brackets
+
+package "ide-core" {
+  [SyntaxRules\n+ brackets\n+ indent_line_suffixes] as RULES
+  [text::indent\nIndentUnit, newline_indent,\nsplits_a_pair] as INDENT
+  [TextBuffer::matching_bracket\nBracketPair,\nMAX_BRACKET_SCAN_BYTES] as BRACKETS
+  [TextBuffer ops\nindent / outdent / surround] as OPS
+  [TextBuffer\ntext + lines + selections\n+ tokens + history] as TB
+}
+
+package "ide-ui" {
+  [intent_for\npure key -> Intent] as INTENT
+  [Frame::rewrite\nTab -> Indent or Insert(unit)] as REWRITE
+  [apply_intent\nauto-close, type-over,\nsurround, auto-indent] as APPLY
+  [paint_bracket_pair\nbracket_match_bg] as PAINT
+  [EditorState\nindent, bracket_pair,\nauto_closed] as STATE
+}
+
+RULES --> INDENT
+RULES --> BRACKETS
+TB <-- OPS : one Transaction\nper command
+TB <-- BRACKETS : tokens() for the\nstring/comment skip
+INDENT --> OPS
+
+INTENT --> REWRITE
+REWRITE --> APPLY
+APPLY --> OPS
+APPLY --> INDENT
+APPLY --> BRACKETS
+STATE <--> REWRITE
+STATE <--> APPLY
+BRACKETS --> PAINT
+STATE --> PAINT
+
+note bottom of BRACKETS
+  Refuses past MAX_HIGHLIGHTED_FILE_BYTES,
+  keyed on the buffer's size -- a small file
+  reaches an empty tokens() legitimately.
+end note
+
+note bottom of INDENT
+  Consumed by A4b:
+  IndentUnit, brackets,
+  matching_bracket.
+end note
+
+@enduml

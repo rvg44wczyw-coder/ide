@@ -1,0 +1,32 @@
+@startuml code-folding-state
+title One fold range's collapsed/expanded state (per start_line)
+
+[*] --> Expanded : fold_ranges() reports this range\n(EditorState::folded has no entry for it)
+
+Expanded --> Collapsed : gutter arrow click\n(EditorState::toggle_fold)
+Expanded --> Collapsed : CollapseFold (⌘−)\nwhen this is the innermost\nuncollapsed range at the caret
+
+Collapsed --> Expanded : gutter arrow click again\n(EditorState::toggle_fold)
+Collapsed --> Expanded : placeholder "⋯" click
+Collapsed --> Expanded : ExpandFold (⌘+)\ncaret is on start_line\n(the only place it can be)
+
+Expanded --> Collapsed : CollapseAllFolds (⌘⇧−)
+Collapsed --> Expanded : ExpandAllFolds (⌘⇧+)
+
+note right of Collapsed
+  Interior lines (start_line+1..=end_line)
+  are absent from VisualLines: no row,
+  no caret, no click target. Only
+  start_line itself still has a row,
+  showing the "{ ⋯" placeholder.
+end note
+
+note left of Expanded
+  An edit that removes this range from
+  fold_ranges() (e.g. the brace pair no
+  longer spans multiple lines) leaves a
+  stale EditorState::folded entry inert --
+  it simply stops affecting anything,
+  rather than transitioning here.
+end note
+@enduml

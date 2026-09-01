@@ -1,0 +1,35 @@
+@startuml
+title FindBar lifecycle (per Tab)
+
+[*] --> Closed
+
+state Closed {
+}
+
+state FindOnly {
+}
+
+state FindReplace {
+}
+
+Closed --> FindOnly : ⌘F\n(open(false, ...))
+Closed --> FindReplace : ⌘R\n(open(true, ...))
+FindOnly --> FindReplace : ⌘R\n(replace row revealed,\nquery/matches kept)
+FindReplace --> FindReplace : ⌘F\n(no-op: already open)
+
+FindOnly --> Closed : Escape / close button
+FindReplace --> Closed : Escape / close button
+
+FindOnly --> FindOnly : query/option edit\n(refresh, §3.2)
+FindReplace --> FindReplace : query/option edit,\nReplace, Replace All\n(refresh, §3.2/§3.8)
+
+note right of Closed
+  query / replacement / options / scope
+  are preserved across Closed <-> open
+  transitions on the SAME tab (§3.7).
+  Switching tabs shows a DIFFERENT
+  Tab's own FindBar, starting from
+  its own last state.
+end note
+
+@enduml

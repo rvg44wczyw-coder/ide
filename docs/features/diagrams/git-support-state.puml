@@ -1,0 +1,17 @@
+@startuml git-support-state
+title Git Support v1 — Per-file Conflict Lifecycle
+
+[*] --> Unresolved : merge/rebase leaves\nindex conflict entry
+
+Unresolved --> Reviewing : user selects path\nin Conflicts list
+Reviewing --> Reviewing : Accept Ours / Accept Theirs /\nhand-edit Result
+
+Reviewing --> Unresolved : user selects a\ndifferent conflicted path\n(no write happens)
+
+Reviewing --> Resolved : Mark Resolved\n(resolve_conflict succeeds)
+
+Resolved --> [*] : path no longer in\nconflicts() — user commits\nexternally to finish the merge
+
+Reviewing --> Reviewing : resolve_conflict fails\n(PathEscapesRepo / io error)\n— error shown, stays in Reviewing
+
+@enduml

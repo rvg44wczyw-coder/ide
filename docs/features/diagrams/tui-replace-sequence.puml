@@ -1,0 +1,58 @@
+@startuml
+title Opening replace mode and replacing a match (T5)
+
+actor User
+participant "App::handle_key" as HandleKey
+participant "App::handle_find_key" as HandleFind
+participant "FindState" as Find
+participant "ide_core::replace_one" as ReplaceOne
+participant "Buffer::apply" as Apply
+participant "App::jump_to_match" as Jump
+
+User -> HandleKey: Ctrl+R (no bar open)
+HandleKey -> HandleKey: Action::Replace\n(active tab? yes)
+HandleKey -> Find: FindState::new()\n+ enable_replace_mode()
+note right of HandleKey
+  self.focus = Focus::Editor
+  field = Query
+end note
+
+User -> HandleFind: types "f", "o", "o"
+loop each character
+  HandleFind -> Find: push_char(c, text)\n(field == Query -> refresh)
+end
+note right of Find
+  status_text() ==
+  "▸ Find: foo    Replace:   (1 of 3)"
+end note
+
+User -> HandleFind: Tab
+HandleFind -> Find: toggle_field()\n(field = Replacement)
+
+User -> HandleFind: types "b", "a", "z"
+loop each character
+  HandleFind -> Find: push_char(c, text)\n(field == Replacement -> no refresh)
+end
+note right of Find
+  status_text() ==
+  "  Find: foo  ▸ Replace: baz  (1 of 3)"
+end note
+
+User -> HandleFind: Enter (field == Replacement)
+HandleFind -> Find: replace_current(text)
+Find -> ReplaceOne: replace_one(text, query,\ncurrent_range, "baz")
+ReplaceOne --> Find: Transaction
+Find --> HandleFind: Some(transaction)
+HandleFind -> Apply: buf.buffer.apply(transaction)
+note right of Apply
+  marks dirty, pushes one
+  undoable step
+end note
+HandleFind -> Find: resync(new text)
+HandleFind -> Jump: jump_to_match(find.current_match())
+note right of HandleFind
+  bar stays open --
+  Enter again replaces the next one
+end note
+
+@enduml

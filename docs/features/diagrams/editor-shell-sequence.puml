@@ -1,0 +1,42 @@
+@startuml editor-shell-sequence
+title Open project -> browse -> edit -> save
+
+actor User
+participant "IdeApp (ide-ui)" as UI
+participant "Project (ide-core)" as Project
+participant "Buffer (ide-core)" as Buffer
+participant "Filesystem" as FS
+
+User -> UI: click "Open Project"
+UI -> UI: rfd::FileDialog::pick_folder()
+UI -> Project: Project::open(dir)
+Project -> FS: canonicalize + validate directory
+FS --> Project: ok
+Project --> UI: Project
+
+UI -> Project: scan_tree()
+Project -> FS: walk entries\n(skip symlink-escapes, unreadable)
+FS --> Project: entries
+Project --> UI: DirEntry tree
+UI -> UI: render tree in left panel
+
+User -> UI: click file in tree
+UI -> Buffer: Buffer::open(path)
+Buffer -> FS: read_to_string(path)
+FS --> Buffer: contents
+Buffer --> UI: Buffer
+UI -> UI: open new tab, focus it
+
+User -> UI: types in editor
+UI -> Buffer: insert(offset, text)
+Buffer -> Buffer: push Edit onto undo_stack,\nmark dirty
+
+User -> UI: Cmd/Ctrl+S
+UI -> Buffer: save()
+Buffer -> FS: write(path, text)
+FS --> Buffer: ok
+Buffer -> Buffer: dirty = false
+Buffer --> UI: Ok(())
+UI -> UI: clear dirty indicator on tab
+
+@enduml

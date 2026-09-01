@@ -1,0 +1,19 @@
+@startuml editor-shell-state
+title Tab / buffer lifecycle
+
+[*] --> Untitled : new tab (no file)
+[*] --> Clean : open existing file
+
+Untitled --> Dirty : first keystroke
+Clean --> Dirty : edit
+Dirty --> Clean : save() succeeds
+Dirty --> Dirty : save() fails\n(I/O error shown to user)
+
+Clean --> Closed : close tab
+Dirty --> ConfirmDiscard : close tab
+ConfirmDiscard --> Closed : user confirms discard
+ConfirmDiscard --> Dirty : user cancels
+
+Closed --> [*]
+
+@enduml

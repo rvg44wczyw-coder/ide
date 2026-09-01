@@ -1,0 +1,38 @@
+@startuml
+title ide-tui -- T2 component relationships (multi-buffer / tabs)
+
+skinparam componentStyle rectangle
+
+package "crates/tui" {
+  [main.rs] --> [app.rs] : handle_key / App::new
+  [main.rs] --> [ui.rs] : render(frame, &app)
+
+  component "app.rs\nApp { tabs: Vec<OpenBuffer>, active_tab }" as App
+  component "commands.rs\nNextTab / PreviousTab / CloseTab" as Commands
+  component "editor.rs\nmove_cursor / cursor_line_column" as Editor
+  component "tree.rs\nTreeState" as Tree
+  component "ui.rs\nrender_editor (+ tab strip)" as Ui
+
+  App --> Commands : binding_for(key)
+  App --> Editor : active_buffer_mut()'s TextBuffer
+  App --> Tree : tree_state
+  Ui --> App : reads tabs / active_tab
+}
+
+package "ide-core" {
+  [Buffer]
+  [TextBuffer]
+  [Project / DirEntry]
+}
+
+App --> Buffer : open_or_focus_tab -> Buffer::open
+Editor --> TextBuffer
+App --> "Project / DirEntry" : App::new (unchanged from T1)
+
+note right of App
+  T1: buffer: Option<OpenBuffer>
+  T2: tabs: Vec<OpenBuffer>, active_tab: Option<usize>
+  open_or_focus_tab dedupes by path before
+  ever calling Buffer::open again.
+end note
+@enduml

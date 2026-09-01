@@ -1,0 +1,61 @@
+@startuml fleet-look-foundation-component
+title Fleet Look B1 — design tokens as the single appearance authority
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+
+package "crates/ui/src/theme" {
+  component "palette.rs\n<size:10>FLEET_DARK / FLEET_LIGHT\n(&'static Tokens)</size>" as PAL
+  component "mod.rs\n<size:10>Theme, Tokens,\napply(), severity_color()</size>" as MOD
+  component "fonts.rs\n<size:10>include_bytes! faces,\nfont_definitions(),\ncompile-time LFS guard</size>" as FONTS
+}
+
+folder "crates/ui/assets/fonts (Git LFS)" {
+  artifact "Inter Regular/Medium\nJetBrains Mono Regular/Bold\n+ OFL licences" as TTF
+}
+
+package "crates/ui/src" {
+  component "app.rs\n<size:10>IdeApp::new,\ntoggle_theme</size>" as APP
+  component "app/render.rs\n<size:10>tab_layout_job, panels,\nlabels, diff</size>" as RENDER
+}
+
+cloud "egui" {
+  component "Context\n<size:10>Style + Visuals\n+ FontDefinitions</size>" as CTX
+}
+
+component "editor widget\n<size:10>gutter, current line,\ncaret, selection</size>" as A2 #line.dashed
+component "fleet-shell\n<size:10>top bar, status bar,\ntabs, tree icons</size>" as B2 #line.dashed
+component "loadable themes\n<size:10>Tokens from file</size>" as G3 #line.dashed
+
+TTF -down-> FONTS : embedded at compile time
+PAL -right-> MOD : backs Theme::tokens()
+FONTS -left-> MOD : font_definitions()
+
+APP -down-> MOD : install_fonts() once,\napply(theme) on startup + toggle
+MOD -right-> CTX : Style, Visuals,\nFontDefinitions
+RENDER -up-> MOD : syntax.of(kind),\nseverity_color(),\ncolor.* — no literals
+CTX -up-> RENDER : resolved style per frame
+
+MOD .down.> A2 : <size:10>A2 reads current_line_bg,\ngutter_fg*, caret, selection_bg</size>
+MOD .down.> B2 : <size:10>B2 adds shell tokens</size>
+MOD .down.> G3 : <size:10>G3 deserializes Tokens</size>
+
+note right of RENDER
+  Invariant §4.1: no Color32 literal
+  anywhere in crates/ui outside theme/,
+  asserted by an include_str! test.
+end note
+
+note left of FONTS
+  egui's default families stay
+  appended as fallbacks: the UI
+  renders text it does not author
+  (filenames, paths, cargo output,
+  assistant replies) and neither
+  face covers CJK or emoji.
+
+  Compile-time const _ assert rejects
+  an unfetched Git LFS pointer.
+end note
+
+@enduml

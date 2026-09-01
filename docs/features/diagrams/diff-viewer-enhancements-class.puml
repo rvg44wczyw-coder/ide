@@ -1,0 +1,48 @@
+@startuml diff-viewer-enhancements-class
+title Diff data model (ide-core) after intraline spans
+
+class FileDiff {
+  old_path: Option<PathBuf>
+  new_path: Option<PathBuf>
+  hunks: Vec<DiffHunk>
+  truncated: bool
+}
+
+class DiffHunk {
+  old_start: u32
+  new_start: u32
+  lines: Vec<DiffLine>
+}
+
+enum DiffLine {
+  Context(String)
+  Added(String, Vec<DiffSpan>)
+  Removed(String, Vec<DiffSpan>)
+}
+
+class DiffSpan {
+  start: usize
+  end: usize
+}
+
+FileDiff "1" *-- "0..*" DiffHunk
+DiffHunk "1" *-- "0..*" DiffLine
+DiffLine "1" *-- "0..*" DiffSpan : Added/Removed only
+
+note right of DiffSpan
+  Byte offsets into that
+  DiffLine's own text,
+  char-boundary-aligned.
+  Empty Vec = unpaired
+  (pure insert/delete) or
+  identical after trim.
+end note
+
+note bottom of DiffLine
+  intraline_diff() populates
+  spans by pairing consecutive
+  Removed-run with following
+  Added-run, index-wise (§3.1).
+end note
+
+@enduml

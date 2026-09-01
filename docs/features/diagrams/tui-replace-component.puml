@@ -1,0 +1,27 @@
+@startuml
+title In-buffer replace -- component relationships (T5)
+
+package "ide-tui" {
+  component "App\n(app.rs)" as App
+  component "FindState\n(find.rs, extended)" as FindState
+  component "ui::render_status\n(ui.rs, unchanged)" as RenderStatus
+  component "editor::cursor_line_column\n(editor.rs)" as Editor
+  component "commands.rs" as Commands
+}
+
+package "ide-core" {
+  component "buffer_search\n(find_matches, replace_one,\nSearchQuery, SearchOptions)" as BufferSearch
+  component "Buffer / TextBuffer" as Buffer
+}
+
+App -> FindState : owns Option<FindState>\n(replace_mode, field, replacement)
+FindState -> BufferSearch : SearchQuery::compile\n+ find_matches (resync)
+FindState -> BufferSearch : replace_current ->\nreplace_one -> Transaction
+App -> Buffer : buffer.apply(transaction)\n(marks dirty, pushes undo)
+App -> FindState : resync(new text)\nafter applying
+App -> Editor : cursor_line_column\n(jump_to_match scroll)
+App -> Buffer : set_selections\n(jump_to_match)
+Commands -> App : Action::Replace (Ctrl+R)
+RenderStatus -> FindState : status_text()\n(replace-mode format)
+
+@enduml

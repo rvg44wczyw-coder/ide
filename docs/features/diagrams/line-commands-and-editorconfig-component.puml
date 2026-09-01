@@ -1,0 +1,61 @@
+@startuml
+skinparam componentStyle rectangle
+skinparam defaultFontName Helvetica
+skinparam shadowing false
+skinparam ArrowColor #555555
+skinparam componentBorderColor #888888
+skinparam packageBorderColor #AAAAAA
+
+title A4b Line Commands and EditorConfig
+
+package "A4a (already merged)" {
+  [IndentUnit] as UNIT
+  [SyntaxRules::brackets] as BR
+  [TextBuffer::matching_bracket] as MB
+}
+
+package "ide-core" {
+  [TextBuffer line ops\nduplicate / delete / join /\nmove / move statement] as LINES
+  [TextBuffer text ops\ncomments, toggle case] as TEXTOPS
+  [extended_selection\ntext::word_at] as HIER
+  [editorconfig\nresolve, parse,\nsave_edit, save_charset] as EC
+  [Buffer::save_with\ncharset at write time] as SAVE
+  [TextBuffer\ntext + lines + selections\n+ tokens + history] as TB
+}
+
+package "ide-ui" {
+  [intent_for\nnine chords] as INTENT
+  [Frame::rewrite\nAlt-arrow -> extend / shrink\n(after A3's CloneCaret arm)] as REWRITE
+  [apply_intent\ndispatch to core] as APPLY
+  [EditorState::shrink_stack] as STACK
+  [IdeApp\ntab open, save] as APP
+}
+
+UNIT --> TEXTOPS : comment alignment
+BR --> LINES : balance test
+MB --> HIER : innermost pair
+
+LINES --> TB : one Transaction\nper command
+TEXTOPS --> TB
+INTENT --> REWRITE
+REWRITE --> APPLY
+APPLY --> LINES
+APPLY --> TEXTOPS
+APPLY --> HIER
+STACK <--> REWRITE
+STACK <--> APPLY
+
+APP --> EC : resolve() at tab open
+EC --> UNIT : indent_style / indent_size
+APP --> SAVE : save_edit() then save_with()
+EC ..> TB : save_edit() is a Transaction,\nso carets survive the save
+
+note bottom of EC
+  Security-sensitive (CLAUDE.md):
+  walks directories upwards,
+  reads untrusted files,
+  canonicalized against project root.
+  hacker pass required before merge.
+end note
+
+@enduml

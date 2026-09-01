@@ -1,0 +1,46 @@
+@startuml tui-shell-and-editor-component
+title ide-tui (T1) — component relationships
+
+package "crates/tui (ide-tui)" {
+  [main.rs] as Main
+  [app.rs\nApp / Focus] as App
+  [tree.rs\nTreeState] as Tree
+  [editor.rs\nmove_cursor] as Editor
+  [commands.rs\nregistry] as Commands
+  [ui.rs\nrender (pure)] as Ui
+}
+
+package "crates/core (ide-core)" {
+  [Project / DirEntry] as Project
+  [Buffer] as Buffer
+  [TextBuffer / Selections / LineIndex] as TextBuffer
+}
+
+package "external" {
+  [ratatui] as Ratatui
+  [crossterm] as Crossterm
+}
+
+Main --> App : constructs, drives main loop
+Main --> Crossterm : raw mode, alt screen, event poll/read
+Main --> Ratatui : Terminal::draw
+
+App --> Tree : visible_rows / move_selection
+App --> Editor : move_cursor
+App --> Commands : binding_for / dispatch
+App --> Project : open, scan_tree
+App --> Buffer : open, insert, delete, save, undo, redo
+
+Tree --> Project : reads DirEntry tree
+Editor --> TextBuffer : line/column <-> offset
+Buffer --> TextBuffer : wraps
+
+Ui --> App : reads state only (no mutation)
+Ui --> Ratatui : List / Paragraph / Clear widgets
+
+note right of App
+  ide-ui (crates/ui) is a peer frontend,
+  not a dependency in either direction.
+end note
+
+@enduml

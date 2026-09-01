@@ -1,0 +1,74 @@
+@startuml project-settings-component
+title Per-project settings — component relationships
+
+package "crates/ui/src/app.rs" {
+  class IdeApp {
+    project: Option<Project>
+    theme: Theme
+    custom_languages: Vec<LanguageConfig>
+    keymap: KeymapOverlay
+    format_on_save: bool
+    tabs: Vec<Tab>
+    -flush_project_settings(project)
+    -load_project_settings(project, ctx)
+  }
+  class ProjectPreferences {
+    theme
+    custom_languages
+    keymap
+    format_on_save
+  }
+  class WorkspaceState {
+    open_tabs: Vec<OpenTabState>
+    active_path: Option<PathBuf>
+  }
+}
+
+package "crates/core/src/project_settings.rs (new)" {
+  class "fn read()" as ReadFn
+  class "fn write()" as WriteFn
+  class "fn ensure_gitignored()" as GitignoreFn
+  class ProjectSettingsFile {
+    Preferences
+    Workspace
+  }
+}
+
+package "crates/core/src/project.rs (unchanged)" {
+  class Project {
+    +root(): Path
+  }
+}
+
+package ".ide/ (new, gitignored)" {
+  class "preferences.json" as PrefsFile
+  class "workspace.json" as WorkspaceFile
+}
+
+class ".gitignore" as Gitignore
+
+IdeApp *-- ProjectPreferences
+IdeApp *-- WorkspaceState
+IdeApp --> ReadFn
+IdeApp --> WriteFn
+IdeApp --> Project : root()
+
+WriteFn --> PrefsFile
+WriteFn --> WorkspaceFile
+ReadFn --> PrefsFile
+ReadFn --> WorkspaceFile
+WriteFn --> GitignoreFn : on first .ide/ creation
+GitignoreFn --> Gitignore : append entry
+
+note right of ReadFn
+  Generic over T: DeserializeOwned --
+  ide-core never sees Theme/
+  KeymapOverlay concretely.
+end note
+
+note right of PrefsFile
+  Analogous to IntelliJ's .idea/.
+  Gitignored by default.
+end note
+
+@enduml

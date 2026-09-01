@@ -1,0 +1,23 @@
+@startuml fleet-shell-tool-windows-state
+title Tool-window visibility (per window: Project / Claude / Bottom)
+
+[*] --> Open : default on launch\n(session-only, not persisted)
+
+Open --> Closed : click rail icon\n(toggle_tool_window)
+Closed --> Open : click rail icon again
+
+state "Bottom window only" as BottomSub {
+  Open --> Open : ToggleFindToolWindow/RunToolWindow/\nProblemsToolWindow while a DIFFERENT\nbottom_view tab is active\n(switches tab, forces open, does not close)
+}
+
+Open --> Hidden_by_Zen : ToggleZenMode on
+Closed --> Hidden_by_Zen : ToggleZenMode on
+Hidden_by_Zen --> Open : ToggleZenMode off\n(restores exactly the prior flag)
+Hidden_by_Zen --> Closed : ToggleZenMode off\n(restores exactly the prior flag)
+
+note right of Hidden_by_Zen
+  Zen Mode is a display-only override,
+  not a state reset: the underlying
+  show_*_tool_window flag is untouched.
+end note
+@enduml

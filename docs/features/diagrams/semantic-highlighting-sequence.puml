@@ -1,0 +1,39 @@
+@startuml semantic-highlighting-sequence
+title Semantic Highlighting — one query, decoded and merged over the regex tokenizer
+
+actor User
+participant "IdeApp\n(app.rs)" as UI
+participant "LspBridge" as Bridge
+participant "LspClient\nevent loop" as Client
+participant "rust-analyzer" as Server
+participant "CodeEditor\n(editor/mod.rs, paint.rs)" as Widget
+
+== Capability negotiation, once at startup ==
+Client -> Server: initialize
+Server --> Client: capabilities.semanticTokensProvider\n{ legend: { tokenTypes, tokenModifiers }, full: true|{delta} }
+Client -> Client: state.semantic_tokens_provider = full-provider?(caps)\nstate.semantic_token_legend = legend.tokenTypes
+
+== SemanticTokensFull: ambient, re-fired on edit/open ==
+User -> UI: types a character (editor widget reports changed)
+UI -> UI: notify_lsp_changed(idx)        ' existing: DidChange
+UI -> UI: sync_semantic_tokens(idx)      ' new
+UI -> Bridge: request_semantic_tokens(path)
+Bridge -> Client: send(LspRequest::SemanticTokensFull{path})
+Client -> Client: allocate id S\npending_semantic_tokens = (S, path)
+alt !state.semantic_tokens_provider
+  Client -> Bridge: LspEvent::SemanticTokens{path, tokens: []}\n(no request ever sent)
+else provider supported
+  Client -> Server: textDocument/semanticTokens/full (id=S)
+  Server --> Client: result: { resultId?, data: [u32...] } | null
+  Client -> Client: BoundedSemanticTokenData caps raw array\nat MAX_SEMANTIC_TOKENS_PER_MESSAGE * 5
+  Client -> Client: decode 5-tuples with running (line, character) cursor;\nmap token_type index via legend -> SemanticTokenKind\n(unmapped type dropped, cursor still advances)
+  Client -> Bridge: LspEvent::SemanticTokens{path, tokens}
+end
+Bridge -> Bridge: for each token: position_to_byte_offset(start), (end)\nmap SemanticTokenKind -> ide_core::TokenKind\nsemantic_tokens[path] = sorted Vec<ide_core::Token>\n(old entry keeps rendering until this replaces it)
+
+== Rendering: merged into the row the regex tokenizer already produces ==
+UI -> Widget: CodeEditor::new(..).semantic_tokens(app.active_semantic_tokens())
+Widget -> Widget: per row: regex = buffer.tokens_in_lines(row)\nsemantic = self.semantic_tokens sliced to row\nmerged = merge_semantic_tokens(regex, semantic)\n(drop overlapping regex tokens, append semantic, sort)
+Widget -> Widget: line_layout_job(.., LineContext{ syntax: &merged, .. })\n-- unchanged: first-match .find() over a\n   now-guaranteed-non-overlapping slice
+
+@enduml

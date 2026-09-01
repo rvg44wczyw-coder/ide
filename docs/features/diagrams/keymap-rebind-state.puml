@@ -1,0 +1,23 @@
+@startuml keymap-rebind-state
+title Keymap window: rebind one command's shortcut
+
+[*] --> Idle
+
+Idle --> Listening : click Edit on a row\n(start_keymap_capture)
+
+state Listening {
+}
+
+Listening --> Pending : key event captured\n(poll_keymap_capture builds\nKeyChord + conflicts())
+
+state Pending {
+  [*] --> ConflictFree : conflicts() empty
+  [*] --> ConflictWarned : conflicts() non-empty\n(warning shown, still confirmable)
+}
+
+Pending --> Idle : Confirm\n(confirm_keymap_capture:\nset_override, row updates)
+Pending --> Idle : Cancel\n(cancel_keymap_capture:\nnothing committed)
+
+Idle --> Idle : Reset\n(reset_keymap_binding,\nfalls back to scheme default)
+
+@enduml

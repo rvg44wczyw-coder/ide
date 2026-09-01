@@ -1,0 +1,40 @@
+@startuml project-settings-sequence
+title Switching from Project A to Project B
+
+actor User
+participant IdeApp
+participant "project_settings\n(ide-core)" as PS
+database "A/.ide/" as A
+database "B/.ide/" as B
+
+User -> IdeApp : Open Project B\n(while A is open)
+
+alt self.project == Some(A)
+  IdeApp -> IdeApp : flush_project_settings(A)
+  IdeApp -> PS : write(A.root, Preferences, prefs)
+  PS -> A : preferences.json
+  IdeApp -> PS : write(A.root, Workspace, tabs)
+  PS -> A : workspace.json
+end
+
+IdeApp -> IdeApp : Project::open(B path)
+IdeApp -> IdeApp : clear self.tabs, self.active_tab = None
+IdeApp -> IdeApp : load_project_settings(B, ctx)
+IdeApp -> PS : read::<ProjectPreferences>(B.root, Preferences)
+PS -> B : preferences.json?
+alt B/.ide/preferences.json exists
+  B --> PS : Some(prefs)
+else first time opening B
+  B --> PS : None
+  PS --> IdeApp : ProjectPreferences::default()
+end
+IdeApp -> IdeApp : apply theme to ctx,\nreplace keymap/custom_languages/format_on_save
+
+IdeApp -> PS : read::<WorkspaceState>(B.root, Workspace)
+PS -> B : workspace.json?
+B --> PS : Some(state) or None
+IdeApp -> IdeApp : restore tabs (skip missing files,\nclamp cursor offsets, §3.3)
+
+IdeApp --> User : Project B open,\nits own theme/keymap/tabs restored
+
+@enduml

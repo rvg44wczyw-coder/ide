@@ -1,0 +1,27 @@
+@startuml editor-shell-component
+title ide — component overview (editor shell v1)
+
+package "ide-ui (bin: ide)" {
+  [IdeApp] as UI
+  [ClaudePanel] as ClaudePanel
+}
+
+package "ide-core" {
+  [Project] as Project
+  [Buffer] as Buffer
+}
+
+package "ide-lsp" {
+  [LspClient] as Lsp
+}
+
+UI --> Project : open()/create()/scan_tree()
+UI --> Buffer : insert()/delete()/save()
+UI ..> Lsp : not used by editor-shell v1 (future feature)
+ClaudePanel --> [claude CLI] : spawn subprocess\n(argv, no shell)
+UI --> [egui/eframe] : render frames
+UI --> [rfd] : native folder picker
+Project --> [Filesystem] : symlink-aware directory scan
+Buffer --> [Filesystem] : read/write file contents
+
+@enduml

@@ -1,0 +1,26 @@
+@startuml syntax-highlighting-pipeline
+title Syntax highlighting: tokenize-and-render pipeline
+
+start
+:tab created (open_file / new_untitled_tab);
+:syntax = syntax_for_extension(path.extension());
+if (syntax is Some?) then (yes)
+  :tokens = tokenize(buffer.text(), syntax);
+else (no)
+  :tokens = empty Vec;
+endif
+:tab stored with syntax + tokens cached;
+
+repeat
+  :frame renders;
+  if (Tab::reconcile applied an edit this frame?) then (yes)
+    :tokens = tokenize(buffer.text(), syntax)\n(no-op if syntax is None);
+  else (no)
+    :tokens unchanged (cache reused);
+  endif
+  :layouter builds LayoutJob\nboundary-merge: token color + diagnostic underline;
+repeat while (tab still active?) is (yes)
+->no;
+stop
+
+@enduml

@@ -1,0 +1,51 @@
+@startuml rename-refactoring-sequence
+title Rename (D1) -- Shift+F6
+
+participant "ide-ui\n(IdeApp)" as UI
+participant "ide-lsp\n(LspClient)" as LSP
+participant "rust-analyzer" as Server
+
+UI -> UI : trigger_rename()\nword_range_at(text, caret) -> local range/name
+UI -> UI : rename_popup = Some(RenamePopup { path, position,\n  original_name, input: original_name })\n(opens immediately, no round trip)
+UI -> LSP : LspRequest::PrepareRename { path, position }\n(ambient, non-blocking)
+
+alt renameProvider.prepareProvider not negotiated
+  LSP --> UI : LspEvent::PrepareRenameReady { path, renameable: true }\n(no wire traffic -- permissive default)
+else negotiated
+  LSP -> Server : textDocument/prepareRename
+  Server --> LSP : Range | {range,placeholder} | {defaultBehavior} | null
+  LSP -> LSP : v1 reads only "renameable or not" (S:1)
+  LSP --> UI : LspEvent::PrepareRenameReady { path, renameable }
+end
+
+UI -> UI : handle_prepare_rename_ready()\nif !renameable and popup still open for this (path,position)\n-> close popup, self.error = "cannot be renamed"
+
+== User edits the popup's input and presses Enter ==
+UI -> UI : confirm_rename()\ninput trimmed, unchanged/empty -> just close, no request
+UI -> LSP : LspRequest::Rename { path, position, new_name }
+
+alt renameProvider not negotiated
+  LSP --> UI : LspEvent::RenameReady { path, new_name, edit: None }\n(no wire traffic)
+else negotiated
+  LSP -> Server : textDocument/rename
+  Server --> LSP : WorkspaceEdit | null
+  LSP -> LSP : convert_workspace_edit() (reused verbatim from A8)\nwhole edit fails if any file fails path validation
+  LSP --> UI : LspEvent::RenameReady { path, new_name, edit }
+end
+
+UI -> UI : handle_rename_ready()
+alt edit is None
+  UI -> UI : self.error = "Rename to `new_name`: nothing to apply"
+else edit touches only the current active tab's file
+  UI -> UI : apply_workspace_edit(edit) directly\n(disk-then-buffer, same ordering as code-actions.md S:3.4)
+else edit touches other files (or no matching active tab)
+  UI -> UI : pending_rename_preview = Some((edit, new_name))\n-- escalate, do not apply yet
+  UI -> UI : render_rename_preview(): list of files + occurrence counts,\nApply / Cancel
+  alt user clicks Apply
+    UI -> UI : apply_workspace_edit(edit)
+  else user clicks Cancel
+    UI -> UI : pending_rename_preview = None (nothing written)
+  end
+end
+
+@enduml

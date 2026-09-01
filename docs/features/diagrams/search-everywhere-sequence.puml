@@ -1,0 +1,50 @@
+@startuml search-everywhere-sequence
+title Search Everywhere — per-tab query flow
+
+actor User
+participant "ide-ui\nIdeApp" as UI
+participant "ide-ui\nFilesSearchPanel /\nSearchPanel (Text)" as BgThread
+participant "ide-ui\nLspBridge" as Bridge
+participant "ide-lsp\nLspClient thread" as LspClient
+participant "language\nserver" as Server
+participant "ide-core\nfuzzy_match_files /\nsearch_tree" as Core
+
+User -> UI : types in query field
+UI -> UI : sync_search_everywhere()\n(once per frame, after lsp.poll())
+
+alt active tab == Files or Text
+  UI -> BgThread : discard_in_flight() + run(tree, query)
+  activate BgThread
+  BgThread -> Core : fuzzy_match_files() / search_tree()
+  Core --> BgThread : FuzzyFileResults / SearchResults
+  BgThread --> UI : poll() (next frame, via channel)
+  deactivate BgThread
+  UI -> UI : search_everywhere_rows() reads panel.results()
+
+else active tab == Symbols, query non-empty
+  UI -> Bridge : query_workspace_symbols(query)
+  Bridge -> LspClient : LspRequest::WorkspaceSymbol { query }
+  LspClient -> Server : workspace/symbol
+  Server --> LspClient : SymbolInformation[] | WorkspaceSymbol[] | null
+  LspClient -> LspClient : bounded parse, per-entry\npath validation (fail-open)
+  LspClient --> Bridge : LspEvent::WorkspaceSymbol { symbols }
+  Bridge -> Bridge : poll() sets workspace_symbols
+  UI -> UI : search_everywhere_rows() reads lsp.workspace_symbols
+
+else active tab == Symbols, query empty
+  UI -> Bridge : request_document_symbols(active_tab_path)
+  Bridge -> LspClient : LspRequest::DocumentSymbol { path }
+  LspClient -> Server : textDocument/documentSymbol
+  Server --> LspClient : DocumentSymbol[] (hierarchical) |\nSymbolInformation[] (flat) | null
+  LspClient -> LspClient : flatten (bounded by\nMAX_SYMBOLS_PER_MESSAGE)
+  LspClient --> Bridge : LspEvent::DocumentSymbol { path, symbols }
+  Bridge -> Bridge : poll() sets document_symbols
+  UI -> UI : search_everywhere_rows() reads lsp.document_symbols
+
+else active tab == Actions
+  UI -> UI : fuzzy_score() over command::commands()\n(synchronous, no thread, no request)
+end
+
+User -> UI : Enter / click a row
+UI -> UI : search_everywhere_confirm()\n(open_definition / open_file / run_command)
+@enduml

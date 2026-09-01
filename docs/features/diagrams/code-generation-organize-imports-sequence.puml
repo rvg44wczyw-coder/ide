@@ -1,0 +1,37 @@
+@startuml code-generation-organize-imports-sequence
+title Optimize Imports (D4 §3.4) — the one new protocol flow this phase adds
+
+actor User
+participant "ide-ui\n(app.rs)" as UI
+participant "LspBridge" as Bridge
+participant "ide-lsp\nconnection task" as Lsp
+participant "Language server\n(rust-analyzer / gopls / ...)" as Server
+
+User -> UI: press ⌘⌥O / Ctrl+Alt+O
+UI -> Bridge: request_organize_imports(path)
+Bridge -> Lsp: LspRequest::OrganizeImports { path }
+note right of Lsp
+  Own pending-id slot, independent of
+  pending_code_action_id / pending_resolve_id.
+  Whole-document range, not the caret position
+  lsp.code_actions was built from.
+end note
+Lsp -> Server: textDocument/codeAction\ncontext.only: ["source.organizeImports"]
+
+alt server returns an entry with a usable edit
+  Server --> Lsp: CodeAction[] (one entry)
+  opt entry needs resolving
+    Lsp -> Server: codeAction/resolve
+    Server --> Lsp: resolved CodeAction
+  end
+  Lsp --> Bridge: LspEvent::WorkspaceEditReady { edit: Some(..), label: Some("Optimize Imports") }
+  Bridge --> UI: (existing) handle_workspace_edit_ready
+  UI -> User: edit applied immediately, no preview
+else server returns empty (guaranteed for rust-analyzer, §1)
+  Server --> Lsp: CodeAction[] (empty)
+  Lsp --> Bridge: LspEvent::WorkspaceEditReady { edit: None, label: None }
+  Bridge --> UI: (existing) handle_workspace_edit_ready
+  UI -> User: "Optimize Imports: nothing to apply"
+end
+
+@enduml

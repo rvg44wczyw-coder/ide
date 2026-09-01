@@ -1,0 +1,21 @@
+@startuml claude-terminal-state
+title One terminal tab's lifecycle (§3.1/§4.4 of claude-terminal.md)
+
+[*] --> Spawning : "+" clicked, rfd::pick_folder() returns Some(dir)
+
+Spawning --> Running : PtySession::spawn Ok
+Spawning --> Exited : PtySession::spawn Err\n(claude not on PATH, or\ncwd failed is_dir() check) --\nerror text fed into TerminalGrid
+
+Running --> Running : poll() drains PtyEvent::Data\ninto TerminalGrid::feed
+Running --> Exited : poll() receives PtyEvent::Exited\n(reader thread hit EOF)
+
+Exited --> [*] : close_tab (drops PtySession,\nkills child if still alive)
+Running --> [*] : close_tab (drops PtySession,\nkills the running child)
+
+note right of Exited
+  Tab stays open with its final
+  TerminalGrid content visible.
+  Does not auto-close (§4.4).
+end note
+
+@enduml

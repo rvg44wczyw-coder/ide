@@ -1,0 +1,46 @@
+@startuml tui-shell-and-editor-sequence
+title ide-tui (T1) — startup, open file, edit, save
+
+actor User
+participant "main.rs" as Main
+participant "App" as App
+participant "ide_core::Project" as Project
+participant "TreeState" as Tree
+participant "ide_core::Buffer" as Buffer
+participant "editor.rs" as Editor
+
+User -> Main : ide-tui <path>
+Main -> Project : Project::open(path)
+Project --> Main : Ok(project) / Err
+alt Err
+  Main -> User : print error to stderr, exit non-zero\n(terminal never touched)
+else Ok
+  Main -> Main : enable raw mode, enter alt screen,\ninstall panic hook
+  Main -> App : App::new(root)
+  App -> Project : scan_tree()
+  Project --> App : DirEntry (root)
+  loop main loop (100ms poll)
+    User -> Main : key event
+    Main -> App : handle_key(key)
+    App -> Tree : move_selection / toggle_expand_selected
+    User -> Main : Enter on a file row
+    Main -> App : handle_key(Enter)
+    App -> Buffer : Buffer::open(path)
+    Buffer --> App : Ok(buffer) / Err
+    User -> Main : Ctrl+T (focus editor), then typing
+    Main -> App : handle_key(char)
+    App -> Editor : move_cursor(...)
+    App -> Buffer : text_buffer_mut().type_text(...)
+    User -> Main : Ctrl+S
+    Main -> App : handle_key(Ctrl+S)
+    App -> Buffer : save()
+    Buffer --> App : Ok(()) / Err
+    App -> Main : status updated
+    Main -> Main : terminal.draw(ui::render)
+  end
+  User -> Main : palette -> Exit
+  Main -> Main : LoopSignal::Exit -> break
+  Main -> Main : disable raw mode, leave alt screen
+end
+
+@enduml

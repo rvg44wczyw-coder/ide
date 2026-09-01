@@ -1,0 +1,35 @@
+@startuml syntax-highlighting-more-languages-cascade
+title tokenize: per-position rule cascade (step 2 is new)
+
+start
+:pos = 0, at_line_start = true;
+while (pos < text.len()?) is (yes)
+  if (at_line_start?) then (yes)
+    if (1. Key rule\n(key_separator set and separator\nfound before newline/quote/comment)?) then (match)
+      :emit Key, advance to separator;
+    elseif (2. **line_prefix_tokens**\nline starts with a prefix?) then (match)
+      :emit that entry's TokenKind\nfor the rest of the line;<<#FFE08A>>
+    else (no match)
+    endif
+  else (no)
+  endif
+  if (3. line comment prefix?) then (match)
+    :emit Comment to end of line;
+  elseif (4. block_comment start?) then (match)
+    :emit Comment to end delimiter;
+  elseif (5. string quote?) then (match)
+    :emit String to closing quote/newline;
+  elseif (6. number?) then (match)
+    :emit Number;
+  elseif (7. word?) then (match)
+    :emit Keyword if in keywords,\nelse consume word untokenized;
+  elseif (8. punctuation char?) then (match)
+    :emit Punctuation;
+  else (9. no rule)
+    :skip one char\n(set at_line_start if it was a newline);
+  endif
+endwhile (no)
+:return tokens;
+stop
+
+@enduml

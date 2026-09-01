@@ -1,0 +1,20 @@
+@startuml file-watcher-state
+title File Watcher — per-tab external-change lifecycle
+
+[*] --> Clean : tab opened
+
+Clean --> Clean : FileModified, !is_dirty()\n(silent reload)
+Clean --> Modified : FileModified, is_dirty()
+Clean --> Deleted : FileRemoved (any dirty state)
+
+Modified --> Clean : Reload\n(reload_active_from_disk)
+Modified --> Clean : Keep Mine\n(dismiss_external_change)
+Modified --> Deleted : FileRemoved before a decision is made
+
+Deleted --> Clean : dismiss_external_change
+
+Clean --> [*] : tab closed
+Modified --> [*] : tab closed
+Deleted --> [*] : tab closed
+
+@enduml

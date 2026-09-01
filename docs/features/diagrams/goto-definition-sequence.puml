@@ -1,0 +1,52 @@
+@startuml goto-definition-sequence
+title Go to Definition — query flow
+
+actor User
+participant "IdeApp\n(app.rs)" as UI
+participant "LspBridge" as Bridge
+participant "LspClient\nevent loop" as Client
+participant "rust-analyzer" as Server
+
+User -> UI: Cmd+B / Cmd+Click\n(or Cmd+Option+B, Ctrl+Shift+B)
+UI -> UI: trigger_go_to_declaration()\ngoto_action = Some(Declaration)\nshow_goto_popup = false
+UI -> Bridge: go_to_definition(path, position)
+Bridge -> Bridge: goto.clear()\nfinding_goto = true
+Bridge -> Client: send(LspRequest::Goto{kind: Definition, ..})
+
+alt not yet initialized
+  Client -> Client: queue in pending[]
+else ready
+  Client -> Client: allocate id N\npending_goto_id = N
+  Client -> Server: textDocument/definition (id=N)
+end
+
+== a different-kind query supersedes the first ==
+User -> UI: Cmd+Option+B (before the first answers)
+UI -> Bridge: go_to_implementation(path, position)
+Bridge -> Client: send(LspRequest::Goto{kind: Implementation, ..})
+Client -> Client: allocate id N+1\npending_goto_id = N+1
+Client -> Server: textDocument/implementation (id=N+1)
+
+Server --> Client: response id=N (stale, definition)
+Client -> Client: id != pending_goto_id\n=> dropped, no event
+
+Server --> Client: response id=N+1 (implementation)
+Client -> Client: capabilities sent no linkSupport,\nso result is Location | Location[] | null\n(peek first byte: '[' => bounded array,\notherwise => single scalar Location)
+Client -> Client: validate each Location's path\nagainst project_root; drop failures
+Client -> Bridge: LspEvent::Goto { locations }
+Bridge -> Bridge: goto = locations\nfinding_goto = false\ngoto_ready = true
+
+== next frame ==
+UI -> Bridge: poll()
+Bridge -> UI: goto_ready = true
+UI -> UI: handle_goto_response()
+
+alt goto.len() == 1
+  UI -> UI: open_definition(path, position)\n(open_file + pending_cursor_offset + push_nav_location)
+else goto.len() == 0 or > 1
+  UI -> UI: show_goto_popup = true
+  User -> UI: click a row (if any)
+  UI -> UI: open_definition(path, position)\nshow_goto_popup = false
+end
+
+@enduml

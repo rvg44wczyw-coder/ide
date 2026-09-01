@@ -1,0 +1,40 @@
+@startuml search-in-path-v2-sequence
+title Search in Path v2 — search and Replace in Path flow
+
+actor User
+participant "ide-ui\napp.rs" as App
+participant "SearchPanel" as Panel
+participant "ide-core\nsearch_in_path" as Core
+participant "ide-core\nworkspace_edit" as WE
+participant "Disk / Buffers" as Disk
+
+User -> App: type query, options, click Search
+App -> Panel: run(tree, query, options)
+Panel -> Core: search_tree_advanced() [background thread]
+Core --> Panel: PathSearchResults (channel)
+App -> Panel: poll() [every frame]
+Panel --> App: results ready
+App -> User: render file list (expand/collapse per file)
+
+User -> App: fill Replacement, click Preview
+App -> Panel: run_replace(tree, query, replacement, options)
+Panel -> Core: replace_in_path() [background thread]
+Core -> Core: buffer_search::replace_all() per file
+Core --> Panel: ReplaceInPathResult (WorkspaceEdit) (channel)
+App -> Panel: poll_replace() [every frame]
+Panel --> App: result ready
+App -> App: show_replace_in_path_preview()\n(apply_transaction + diff_text per file)
+App -> User: render diff preview (Apply / Cancel)
+
+alt User clicks Apply
+  User -> App: confirm_replace_in_path_preview()
+  App -> App: apply_file_edits(edits)
+  App -> WE: apply_workspace_edit_to_disk(disk subset)
+  WE -> Disk: read-modify-write, all-or-nothing
+  App -> Disk: Buffer::apply(transaction) for open tabs
+  App -> User: "Replace in Path: applied to N files"
+else User clicks Cancel
+  User -> App: cancel_replace_in_path_preview()
+  App -> App: drop pending preview, no I/O
+end
+@enduml

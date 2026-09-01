@@ -1,0 +1,25 @@
+@startuml syntax-highlighting-env-make-docker-lookup
+title syntax_for_path lookup order
+
+start
+:path (e.g. from Tab::syntax_for_buffer);
+:file_name = path.file_name();
+if (file_name is Some(&str)?) then (yes)
+  :for each builtin in fixed order\n(JSON, YAML, SYSTEMD_UNIT,\nENV, MAKEFILE, DOCKERFILE);
+  if (file_name is in that builtin's `filenames`\nOR starts_with one of its `filename_prefixes`?) then (yes)
+    :return that SyntaxRules;
+    stop
+  else (no)
+  endif
+else (no)
+endif
+:extension = path.extension();
+if (extension matches a builtin's\n`extensions` via syntax_for_extension?) then (yes)
+  :return that SyntaxRules;
+  stop
+else (no)
+  :return None;
+  stop
+endif
+
+@enduml

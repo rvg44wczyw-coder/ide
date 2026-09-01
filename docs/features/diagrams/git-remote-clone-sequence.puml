@@ -1,0 +1,41 @@
+@startuml git-remote-clone-sequence
+title Clone flow (Batch E)
+
+actor User
+participant "render_welcome\n(ide-ui)" as UI
+participant "CloneState" as State
+participant "background thread" as Thread
+participant "ide_core::git::clone_repo" as Core
+participant "git2 / libgit2" as Git2
+participant "Project::open + scan_tree" as Project
+participant "IdeApp" as App
+
+User -> UI: type URL, choose destination, click Clone
+UI -> State: start(url, dest)
+State -> Thread: spawn
+activate Thread
+Thread -> Core: clone_repo(url, dest, on_progress)
+activate Core
+Core -> Core: validate url / dest
+Core -> Git2: RepoBuilder::clone(url, dest)
+loop transfer progress
+  Git2 --> Core: transfer_progress callback
+  Core --> Thread: on_progress(CloneProgress)
+  Thread --> State: CloneEvent::Progress (mpsc)
+end
+Git2 --> Core: cloned repo (or Err)
+Core -> Project: Project::open(dest).scan_tree()
+Project --> Core: validated tree (escapes excluded)
+Core --> Thread: Ok(GitRepo) / Err(GitError)
+deactivate Core
+Thread --> State: CloneEvent::Done(result) (mpsc)
+deactivate Thread
+
+loop every frame
+  App -> State: poll()
+  State --> App: Progress / Succeeded(path) / Failed / None
+end
+App -> App: open_project(path) on Succeeded
+App --> User: project loaded, launcher replaced by editor
+
+@enduml

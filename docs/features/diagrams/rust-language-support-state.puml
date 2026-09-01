@@ -1,0 +1,21 @@
+@startuml rust-language-support-state
+title Rust Language Support v1 — LspClient Lifecycle
+
+[*] --> Stopped
+
+Stopped --> Starting : LspClient::start()\n(Cargo.toml detected)
+Starting --> Stopped : spawn failed\n(rust-analyzer not on PATH)\n=> LspError::ServerNotFound
+
+Starting --> Initializing : process spawned,\ninitialize request sent
+Initializing --> Ready : initialize response received\n(queued requests flushed)
+
+Ready --> Ready : DidOpen / DidChange / DidClose\npublishDiagnostics
+
+Ready --> Exited : process exited\n(crash or normal exit)
+Initializing --> Exited : process exited\nbefore handshake completed
+Exited --> [*] : LspEvent::ServerExited surfaced;\nno auto-restart (v1)
+
+Exited --> Starting : user clicks\n"Restart Rust Analyzer"
+Stopped --> [*] : Cargo.toml no longer\npresent (project switched)
+
+@enduml
