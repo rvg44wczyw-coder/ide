@@ -8,8 +8,8 @@
 use crate::editor::blame_gutter::{strip_bidi_controls, truncate_display};
 use crate::editor::{marks_from_hunks, GutterMark};
 use ide_core::{
-    BlameLine, BranchInfo, CommitDetail, CommitNode, ConflictSides, DiffHunk, FileDiff, GitRepo,
-    MergeOutcome, WorkingTreeStatus,
+    BlameLine, BranchInfo, CommitDetail, CommitNode, ConflictSides, DiffHunk, FileDiff, GitError,
+    GitRepo, MergeOutcome, WorkingTreeStatus, WorktreeInfo,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,29 @@ pub struct BranchesPopupState {
     pub pending_delete: Option<String>,
 }
 
+/// The worktrees popup's own transient UI state (`docs/features/
+/// git-worktrees.md` §2.2.1) — separate from `GitPanel`'s always-empty-
+/// until-opened `worktrees_popup.worktrees` list, the same split
+/// `branches`/`branches_popup` already keep for branches.
+#[derive(Default)]
+pub struct WorktreesPopupState {
+    pub open: bool,
+    pub worktrees: Vec<WorktreeInfo>,
+    pub new_name: String,
+    pub new_path: String,
+    /// Empty means "create a new branch named `new_name`" (§2.1's
+    /// `branch: None` case) — the UI surfaces this as placeholder text,
+    /// not a separate checkbox, since it's exactly one field either way.
+    pub new_branch: String,
+    pub error: Option<String>,
+    /// Set when a plain (non-force) `remove_worktree` call fails with
+    /// `WorktreeHasUncommittedChanges` or a locked worktree, so the popup
+    /// can offer a force-confirm button instead of just showing the error
+    /// — same two-step pattern `E2`'s branch-delete `BranchNotMerged`
+    /// confirm already uses.
+    pub pending_force_remove: Option<String>,
+}
+
 #[derive(Default)]
 pub struct GitPanel {
     repo: Option<GitRepo>,
@@ -97,6 +120,10 @@ pub struct GitPanel {
     /// switch mid-merge loses only this cosmetic label, never the
     /// underlying `MERGE_HEAD` state `commit()` itself still detects).
     pub merging: bool,
+    /// Loaded by `open_worktrees_popup` and refreshed after every mutating
+    /// worktree operation — same lazy-load convention `branches`/
+    /// `branches_popup` already keep (`git-worktrees.md` §2.2.1).
+    pub worktrees_popup: WorktreesPopupState,
 }
 
 impl GitPanel {
@@ -470,6 +497,99 @@ impl GitPanel {
             self.close_branches_popup();
         }
         Ok(())
+    }
+
+    /// Opens the worktrees popup with a freshly loaded list
+    /// (`git-worktrees.md` §2.2.1). Unlike `open_branches_popup`, doesn't
+    /// defensively re-open the repository — a project is already open
+    /// (and `self.repo` therefore already loaded by `refresh()`) whenever
+    /// this is reachable at all, since the action that opens this popup
+    /// only exists once a project is open.
+    pub fn open_worktrees_popup(&mut self) {
+        self.worktrees_popup = WorktreesPopupState {
+            open: true,
+            ..WorktreesPopupState::default()
+        };
+        self.refresh_worktrees();
+    }
+
+    pub fn close_worktrees_popup(&mut self) {
+        self.worktrees_popup = WorktreesPopupState::default();
+    }
+
+    /// Calls `GitRepo::worktrees`, populating `worktrees_popup.worktrees`
+    /// on success or `worktrees_popup.error` on failure (§2.2.1). Not
+    /// eagerly called by `refresh()` itself — same lazy-load reasoning
+    /// `reload_branches` already documents for `branches`.
+    pub fn refresh_worktrees(&mut self) {
+        let Some(repo) = &self.repo else {
+            self.worktrees_popup.worktrees = Vec::new();
+            return;
+        };
+        match repo.worktrees() {
+            Ok(worktrees) => {
+                self.worktrees_popup.worktrees = worktrees;
+                self.worktrees_popup.error = None;
+            }
+            Err(e) => self.worktrees_popup.error = Some(e.to_string()),
+        }
+    }
+
+    /// Creates a worktree from the popup's own `new_name`/`new_path`/
+    /// `new_branch` fields (§2.2.1): an empty `new_branch` becomes `None`
+    /// (core's own "create a new branch named `name`" default). On
+    /// success, clears the form and refreshes the list; on failure, sets
+    /// `error` and leaves the form fields as-is so the user can fix and
+    /// retry rather than retype. Doesn't close the popup either way —
+    /// unlike `create_branch`, adding a worktree isn't a context switch.
+    pub fn create_worktree(&mut self) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
+        let branch = (!self.worktrees_popup.new_branch.is_empty())
+            .then(|| self.worktrees_popup.new_branch.clone());
+        let result = repo.add_worktree(
+            &self.worktrees_popup.new_name,
+            &self.worktrees_popup.new_path,
+            branch.as_deref(),
+        );
+        match result {
+            Ok(()) => {
+                self.worktrees_popup.new_name.clear();
+                self.worktrees_popup.new_path.clear();
+                self.worktrees_popup.new_branch.clear();
+                self.worktrees_popup.error = None;
+                self.refresh_worktrees();
+            }
+            Err(e) => self.worktrees_popup.error = Some(e.to_string()),
+        }
+    }
+
+    /// Removes `name` (§2.2.1). On a `WorktreeHasUncommittedChanges` or
+    /// `WorktreeLocked` failure with `force: false`, sets
+    /// `pending_force_remove` *instead of* `error` — the popup's confirm
+    /// step uses a fixed message ("has uncommitted changes / is locked --
+    /// remove anyway?", §2.2.2) rather than the raw error text, the same
+    /// two-step pattern `request_delete_branch`/`confirm_delete_branch`
+    /// already use for `BranchNotMerged`. Any other failure (including a
+    /// retry with `force: true` that still fails) surfaces as `error`.
+    pub fn remove_worktree(&mut self, name: &str, force: bool) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
+        match repo.remove_worktree(name, force) {
+            Ok(()) => {
+                self.worktrees_popup.pending_force_remove = None;
+                self.worktrees_popup.error = None;
+                self.refresh_worktrees();
+            }
+            Err(GitError::WorktreeHasUncommittedChanges(_) | GitError::WorktreeLocked(_))
+                if !force =>
+            {
+                self.worktrees_popup.pending_force_remove = Some(name.to_string());
+            }
+            Err(e) => self.worktrees_popup.error = Some(e.to_string()),
+        }
     }
 
     /// `absolute_path`'s per-line blame against `HEAD`, converted to a

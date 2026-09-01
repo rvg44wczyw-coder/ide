@@ -223,6 +223,7 @@ pub enum CommandAction {
     CloseTab,
     GitBranches,
     ToggleBlameAnnotations,
+    GitWorktrees,
 }
 
 #[derive(Debug)]
@@ -503,6 +504,16 @@ pub fn commands() -> &'static [Command] {
                 category: "Git",
                 binding: None,
                 action: CommandAction::ToggleBlameAnnotations,
+            },
+            Command {
+                id: "GitWorktrees",
+                title: "Git Worktrees...",
+                category: "Git",
+                // No JetBrains-IDE precedent to copy a binding from --
+                // per root CLAUDE.md's "never invent a binding" rule,
+                // palette/menu-only (`git-worktrees.md` §2.2.2).
+                binding: None,
+                action: CommandAction::GitWorktrees,
             },
             Command {
                 id: "ToggleZenMode",

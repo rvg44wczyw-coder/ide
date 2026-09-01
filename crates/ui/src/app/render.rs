@@ -5,8 +5,8 @@
 //! directly (Rust visibility is scoped to a module and its descendants).
 
 use super::{
-    BottomView, ClaudeMessage, ClaudeView, ExternalChange, IdeApp, SearchEverywhereRow,
-    SearchEverywhereTab, SmartModeState, ToolWindow, ViewMode, LAST_PROJECT_STORAGE_KEY,
+    BottomView, ClaudeMessage, ClaudeView, ExternalChange, IdeApp, RestoreChoice,
+    SearchEverywhereRow, SearchEverywhereTab, SmartModeState, ToolWindow, ViewMode,
 };
 use crate::command::{self, CommandAction};
 use crate::editor::blame_gutter::relative_time;
@@ -2029,6 +2029,121 @@ impl IdeApp {
         }
     }
 
+    /// The worktrees popup (`docs/features/git-worktrees.md` §2.2.2): list
+    /// of linked worktrees with Switch/Open-in-New-Window/Remove per row,
+    /// plus an Add-worktree form.
+    fn render_worktrees_popup(&mut self, ctx: &egui::Context) {
+        if !self.git.worktrees_popup.open {
+            return;
+        }
+        if self.project.is_none() {
+            self.git.close_worktrees_popup();
+            return;
+        }
+
+        let mut open = true;
+        let mut switch_to: Option<PathBuf> = None;
+        let mut open_new_window: Option<PathBuf> = None;
+        let mut remove_decision: Option<(String, bool)> = None;
+        let mut create = false;
+
+        egui::Window::new("Git Worktrees")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for worktree in &self.git.worktrees_popup.worktrees {
+                            ui.horizontal(|ui| {
+                                let branch = worktree
+                                    .branch
+                                    .clone()
+                                    .unwrap_or_else(|| "(detached / unavailable)".to_string());
+                                let lock_badge = if worktree.is_locked { " 🔒" } else { "" };
+                                ui.label(format!(
+                                    "{}{} — {} — {}",
+                                    worktree.name,
+                                    lock_badge,
+                                    branch,
+                                    worktree.path.display()
+                                ));
+                                if ui.small_button("Switch here").clicked() {
+                                    switch_to = Some(worktree.path.clone());
+                                }
+                                if ui.small_button("Open in New Window").clicked() {
+                                    open_new_window = Some(worktree.path.clone());
+                                }
+                                if self.git.worktrees_popup.pending_force_remove.as_deref()
+                                    == Some(worktree.name.as_str())
+                                {
+                                    if ui.small_button("Remove Anyway").clicked() {
+                                        remove_decision = Some((worktree.name.clone(), true));
+                                    }
+                                } else if ui.small_button("Remove").clicked() {
+                                    remove_decision = Some((worktree.name.clone(), false));
+                                }
+                            });
+                            if self.git.worktrees_popup.pending_force_remove.as_deref()
+                                == Some(worktree.name.as_str())
+                            {
+                                ui.colored_label(
+                                    self.theme.tokens().color.danger,
+                                    "Has uncommitted changes or is locked — remove anyway?",
+                                );
+                            }
+                        }
+                    });
+
+                ui.separator();
+                ui.label("Add worktree");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.git.worktrees_popup.new_name)
+                        .hint_text("Worktree name"),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.git.worktrees_popup.new_path)
+                            .hint_text("Destination path"),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            self.git.worktrees_popup.new_path = dir.display().to_string();
+                        }
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.git.worktrees_popup.new_branch)
+                        .hint_text("leave empty to create a new branch named the worktree's name"),
+                );
+                if ui.button("Create").clicked() {
+                    create = true;
+                }
+
+                if let Some(err) = &self.git.worktrees_popup.error {
+                    ui.colored_label(self.theme.tokens().color.danger, err);
+                }
+            });
+
+        if let Some(path) = switch_to {
+            self.open_project(&path, ctx);
+            self.git.close_worktrees_popup();
+        }
+        if let Some(path) = open_new_window {
+            self.open_in_new_window(&path);
+        }
+        if let Some((name, force)) = remove_decision {
+            self.git.remove_worktree(&name, force);
+        }
+        if create {
+            self.git.create_worktree();
+        }
+        if !open {
+            self.git.close_worktrees_popup();
+        }
+    }
+
     /// The blame gutter's click popup (`docs/features/
     /// git-branches-and-blame.md` §2.2.3): full `CommitDetail` for the
     /// clicked annotation's commit, looked up live each time it's open
@@ -3624,6 +3739,41 @@ impl IdeApp {
         }
     }
 
+    /// `docs/features/git-worktrees.md` §2.2.3: shown only when the
+    /// open-projects registry had 2+ entries at startup and there was no
+    /// explicit `initial_project` -- a blocking modal (no close button; the
+    /// user must pick one of the three options, each of which clears
+    /// `startup_restore_prompt` via `resolve_startup_restore`).
+    fn render_startup_restore_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &self.startup_restore_prompt else {
+            return;
+        };
+        let candidates = prompt.candidates.clone();
+        let mut choice = None;
+        egui::Window::new(format!("{} projects were open last time", candidates.len()))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if ui.button("Restore All").clicked() {
+                    choice = Some(RestoreChoice::All);
+                }
+                ui.separator();
+                ui.label("Or open just one:");
+                for (i, path) in candidates.iter().enumerate() {
+                    if ui.button(path.display().to_string()).clicked() {
+                        choice = Some(RestoreChoice::One(i));
+                    }
+                }
+                ui.separator();
+                if ui.button("Open None").clicked() {
+                    choice = Some(RestoreChoice::None);
+                }
+            });
+        if let Some(choice) = choice {
+            self.resolve_startup_restore(choice, ctx);
+        }
+    }
+
     fn render_confirm_modal(&mut self, ctx: &egui::Context) {
         if self.pending_confirm.is_none() {
             return;
@@ -4178,6 +4328,7 @@ impl eframe::App for IdeApp {
         self.render_git_gutter_popup(&ctx);
         self.render_discard_confirm_popup(&ctx);
         self.render_branches_popup(&ctx);
+        self.render_worktrees_popup(&ctx);
         self.render_blame_popup(&ctx);
         self.render_language_suggestion_popup(&ctx);
         self.render_rename_popup(&ctx);
@@ -4189,18 +4340,31 @@ impl eframe::App for IdeApp {
         self.render_recent_locations_popup(&ctx);
         self.render_go_to_line_dialog(&ctx);
         self.render_confirm_modal(&ctx);
+        self.render_startup_restore_prompt(&ctx);
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
         // Theme/custom_languages/keymap/format_on_save moved to
         // `.ide/preferences.json` (`project-settings.md` §4) -- flushed on
         // every project switch already; flush again here too, since app
         // exit is also a point where the in-memory state could otherwise
-        // be lost if it changed since the last switch.
+        // be lost if it changed since the last switch. The open-projects
+        // registry (`OPEN_PROJECTS_STORAGE_KEY`) is its own file, kept up
+        // to date by `register_open_project`/`deregister_open_project` on
+        // every load/switch/exit rather than here -- nothing left for this
+        // method to write through `eframe::Storage`.
         if let Some(project) = &self.project {
             let root = project.root().to_path_buf();
             self.flush_project_settings(&root);
-            eframe::set_value(storage, LAST_PROJECT_STORAGE_KEY, &root);
+        }
+    }
+
+    fn on_exit(&mut self) {
+        // Best-effort (`docs/features/git-worktrees.md` §2.2.3/§3): a
+        // crash or force-quit skips this, and the registry self-corrects
+        // on the next read rather than needing it to be reliable.
+        if let Some(project) = &self.project {
+            self.deregister_open_project(project.root());
         }
     }
 }

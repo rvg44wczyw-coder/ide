@@ -23,11 +23,16 @@ mod search_panel;
 mod theme;
 mod tree_scan;
 
-pub fn run() -> eframe::Result<()> {
+/// `initial_project`, when given, opens that path directly (skipping the
+/// open-projects-registry restore logic entirely -- `docs/features/
+/// git-worktrees.md` §2.2.3) -- used both for the ordinary CLI-argument
+/// case and by `IdeApp::open_in_new_window`, which re-execs this same
+/// binary with the worktree/project path as its one argument.
+pub fn run(initial_project: Option<std::path::PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "ide",
         options,
-        Box::new(|cc| Ok(Box::new(app::IdeApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::IdeApp::new(cc, initial_project)))),
     )
 }
