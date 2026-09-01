@@ -33,9 +33,9 @@ pub use fuzzy::{
     MAX_FUZZY_FILE_RESULTS,
 };
 pub use git::{
-    diff_text, BlameLine, BranchInfo, ChangeKind, CommitDetail, CommitNode, ConflictSides,
-    DiffHunk, DiffLine, DiffSpan, FileDiff, GitError, GitRepo, MergeOutcome, StatusEntry,
-    WorkingTreeStatus, WorktreeInfo, MAX_BLAME_LINES, MAX_DIFF_LINES,
+    diff_text, BlameLine, BranchInfo, ChangeKind, CommitDetail, CommitLogFilter, CommitNode,
+    ConflictSides, DiffHunk, DiffLine, DiffSpan, FileDiff, GitError, GitRepo, MergeOutcome,
+    StatusEntry, WorkingTreeStatus, WorktreeInfo, MAX_BLAME_LINES, MAX_DIFF_LINES,
 };
 pub use language::{
     detect_active_languages, detect_language, detect_language_suggestions, language_for_path,
