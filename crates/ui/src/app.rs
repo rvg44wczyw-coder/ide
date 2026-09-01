@@ -1584,12 +1584,12 @@ impl IdeApp {
         }
         match action {
             RestoreAction::OpenHereThenSpawn { here, spawn } => {
-                self.restore_last_project(Some(here), ctx);
+                self.open_project(&here, ctx);
                 for extra in spawn {
                     self.open_in_new_window(&extra);
                 }
             }
-            RestoreAction::OpenHere(path) => self.restore_last_project(Some(path), ctx),
+            RestoreAction::OpenHere(path) => self.open_project(&path, ctx),
             RestoreAction::None => {}
         }
     }
@@ -4741,7 +4741,11 @@ impl IdeApp {
                 }
             }
             CommandAction::ToggleBlameAnnotations => self.toggle_blame_annotations(),
-            CommandAction::GitWorktrees => self.git.open_worktrees_popup(),
+            CommandAction::GitWorktrees => {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    self.git.open_worktrees_popup(&root);
+                }
+            }
         }
     }
 
@@ -5681,6 +5685,52 @@ c
         app.run_command(CommandAction::GitBranches, &ctx);
 
         assert!(app.git.branches_popup.open);
+    }
+
+    #[test]
+    fn is_command_enabled_git_worktrees_needs_a_project() {
+        let app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::GitWorktrees));
+    }
+
+    #[test]
+    fn run_command_git_worktrees_opens_the_popup_when_a_project_is_open() {
+        let dir = git_init_repo();
+        git_commit(
+            dir.path(),
+            "f.txt",
+            "a
+",
+        );
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::GitWorktrees, &ctx);
+
+        assert!(app.git.worktrees_popup.open);
+    }
+
+    #[test]
+    fn run_command_git_worktrees_defensively_picks_up_a_repo_initialized_after_project_open() {
+        // A project directory opened before it was ever `git init`'d --
+        // `is_command_enabled` only checks `self.project.is_some()`, so
+        // the command is reachable with `app.git.repo` still `None`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        assert!(!app.git.is_repo());
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::GitWorktrees, &ctx);
+
+        assert!(app.git.is_repo());
+        assert!(app.git.worktrees_popup.open);
     }
 
     #[test]

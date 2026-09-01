@@ -500,12 +500,18 @@ impl GitPanel {
     }
 
     /// Opens the worktrees popup with a freshly loaded list
-    /// (`git-worktrees.md` §2.2.1). Unlike `open_branches_popup`, doesn't
-    /// defensively re-open the repository — a project is already open
-    /// (and `self.repo` therefore already loaded by `refresh()`) whenever
-    /// this is reachable at all, since the action that opens this popup
-    /// only exists once a project is open.
-    pub fn open_worktrees_popup(&mut self) {
+    /// (`git-worktrees.md` §2.2.1). Defensively re-opens the repository if
+    /// it somehow isn't loaded yet, same as `open_branches_popup` — a
+    /// project being open doesn't guarantee `self.repo` is `Some`:
+    /// `is_command_enabled` only gates this command on a project being
+    /// open, not on it being a git repository, so a project that becomes a
+    /// git repo mid-session (an external `git init`) would otherwise leave
+    /// this popup stuck showing an empty list with no way to recover short
+    /// of a manual Refresh.
+    pub fn open_worktrees_popup(&mut self, project_root: &Path) {
+        if self.repo.is_none() {
+            self.refresh(project_root);
+        }
         self.worktrees_popup = WorktreesPopupState {
             open: true,
             ..WorktreesPopupState::default()
@@ -1626,5 +1632,193 @@ mod tests {
         assert!(detail.body.chars().count() <= MAX_COMMIT_DETAIL_BODY_CHARS);
         assert!(detail.summary.ends_with('\u{2026}'));
         assert!(detail.body.ends_with('\u{2026}'));
+    }
+
+    // ---- worktrees popup ----
+
+    #[test]
+    fn open_worktrees_popup_loads_the_list_and_resets_transient_state() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\n", "init");
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.worktrees_popup.error = Some("leftover".to_string());
+
+        panel.open_worktrees_popup(dir.path());
+
+        assert!(panel.worktrees_popup.open);
+        assert!(panel.worktrees_popup.error.is_none());
+        assert!(panel.worktrees_popup.worktrees.is_empty());
+    }
+
+    #[test]
+    fn open_worktrees_popup_defensively_reopens_a_repo_initialized_after_first_refresh() {
+        // Mirrors `refresh_picks_up_git_init_run_outside_the_app`: this is
+        // the code path `is_command_enabled`'s project-only gate can reach
+        // with `self.repo` still `None` (rev finding #3, E8 fix round).
+        let dir = tempfile::tempdir().unwrap();
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert!(!panel.is_repo());
+
+        run(dir.path(), &["init", "-q"]);
+        panel.open_worktrees_popup(dir.path());
+
+        assert!(panel.is_repo());
+        assert!(panel.worktrees_popup.open);
+    }
+
+    #[test]
+    fn close_worktrees_popup_resets_the_whole_state() {
+        let mut panel = GitPanel::default();
+        panel.worktrees_popup.open = true;
+        panel.worktrees_popup.new_name = "x".to_string();
+        panel.worktrees_popup.error = Some("y".to_string());
+
+        panel.close_worktrees_popup();
+
+        assert!(!panel.worktrees_popup.open);
+        assert!(panel.worktrees_popup.new_name.is_empty());
+        assert!(panel.worktrees_popup.error.is_none());
+    }
+
+    #[test]
+    fn refresh_worktrees_on_non_repo_clears_the_list() {
+        let mut panel = GitPanel::default();
+        panel.worktrees_popup.worktrees = vec![WorktreeInfo {
+            name: "stale".to_string(),
+            path: PathBuf::from("/stale"),
+            branch: None,
+            is_locked: false,
+        }];
+
+        panel.refresh_worktrees();
+
+        assert!(panel.worktrees_popup.worktrees.is_empty());
+    }
+
+    #[test]
+    fn refresh_worktrees_populates_from_the_repo() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\n", "init");
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let wt_path = worktree_dir.path().join("wt");
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel
+            .repo
+            .as_ref()
+            .unwrap()
+            .add_worktree("wt", &wt_path, None)
+            .unwrap();
+
+        panel.refresh_worktrees();
+
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+        assert_eq!(panel.worktrees_popup.worktrees[0].name, "wt");
+    }
+
+    #[test]
+    fn create_worktree_adds_it_and_clears_the_form() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\n", "init");
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let wt_path = worktree_dir.path().join("wt");
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.worktrees_popup.new_name = "wt".to_string();
+        panel.worktrees_popup.new_path = wt_path.to_string_lossy().to_string();
+
+        panel.create_worktree();
+
+        assert!(panel.worktrees_popup.error.is_none());
+        assert!(panel.worktrees_popup.new_name.is_empty());
+        assert!(panel.worktrees_popup.new_path.is_empty());
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+        assert_eq!(panel.worktrees_popup.worktrees[0].name, "wt");
+    }
+
+    #[test]
+    fn create_worktree_with_a_taken_name_sets_error_and_keeps_the_form() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\n", "init");
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel
+            .repo
+            .as_ref()
+            .unwrap()
+            .add_worktree("wt", worktree_dir.path().join("first"), None)
+            .unwrap();
+        panel.worktrees_popup.new_name = "wt".to_string();
+        panel.worktrees_popup.new_path = worktree_dir
+            .path()
+            .join("second")
+            .to_string_lossy()
+            .to_string();
+
+        panel.create_worktree();
+
+        assert!(panel.worktrees_popup.error.is_some());
+        // Left as-is so the user can fix and retry rather than retype
+        // (create_worktree's own doc comment).
+        assert_eq!(panel.worktrees_popup.new_name, "wt");
+    }
+
+    #[test]
+    fn remove_worktree_removes_it_and_refreshes_the_list() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\n", "init");
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel
+            .repo
+            .as_ref()
+            .unwrap()
+            .add_worktree("wt", worktree_dir.path().join("wt"), None)
+            .unwrap();
+        panel.refresh_worktrees();
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+
+        panel.remove_worktree("wt", false);
+
+        assert!(panel.worktrees_popup.error.is_none());
+        assert!(panel.worktrees_popup.pending_force_remove.is_none());
+        assert!(panel.worktrees_popup.worktrees.is_empty());
+    }
+
+    #[test]
+    fn remove_worktree_with_uncommitted_changes_sets_pending_force_remove_then_force_removes() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\n", "init");
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let wt_path = worktree_dir.path().join("wt");
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel
+            .repo
+            .as_ref()
+            .unwrap()
+            .add_worktree("wt", &wt_path, None)
+            .unwrap();
+        std::fs::write(wt_path.join("f.txt"), "dirty\n").unwrap();
+
+        panel.remove_worktree("wt", false);
+        assert!(panel.worktrees_popup.error.is_none());
+        assert_eq!(
+            panel.worktrees_popup.pending_force_remove.as_deref(),
+            Some("wt")
+        );
+        // Still registered -- the plain call above must not have removed it.
+        panel.refresh_worktrees();
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+
+        panel.remove_worktree("wt", true);
+
+        assert!(panel.worktrees_popup.error.is_none());
+        assert!(panel.worktrees_popup.pending_force_remove.is_none());
+        assert!(panel.worktrees_popup.worktrees.is_empty());
     }
 }
