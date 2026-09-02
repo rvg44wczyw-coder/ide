@@ -114,6 +114,20 @@ const MENU_GROUPS: &[MenuGroup] = &[
         ],
     },
     MenuGroup {
+        title: "Run",
+        items: &[
+            Some("Debug"),
+            Some("ResumeProgram"),
+            Some("StepOver"),
+            Some("StepInto"),
+            Some("StepOut"),
+            Some("PauseProgram"),
+            Some("StopDebugging"),
+            None,
+            Some("ToggleLineBreakpoint"),
+        ],
+    },
+    MenuGroup {
         title: "Window",
         items: &[Some("NextTab"), Some("PreviousTab"), Some("CloseTab")],
     },

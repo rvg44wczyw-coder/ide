@@ -90,6 +90,32 @@ pub fn paint_code_action_marker(
     );
 }
 
+/// A breakpoint marker centered on the line-number digits, drawn over them
+/// (`docs/features/debugger.md` §2.3) -- same "a shape, not an asset"
+/// convention as `paint_fold_arrow`/`paint_code_action_marker`. A filled
+/// circle for a real/unconfirmed breakpoint; a stroke-only (hollow) circle
+/// for one the adapter's most recent `BreakpointsConfirmed` reported
+/// `verified: false` -- still visible, but distinguishable from one that
+/// will actually fire.
+pub fn paint_breakpoint_marker(
+    painter: &egui::Painter,
+    number_right: f32,
+    top: f32,
+    row_height: f32,
+    char_width: f32,
+    verified: bool,
+    color: egui::Color32,
+) {
+    let cx = number_right - char_width * 0.6;
+    let cy = top + row_height * 0.5;
+    let r = row_height * 0.32;
+    if verified {
+        painter.circle_filled(egui::pos2(cx, cy), r, color);
+    } else {
+        painter.circle_stroke(egui::pos2(cx, cy), r, egui::Stroke::new(1.5, color));
+    }
+}
+
 /// Buffer-byte-range `Token`s decoded from `tokens`, converting `ide_lsp::
 /// SemanticToken`'s `Position`+UTF-16-`length` shape the same way
 /// `document_highlight_marks` converts `document_highlights` -- an entry

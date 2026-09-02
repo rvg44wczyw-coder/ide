@@ -891,6 +891,7 @@ mod tests {
             command: "definitely-not-a-real-lsp-binary-xyz".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -901,6 +902,7 @@ mod tests {
             command: "definitely-not-a-real-lsp-binary-xyz".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1411,6 +1413,7 @@ mod tests {
             command: "cat".to_string(),
             args: Vec::new(),
             extra_extensions: vec!["c".to_string()],
+            ..Default::default()
         };
         bridge.sync_active_languages(dir.path(), &[cpp]);
 

@@ -16,6 +16,7 @@ use crate::claude_panel::{ClaudeMessage, ClaudePanel};
 use crate::claude_terminal::ClaudeTerminalPanel;
 use crate::clone_panel::CloneState;
 use crate::command::{self, Binding, CommandAction, KeyChord};
+use crate::debug_panel::DebugPanel;
 use crate::editor::{self, BlameAnnotation, EditorState};
 use crate::file_structure;
 use crate::files_search;
@@ -215,6 +216,9 @@ pub enum BottomView {
     /// Global search results (`docs/features/global-search-and-languages.md`
     /// §2.2/§3) -- extends the row above to four-way.
     Search,
+    /// Threads/stack/output for the active debug session (`docs/features/
+    /// debugger.md` §2.3) -- extends the row above to five-way.
+    Debug,
 }
 
 /// Parameterizes `IdeApp::toggle_tool_window` / `is_tool_window_open`
@@ -817,6 +821,7 @@ pub struct IdeApp {
     claude_view: ClaudeView,
     git: GitPanel,
     lsp: LspBridge,
+    debug: DebugPanel,
     cargo: CargoPanel,
     clone: CloneState,
     /// `Some` only between startup and `resolve_startup_restore` clearing
@@ -1018,6 +1023,8 @@ pub struct IdeApp {
     new_language_extension: String,
     new_language_command: String,
     new_language_args: String,
+    new_language_debug_adapter_command: String,
+    new_language_debug_adapter_args: String,
     language_settings_error: Option<String>,
     show_language_settings: bool,
     /// Mirrors `ProjectPreferences::dismissed_language_suggestions`,
@@ -1189,6 +1196,7 @@ impl IdeApp {
             claude_view: ClaudeView::Chat,
             git: GitPanel::default(),
             lsp: LspBridge::default(),
+            debug: DebugPanel::default(),
             cargo: CargoPanel::default(),
             clone: CloneState::default(),
             startup_restore_prompt: None,
@@ -1240,6 +1248,8 @@ impl IdeApp {
             new_language_extension: String::new(),
             new_language_command: String::new(),
             new_language_args: String::new(),
+            new_language_debug_adapter_command: String::new(),
+            new_language_debug_adapter_args: String::new(),
             language_settings_error: None,
             show_language_settings: false,
             dismissed_language_suggestions: Vec::new(),
@@ -2006,6 +2016,27 @@ impl IdeApp {
     /// click (`docs/features/goto-definition.md` §2.2/§3.3/§3.4).
     fn open_definition(&mut self, path: &Path, position: Position) {
         self.open_at(path, position);
+    }
+
+    /// Opens `path` (a `StackFrame::source` -- already canonicalized and
+    /// checked against `project_root` by `ide-dap`, §3.6; never a second,
+    /// independent path-open call) and best-effort places the cursor at
+    /// `line`/`column`. DAP reports both 1-based (`initialize_arguments`'s
+    /// `linesStartAt1`/`columnsStartAt1: true`), unlike `ide_lsp::Position`'s
+    /// 0-based convention `open_at` assumes -- kept as its own small
+    /// sibling rather than folded into `open_at`, matching this project's
+    /// "three similar lines is better than a premature abstraction"
+    /// preference (`open_search_result`'s doc comment).
+    fn open_stack_frame(&mut self, path: &Path, line: u32, column: u32) {
+        self.open_file(path);
+        let Some(idx) = self.active_tab else { return };
+        let position = Position {
+            line: line.saturating_sub(1),
+            character: column.saturating_sub(1),
+        };
+        self.pending_cursor_offset =
+            ide_lsp::position_to_byte_offset(self.tabs[idx].buffer.text(), position);
+        self.push_nav_location();
     }
 
     /// Opens `path` (a search result's file -- must come from a
@@ -2791,6 +2822,58 @@ impl IdeApp {
         }
     }
 
+    /// Called once per frame right after the editor widget's `show()`
+    /// returns, alongside `handle_git_gutter_click`/`handle_blame_click`
+    /// (`docs/features/debugger.md` §2.3). Toggles a breakpoint on the
+    /// clicked line -- no-op with no open (named, on-disk) tab, matching
+    /// the doc-provenance discipline the other two handlers apply to their
+    /// own click targets.
+    fn handle_breakpoint_click(&mut self, idx: usize, output: &editor::EditorOutput) {
+        let Some(line) = output.breakpoint_clicked_line else {
+            return;
+        };
+        let Some(path) = self.tabs[idx].buffer.path() else {
+            return;
+        };
+        self.debug
+            .toggle_breakpoint(path.to_path_buf(), line as u32 + 1);
+    }
+
+    /// The active tab's breakpoints as sorted `BreakpointMark`s for the
+    /// editor widget's `.breakpoints(...)` builder call -- `None` when the
+    /// tab has no path (untitled) since `DebugPanel::breakpoints` is keyed
+    /// by on-disk path. `verified` defaults `true` (a real/unconfirmed
+    /// breakpoint paints solid, doc §2.3); a line the most recent
+    /// `BreakpointsConfirmed` for this file reported `verified: false`
+    /// paints hollow instead.
+    fn breakpoint_marks_for_active_tab(&self) -> Vec<editor::BreakpointMark> {
+        let Some(idx) = self.active_tab else {
+            return Vec::new();
+        };
+        let Some(path) = self.tabs[idx].buffer.path() else {
+            return Vec::new();
+        };
+        let Some(lines) = self.debug.breakpoints.get(path) else {
+            return Vec::new();
+        };
+        let confirmed = self.debug.confirmed_breakpoints.get(path);
+        let mut marks: Vec<editor::BreakpointMark> = lines
+            .iter()
+            .map(|&line| {
+                let verified = confirmed
+                    .and_then(|c| c.iter().find(|v| v.line == line))
+                    .map(|v| v.verified)
+                    .unwrap_or(true);
+                editor::BreakpointMark {
+                    line: (line as usize).saturating_sub(1),
+                    verified,
+                }
+            })
+            .collect();
+        marks.sort_by_key(|m| m.line);
+        marks
+    }
+
     /// The branches popup's currently filtered/sorted rows (fuzzy-filtered
     /// by `branches_popup.filter`, score-descending -- same ordering
     /// `render_branches_popup` draws), as owned `(name, is_head)` pairs
@@ -3528,6 +3611,12 @@ impl IdeApp {
             .split_whitespace()
             .map(str::to_string)
             .collect();
+        let debug_adapter_command = self.new_language_debug_adapter_command.trim().to_string();
+        let debug_adapter_args: Vec<String> = self
+            .new_language_debug_adapter_args
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
 
         if name.is_empty() || extension.is_empty() || command.is_empty() {
             self.language_settings_error =
@@ -3551,11 +3640,16 @@ impl IdeApp {
             command,
             args,
             extra_extensions: Vec::new(),
+            debug_adapter_command: (!debug_adapter_command.is_empty())
+                .then_some(debug_adapter_command),
+            debug_adapter_args,
         });
         self.new_language_name.clear();
         self.new_language_extension.clear();
         self.new_language_command.clear();
         self.new_language_args.clear();
+        self.new_language_debug_adapter_command.clear();
+        self.new_language_debug_adapter_args.clear();
         self.language_settings_error = None;
         self.resync_active_languages();
     }
@@ -4640,6 +4734,30 @@ impl IdeApp {
                         .active_tab
                         .is_some_and(|idx| self.tabs[idx].buffer.path().is_some())
             }
+            // One session at a time (`docs/features/debugger.md` §3.1):
+            // greyed out whenever a session is already active, or the
+            // active file's language has no debug adapter configured.
+            CommandAction::Debug => {
+                !self.debug.is_active()
+                    && self.project.is_some()
+                    && self.active_tab.is_some_and(|idx| {
+                        self.tabs[idx].buffer.path().is_some_and(|path| {
+                            ide_core::language_for_path(&self.active_languages, path)
+                                .is_some_and(|c| c.debug_adapter().is_some())
+                        })
+                    })
+            }
+            CommandAction::ResumeProgram
+            | CommandAction::StepOver
+            | CommandAction::StepInto
+            | CommandAction::StepOut
+            | CommandAction::PauseProgram
+            | CommandAction::StopDebugging => self.debug.is_active(),
+            // Works with no active session (§3.4) -- only needs a saved
+            // tab, the same precondition `ToggleBlameAnnotations` uses.
+            CommandAction::ToggleLineBreakpoint => self
+                .active_tab
+                .is_some_and(|idx| self.tabs[idx].buffer.path().is_some()),
         }
     }
 
@@ -4756,6 +4874,14 @@ impl IdeApp {
                 }
             }
             CommandAction::ShowFileHistory => self.trigger_show_file_history(),
+            CommandAction::Debug => self.trigger_debug(),
+            CommandAction::ResumeProgram => self.debug.resume(),
+            CommandAction::StepOver => self.debug.step_over(),
+            CommandAction::StepInto => self.debug.step_into(),
+            CommandAction::StepOut => self.debug.step_out(),
+            CommandAction::PauseProgram => self.debug.pause(),
+            CommandAction::StopDebugging => self.debug.stop(),
+            CommandAction::ToggleLineBreakpoint => self.toggle_breakpoint_at_caret(),
         }
     }
 
@@ -4779,6 +4905,79 @@ impl IdeApp {
         };
         let relative = relative.to_path_buf();
         self.git.show_file_history(&relative);
+    }
+
+    /// `Debug` command (`docs/features/debugger.md` §2.3): opens the
+    /// launch popup rather than starting a session immediately -- the
+    /// doc's own rationale (no real run-configuration model exists yet to
+    /// build a `program`/`args`/`cwd` guess from). No-op outside
+    /// `is_command_enabled`'s own gate (active tab, saved path, a
+    /// configured debug adapter for its language).
+    fn trigger_debug(&mut self) {
+        let Some(idx) = self.active_tab else { return };
+        let Some(path) = self.tabs[idx].buffer.path() else {
+            return;
+        };
+        if ide_core::language_for_path(&self.active_languages, path)
+            .and_then(|c| c.debug_adapter())
+            .is_none()
+        {
+            return;
+        }
+        if self.debug.launch_args_draft.trim().is_empty() {
+            self.debug.launch_args_draft = "{}".to_string();
+        }
+        self.debug.error = None;
+        self.debug.show_launch_popup = true;
+    }
+
+    /// The launch popup's "Launch" button: parses `launch_args_draft` as
+    /// raw JSON, rejecting (via `debug.error`, popup stays open) rather
+    /// than sending anything on invalid JSON (doc §2.3). No-op with no
+    /// open project (`DapClient::start` needs a `project_root`) or no
+    /// configured adapter for the active file's language -- both already
+    /// checked by `trigger_debug` before the popup could open, this is
+    /// just the same defensive re-check `add_custom_language`'s pattern
+    /// uses at its own point of use.
+    fn confirm_debug_launch(&mut self) {
+        let Some(idx) = self.active_tab else { return };
+        let Some(path) = self.tabs[idx].buffer.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) else {
+            return;
+        };
+        let Some((command, args)) = ide_core::language_for_path(&self.active_languages, &path)
+            .and_then(|c| c.debug_adapter())
+            .map(|(command, args)| (command.to_string(), args.to_vec()))
+        else {
+            return;
+        };
+        let arguments =
+            match serde_json::from_str::<serde_json::Value>(&self.debug.launch_args_draft) {
+                Ok(value) => value,
+                Err(e) => {
+                    self.debug.error = Some(format!("Invalid JSON: {e}"));
+                    return;
+                }
+            };
+        self.debug.show_launch_popup = false;
+        self.debug.start_session(&command, &args, root, arguments);
+    }
+
+    /// `ToggleLineBreakpoint` (doc §2.3): toggles a breakpoint on the
+    /// active editor's current caret line -- the same underlying
+    /// `DebugPanel::toggle_breakpoint` the gutter click calls, converting
+    /// the 0-based caret line to DAP's 1-based convention exactly like
+    /// `handle_breakpoint_click` does for the gutter gesture.
+    fn toggle_breakpoint_at_caret(&mut self) {
+        let Some(idx) = self.active_tab else { return };
+        let Some(path) = self.tabs[idx].buffer.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let offset = self.active_cursor_offset.unwrap_or(0);
+        let (line, _) = editor::cursor_line_column(self.tabs[idx].buffer.text_buffer(), offset);
+        self.debug.toggle_breakpoint(path, line as u32 + 1);
     }
 
     /// `CollapseFold` (`code-folding.md` §2.4/§2.5): collapses the
@@ -5140,6 +5339,7 @@ mod tests {
             claude_view: ClaudeView::Chat,
             git: GitPanel::default(),
             lsp: LspBridge::default(),
+            debug: DebugPanel::default(),
             cargo: CargoPanel::default(),
             clone: CloneState::default(),
             startup_restore_prompt: None,
@@ -5191,6 +5391,8 @@ mod tests {
             new_language_extension: String::new(),
             new_language_command: String::new(),
             new_language_args: String::new(),
+            new_language_debug_adapter_command: String::new(),
+            new_language_debug_adapter_args: String::new(),
             language_settings_error: None,
             show_language_settings: false,
             dismissed_language_suggestions: Vec::new(),
@@ -5414,6 +5616,7 @@ mod tests {
             clicked_link: None,
             git_gutter_clicked_line: Some(3),
             blame_clicked_line: None,
+            breakpoint_clicked_line: None,
         };
 
         app.handle_git_gutter_click(&output);
@@ -5449,6 +5652,7 @@ mod tests {
             clicked_link: None,
             git_gutter_clicked_line: None,
             blame_clicked_line: Some(2),
+            breakpoint_clicked_line: None,
         };
 
         app.handle_blame_click(0, &output);
@@ -5469,6 +5673,7 @@ mod tests {
             clicked_link: None,
             git_gutter_clicked_line: None,
             blame_clicked_line: Some(5),
+            breakpoint_clicked_line: None,
         };
 
         app.handle_blame_click(0, &output);
@@ -6853,6 +7058,14 @@ b
             command: command.to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    fn go_config_with_debug_adapter(command: &str) -> LanguageConfig {
+        LanguageConfig {
+            debug_adapter_command: Some(command.to_string()),
+            ..go_config()
         }
     }
 
@@ -7428,6 +7641,7 @@ b
                 command: "gopls".to_string(),
                 args: Vec::new(),
                 extra_extensions: Vec::new(),
+                ..Default::default()
             }]
         );
         assert!(app.language_settings_error.is_none());
@@ -7455,6 +7669,7 @@ b
                 command: "typescript-language-server".to_string(),
                 args: vec!["--stdio".to_string(), "--log-level=verbose".to_string()],
                 extra_extensions: Vec::new(),
+                ..Default::default()
             }]
         );
         assert!(app.new_language_args.is_empty());
@@ -12786,5 +13001,466 @@ b
         app.run_command(CommandAction::RecentLocations, &egui::Context::default());
         assert!(app.recent_locations_open);
         assert!(!app.recent_files_open);
+    }
+
+    // ---- F5a: debugger ----
+
+    #[test]
+    fn open_stack_frame_converts_1_based_dap_position_to_0_based_and_opens_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_stack_frame(&file, 1, 4);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.pending_cursor_offset, Some(3));
+    }
+
+    #[test]
+    fn open_stack_frame_saturates_when_dap_reports_a_zero_line_or_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_stack_frame(&file, 0, 0);
+
+        assert_eq!(app.pending_cursor_offset, Some(0));
+    }
+
+    #[test]
+    fn handle_breakpoint_click_toggles_a_breakpoint_using_1_based_dap_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "a\nb\nc\n").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        let idx = app.active_tab.unwrap();
+        let output = editor::EditorOutput {
+            cursor_offset: 0,
+            changed: false,
+            hovered_word: None,
+            clicked_link: None,
+            git_gutter_clicked_line: None,
+            blame_clicked_line: None,
+            breakpoint_clicked_line: Some(2),
+        };
+
+        app.handle_breakpoint_click(idx, &output);
+
+        let canonical = file.canonicalize().unwrap();
+        assert_eq!(app.debug.breakpoints.get(&canonical), Some(&vec![3]));
+    }
+
+    #[test]
+    fn handle_breakpoint_click_is_a_noop_for_an_untitled_tab() {
+        let mut app = app_without_gui();
+        app.tabs.push(Tab::untitled("Untitled".to_string()));
+        let output = editor::EditorOutput {
+            cursor_offset: 0,
+            changed: false,
+            hovered_word: None,
+            clicked_link: None,
+            git_gutter_clicked_line: None,
+            blame_clicked_line: None,
+            breakpoint_clicked_line: Some(0),
+        };
+
+        app.handle_breakpoint_click(0, &output);
+
+        assert!(app.debug.breakpoints.is_empty());
+    }
+
+    #[test]
+    fn handle_breakpoint_click_is_a_noop_with_no_clicked_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "a\n").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        let idx = app.active_tab.unwrap();
+        let output = editor::EditorOutput {
+            cursor_offset: 0,
+            changed: false,
+            hovered_word: None,
+            clicked_link: None,
+            git_gutter_clicked_line: None,
+            blame_clicked_line: None,
+            breakpoint_clicked_line: None,
+        };
+
+        app.handle_breakpoint_click(idx, &output);
+
+        assert!(app.debug.breakpoints.is_empty());
+    }
+
+    #[test]
+    fn breakpoint_marks_for_active_tab_is_empty_with_no_active_tab() {
+        let app = app_without_gui();
+        assert!(app.breakpoint_marks_for_active_tab().is_empty());
+    }
+
+    #[test]
+    fn breakpoint_marks_for_active_tab_is_empty_for_an_untitled_tab() {
+        let mut app = app_without_gui();
+        app.tabs.push(Tab::untitled("Untitled".to_string()));
+        app.active_tab = Some(0);
+
+        assert!(app.breakpoint_marks_for_active_tab().is_empty());
+    }
+
+    #[test]
+    fn breakpoint_marks_for_active_tab_is_empty_with_no_breakpoints_for_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "a\n").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+
+        assert!(app.breakpoint_marks_for_active_tab().is_empty());
+    }
+
+    #[test]
+    fn breakpoint_marks_for_active_tab_converts_and_sorts_1_based_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "a\nb\nc\nd\n").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        let canonical = file.canonicalize().unwrap();
+        app.debug.breakpoints.insert(canonical, vec![4, 1]);
+
+        let marks = app.breakpoint_marks_for_active_tab();
+
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[0].line, 0);
+        assert!(marks[0].verified);
+        assert_eq!(marks[1].line, 3);
+        assert!(marks[1].verified);
+    }
+
+    #[test]
+    fn breakpoint_marks_for_active_tab_marks_a_line_hollow_when_reported_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "a\nb\n").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        let canonical = file.canonicalize().unwrap();
+        app.debug.breakpoints.insert(canonical.clone(), vec![2]);
+        app.debug.confirmed_breakpoints.insert(
+            canonical,
+            vec![ide_dap::VerifiedBreakpoint {
+                line: 2,
+                verified: false,
+                message: None,
+            }],
+        );
+
+        let marks = app.breakpoint_marks_for_active_tab();
+
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].line, 1);
+        assert!(!marks[0].verified);
+    }
+
+    #[test]
+    fn is_command_enabled_debug_needs_a_project_a_saved_tab_and_a_configured_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.go");
+        std::fs::write(&file, "package main").unwrap();
+
+        let mut app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::Debug));
+
+        app.open_file(&file);
+        assert!(
+            !app.is_command_enabled(CommandAction::Debug),
+            "no project open yet"
+        );
+
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        assert!(
+            !app.is_command_enabled(CommandAction::Debug),
+            "no debug adapter configured for .go"
+        );
+
+        app.active_languages = vec![go_config_with_debug_adapter("cat")];
+        assert!(app.is_command_enabled(CommandAction::Debug));
+    }
+
+    #[test]
+    fn is_command_enabled_execution_control_actions_need_an_active_session() {
+        let actions = [
+            CommandAction::ResumeProgram,
+            CommandAction::StepOver,
+            CommandAction::StepInto,
+            CommandAction::StepOut,
+            CommandAction::PauseProgram,
+            CommandAction::StopDebugging,
+        ];
+
+        let mut app = app_without_gui();
+        for action in actions {
+            assert!(!app.is_command_enabled(action));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        app.debug
+            .start_session("cat", &[], dir.path(), serde_json::json!({}));
+        assert!(app.debug.is_active());
+
+        for action in actions {
+            assert!(app.is_command_enabled(action));
+        }
+        // A configured session also disables re-triggering Debug (§3.1:
+        // one session at a time).
+        assert!(!app.is_command_enabled(CommandAction::Debug));
+    }
+
+    #[test]
+    fn is_command_enabled_toggle_line_breakpoint_needs_a_saved_tab_but_no_session() {
+        let mut app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::ToggleLineBreakpoint));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "a\n").unwrap();
+        app.open_file(&file);
+
+        assert!(app.is_command_enabled(CommandAction::ToggleLineBreakpoint));
+    }
+
+    #[test]
+    fn run_command_dispatches_execution_control_actions_to_the_debug_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.debug
+            .start_session("cat", &[], dir.path(), serde_json::json!({}));
+        assert!(app.debug.is_active());
+        let ctx = egui::Context::default();
+
+        for action in [
+            CommandAction::ResumeProgram,
+            CommandAction::StepOver,
+            CommandAction::StepInto,
+            CommandAction::StepOut,
+            CommandAction::PauseProgram,
+        ] {
+            app.run_command(action, &ctx);
+        }
+        assert!(
+            app.debug.is_active(),
+            "execution-control commands must not end the session"
+        );
+
+        app.run_command(CommandAction::StopDebugging, &ctx);
+        assert!(!app.debug.is_active());
+    }
+
+    #[test]
+    fn trigger_debug_opens_the_launch_popup_with_a_default_json_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.go");
+        std::fs::write(&file, "package main").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.active_languages = vec![go_config_with_debug_adapter("cat")];
+
+        app.trigger_debug();
+
+        assert!(app.debug.show_launch_popup);
+        assert_eq!(app.debug.launch_args_draft, "{}");
+        assert!(app.debug.error.is_none());
+    }
+
+    #[test]
+    fn run_command_debug_dispatches_to_trigger_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.go");
+        std::fs::write(&file, "package main").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.active_languages = vec![go_config_with_debug_adapter("cat")];
+
+        app.run_command(CommandAction::Debug, &egui::Context::default());
+
+        assert!(app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn run_command_toggle_line_breakpoint_dispatches_to_toggle_breakpoint_at_caret() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "a\nb\n").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.active_cursor_offset = Some(0);
+
+        app.run_command(
+            CommandAction::ToggleLineBreakpoint,
+            &egui::Context::default(),
+        );
+
+        let canonical = file.canonicalize().unwrap();
+        assert_eq!(app.debug.breakpoints.get(&canonical), Some(&vec![1]));
+    }
+
+    #[test]
+    fn trigger_debug_is_a_noop_for_an_untitled_tab() {
+        let mut app = app_without_gui();
+        app.tabs.push(Tab::untitled("Untitled".to_string()));
+        app.active_tab = Some(0);
+
+        app.trigger_debug();
+
+        assert!(!app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn trigger_debug_is_a_noop_without_a_configured_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.go");
+        std::fs::write(&file, "package main").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+
+        app.trigger_debug();
+
+        assert!(!app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn confirm_debug_launch_is_a_noop_for_an_untitled_tab() {
+        let mut app = app_without_gui();
+        app.tabs.push(Tab::untitled("Untitled".to_string()));
+        app.active_tab = Some(0);
+        app.debug.show_launch_popup = true;
+        app.debug.launch_args_draft = "{}".to_string();
+
+        app.confirm_debug_launch();
+
+        assert!(!app.debug.is_active());
+        assert!(app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn confirm_debug_launch_is_a_noop_without_a_configured_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.go");
+        std::fs::write(&file, "package main").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.debug.show_launch_popup = true;
+        app.debug.launch_args_draft = "{}".to_string();
+
+        app.confirm_debug_launch();
+
+        assert!(!app.debug.is_active());
+        assert!(app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn confirm_debug_launch_rejects_invalid_json_and_keeps_the_popup_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.go");
+        std::fs::write(&file, "package main").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.active_languages = vec![go_config_with_debug_adapter("cat")];
+        app.debug.show_launch_popup = true;
+        app.debug.launch_args_draft = "not json".to_string();
+
+        app.confirm_debug_launch();
+
+        assert!(app.debug.error.is_some());
+        assert!(app.debug.show_launch_popup);
+        assert!(!app.debug.is_active());
+    }
+
+    #[test]
+    fn confirm_debug_launch_starts_a_session_on_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.go");
+        std::fs::write(&file, "package main").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.active_languages = vec![go_config_with_debug_adapter("cat")];
+        app.debug.show_launch_popup = true;
+        app.debug.launch_args_draft = "{}".to_string();
+
+        app.confirm_debug_launch();
+
+        assert!(app.debug.is_active());
+        assert!(!app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn confirm_debug_launch_is_a_noop_without_an_open_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.go");
+        std::fs::write(&file, "package main").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.active_languages = vec![go_config_with_debug_adapter("cat")];
+        app.debug.show_launch_popup = true;
+        app.debug.launch_args_draft = "{}".to_string();
+
+        app.confirm_debug_launch();
+
+        assert!(!app.debug.is_active());
+    }
+
+    #[test]
+    fn toggle_breakpoint_at_caret_is_a_noop_for_an_untitled_tab() {
+        let mut app = app_without_gui();
+        app.tabs.push(Tab::untitled("Untitled".to_string()));
+        app.active_tab = Some(0);
+
+        app.toggle_breakpoint_at_caret();
+
+        assert!(app.debug.breakpoints.is_empty());
+    }
+
+    #[test]
+    fn toggle_breakpoint_at_caret_toggles_using_the_current_cursor_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.rs");
+        std::fs::write(&file, "a\nb\nc\n").unwrap();
+
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        // Byte offset 2 is the start of line 1 (0-based), "b".
+        app.active_cursor_offset = Some(2);
+
+        app.toggle_breakpoint_at_caret();
+
+        let canonical = file.canonicalize().unwrap();
+        assert_eq!(app.debug.breakpoints.get(&canonical), Some(&vec![2]));
+
+        app.toggle_breakpoint_at_caret();
+
+        assert!(!app.debug.breakpoints.contains_key(&canonical));
     }
 }
