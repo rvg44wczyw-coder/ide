@@ -232,6 +232,8 @@ pub enum Action {
     ConfigureDebugAdapter,
     GitBranches,
     ShowFileHistory,
+    ToggleBlameAnnotations,
+    ShowBlameForCurrentLine,
     Exit,
 }
 
@@ -854,6 +856,27 @@ pub fn commands() -> &'static [Command] {
             // Palette-only, same reasoning as `GitBranches` above.
             binding: None,
             action: Action::ShowFileHistory,
+        },
+        Command {
+            id: "ToggleBlameAnnotations",
+            title: "Toggle Blame Annotations",
+            // Palette-only (`docs/features/tui-blame.md` §3.1) --
+            // `ide-ui`'s own primary entry point is its gutter's
+            // right-click context menu (no terminal equivalent), and its
+            // command-palette entry has no JetBrains macOS default
+            // binding either, so there is nothing to translate.
+            binding: None,
+            action: Action::ToggleBlameAnnotations,
+        },
+        Command {
+            id: "ShowBlameForCurrentLine",
+            title: "Show Blame Details for Current Line",
+            // Palette-only, `ide-tui`-only command -- no `ide-ui` action
+            // exists to translate a binding from (`docs/features/
+            // tui-blame.md` §3.4: a deliberate keyboard fallback to the
+            // Commit Details popup for a mouse-hostile terminal session).
+            binding: None,
+            action: Action::ShowBlameForCurrentLine,
         },
         Command {
             id: "Exit",

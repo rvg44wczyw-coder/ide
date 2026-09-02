@@ -122,6 +122,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.pending_rename_preview.is_some() {
         render_rename_preview(frame, app, size);
     }
+    if app.blame_popup.is_some() {
+        render_blame_popup(frame, app, size);
+    }
     if app.git_panel.is_some() {
         render_git_panel(frame, app, size);
     }
@@ -319,6 +322,12 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         breakpoints_verified: &breakpoints_verified,
         breakpoints_unverified: &breakpoints_unverified,
     };
+    // `docs/features/tui-blame.md` §2.4 -- computed once per frame, not
+    // per visible line, same as every other overlay above.
+    let blame_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let lines: Vec<Line> = (visible_start..visible_end)
         .map(|row| {
             let line = visual.buffer_line(row);
@@ -337,6 +346,12 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     " \u{22ef}",
                     Style::default().fg(Color::DarkGray),
                 ));
+            }
+            if let Some(annotations) = &buf.blame {
+                let prefix = blame_lane_prefix(annotations, line, blame_now);
+                let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::DarkGray))];
+                spans.extend(styled.spans);
+                styled = Line::from(spans);
             }
             styled
         })
@@ -387,12 +402,37 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 let (_, screen_column) =
                     crate::highlight::expand_tabs(&line_text[..byte_col], 0, buf.indent.width);
                 frame.set_cursor_position((
-                    text_area.x + screen_column as u16,
+                    text_area.x + screen_column as u16 + app.blame_lane_width(),
                     text_area.y + screen_line as u16,
                 ));
             }
         }
     }
+}
+
+/// `docs/features/tui-blame.md` §2.4 -- exactly `BLAME_LANE_WIDTH` chars
+/// wide always (the labeled row and every blank row alike), so the
+/// buffer's own text starts at a fixed column regardless of which rows
+/// happen to carry a label.
+fn blame_lane_prefix(
+    annotations: &[crate::blame_gutter::BlameAnnotation],
+    line: usize,
+    now: i64,
+) -> String {
+    use crate::blame_gutter::{blame_annotation_at, truncate_display, BLAME_LANE_CHARS};
+    let label = match blame_annotation_at(annotations, line) {
+        Some(a) if a.line == line => truncate_display(
+            &format!(
+                "{} {}, {}",
+                a.short_id,
+                a.author,
+                crate::blame_gutter::relative_time(a.timestamp, now)
+            ),
+            BLAME_LANE_CHARS,
+        ),
+        _ => String::new(),
+    };
+    format!("{label:<BLAME_LANE_CHARS$} ")
 }
 
 fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
@@ -1879,6 +1919,85 @@ fn change_kind_badge(kind: ide_core::ChangeKind) -> &'static str {
 /// tui-git-staging-branches-and-log-filters.md` §2.4/§3.4): centered over
 /// whichever view is active underneath, matching the existing conflict-
 /// resolution popup's own "draw over the current view" precedent.
+/// How many rows `text` occupies once word-wrapped to `width` columns --
+/// used only for popup height sizing, so an approximation matching
+/// `ratatui`'s own `Wrap` behaviour closely enough is fine; it doesn't
+/// need to be pixel-perfect, only big enough that `blame_popup_scroll`
+/// only ever has to cover genuine overflow, not a systematic undercount.
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    let width = (width.max(1)) as usize;
+    text.lines()
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 {
+                1
+            } else {
+                chars.div_ceil(width)
+            }
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+/// The Commit Details popup (`docs/features/tui-blame.md` §2.4/§3.3) --
+/// unlike `render_git_branches_popup`'s fixed small-box shape, a commit
+/// body has no length cap, so height grows with the wrapped body line
+/// count up to a terminal-bounded max; `blame_popup_scroll` covers
+/// whatever still doesn't fit. Always goes through `app.git.commit_detail`
+/// (the sanitizing `GitPanel` wrapper), never `ide_core::GitRepo::
+/// commit_detail` directly -- `docs/security-findings/
+/// git-branches-and-blame-ui-2026-09-01.md` findings 1/2.
+fn render_blame_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(id) = app.blame_popup.as_ref() else {
+        return;
+    };
+    let width = area.width.clamp(40, 90);
+    let inner_width = width.saturating_sub(2);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let body_text = match app.git.commit_detail(id) {
+        Ok(detail) => {
+            let mut text = format!(
+                "{}  {}\n{} <{}>\n{}\n",
+                detail.short_id,
+                detail.summary,
+                detail.author,
+                detail.email,
+                crate::blame_gutter::relative_time(detail.timestamp, now),
+            );
+            if !detail.body.is_empty() {
+                text.push('\n');
+                text.push_str(&detail.body);
+            }
+            text
+        }
+        Err(e) => format!("Failed to load commit details: {e}"),
+    };
+
+    let wrapped = wrapped_line_count(&body_text, inner_width);
+    let height = (wrapped as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Commit Details  (Esc: close)");
+    let paragraph = Paragraph::new(body_text)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.blame_popup_scroll, 0));
+    frame.render_widget(paragraph, popup);
+}
+
 fn render_git_branches_popup(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width.clamp(30, 60).min(area.width);
     let height = area.height.clamp(6, 16).min(area.height);
