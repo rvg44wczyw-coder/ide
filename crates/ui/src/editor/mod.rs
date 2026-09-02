@@ -31,9 +31,20 @@ use double_tap::DoubleTap;
 use geometry::Metrics;
 use input::{apply_intent, intent_for, Direction, Intent};
 use paint::{
-    diagnostic_marks, document_highlight_marks, merge_semantic_tokens, paint_code_action_marker,
-    semantic_token_marks, tokens_in_range, LineCache, LineContext,
+    diagnostic_marks, document_highlight_marks, merge_semantic_tokens, paint_breakpoint_marker,
+    paint_code_action_marker, semantic_token_marks, tokens_in_range, LineCache, LineContext,
 };
+
+/// One line's breakpoint state for the gutter (`docs/features/
+/// debugger.md` §2.3) -- `verified` is `true` until a `BreakpointsConfirmed`
+/// event for this file reports it `false` (adapter rejected the line: a
+/// comment, unreachable code), which paints it as a dimmed/hollow circle
+/// instead of the solid one every other breakpoint gets.
+#[derive(Debug, Clone, Copy)]
+pub struct BreakpointMark {
+    pub line: usize,
+    pub verified: bool,
+}
 
 /// Everything the widget must remember between frames.
 #[derive(Default)]
@@ -234,6 +245,13 @@ pub struct EditorOutput {
     /// which annotation (and thus which `commit_id`) covers it and open
     /// the blame popup.
     pub blame_clicked_line: Option<usize>,
+    /// Set when the line-number digits were clicked this frame
+    /// (`docs/features/debugger.md` §2.3) -- the buffer line to toggle a
+    /// breakpoint on. Intercepts the caret-placement fallback (unlike
+    /// `git_gutter_clicked_line`/`blame_clicked_line`, which are in their
+    /// own dedicated lanes that never compete with it) -- a gutter click
+    /// never moves the caret, matching the reference IDE's own behavior.
+    pub breakpoint_clicked_line: Option<usize>,
 }
 
 pub struct CodeEditor<'a> {
@@ -254,6 +272,7 @@ pub struct CodeEditor<'a> {
     git_gutter_marks: &'a [GutterMark],
     blame_on: bool,
     blame_annotations: &'a [BlameAnnotation],
+    breakpoint_marks: &'a [BreakpointMark],
 }
 
 impl<'a> CodeEditor<'a> {
@@ -285,6 +304,7 @@ impl<'a> CodeEditor<'a> {
             git_gutter_marks: &[],
             blame_on: false,
             blame_annotations: &[],
+            breakpoint_marks: &[],
         }
     }
 
@@ -379,6 +399,15 @@ impl<'a> CodeEditor<'a> {
         self
     }
 
+    /// The active tab's breakpoints (`docs/features/debugger.md` §2.3) --
+    /// default `&[]` paints and hit-tests nothing, same as every other
+    /// optional overlay here. Sorted ascending by `line`, matching
+    /// `git_gutter_marks`' own binary-search precondition.
+    pub fn breakpoints(mut self, marks: &'a [BreakpointMark]) -> Self {
+        self.breakpoint_marks = marks;
+        self
+    }
+
     pub fn show(self, ui: &mut egui::Ui) -> EditorOutput {
         let Self {
             id,
@@ -398,6 +427,7 @@ impl<'a> CodeEditor<'a> {
             git_gutter_marks,
             blame_on,
             blame_annotations,
+            breakpoint_marks,
         } = self;
 
         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -459,11 +489,13 @@ impl<'a> CodeEditor<'a> {
             code_action_line,
             git_gutter_marks,
             blame_annotations,
+            breakpoint_marks,
             changed: false,
             hovered_word: None,
             clicked_link: None,
             git_gutter_clicked_line: None,
             blame_clicked_line: None,
+            breakpoint_clicked_line: None,
             copy: None,
         };
 
@@ -483,6 +515,7 @@ impl<'a> CodeEditor<'a> {
             clicked_link: frame.clicked_link,
             git_gutter_clicked_line: frame.git_gutter_clicked_line,
             blame_clicked_line: frame.blame_clicked_line,
+            breakpoint_clicked_line: frame.breakpoint_clicked_line,
         }
     }
 }
@@ -507,11 +540,13 @@ struct Frame<'a> {
     code_action_line: Option<usize>,
     git_gutter_marks: &'a [GutterMark],
     blame_annotations: &'a [BlameAnnotation],
+    breakpoint_marks: &'a [BreakpointMark],
     changed: bool,
     hovered_word: Option<Range<usize>>,
     clicked_link: Option<Range<usize>>,
     git_gutter_clicked_line: Option<usize>,
     blame_clicked_line: Option<usize>,
+    breakpoint_clicked_line: Option<usize>,
     copy: Option<String>,
 }
 
@@ -1040,6 +1075,17 @@ impl Frame<'_> {
                 self.font_id.clone(),
                 color,
             );
+            if let Some(verified) = self.breakpoint_mark_at(line) {
+                paint_breakpoint_marker(
+                    painter,
+                    number_right,
+                    top,
+                    self.metrics.row_height,
+                    self.metrics.char_width,
+                    verified,
+                    self.tokens.color.danger,
+                );
+            }
             if fold_start_lines.contains(&line) {
                 self.paint_fold_arrow(painter, marker_left, top, self.state.is_folded(line), color);
             } else if self.code_action_line == Some(line) {
@@ -1117,6 +1163,15 @@ impl Frame<'_> {
             .binary_search_by_key(&line, |m| m.line)
             .ok()
             .map(|i| self.git_gutter_marks[i].kind)
+    }
+
+    /// `breakpoint_marks` is sorted ascending by `line` with at most one
+    /// entry per line -- same precondition/search as `git_gutter_mark_at`.
+    fn breakpoint_mark_at(&self, line: usize) -> Option<bool> {
+        self.breakpoint_marks
+            .binary_search_by_key(&line, |m| m.line)
+            .ok()
+            .map(|i| self.breakpoint_marks[i].verified)
     }
 
     /// A colored strip in the gutter's *leading* padding (`gutter_left` ..
@@ -1366,6 +1421,12 @@ impl Frame<'_> {
                         self.blame_clicked_line = Some(line);
                         return;
                     }
+                    if let Some(line) =
+                        self.breakpoint_click_target(pointer, origin, viewport, visual)
+                    {
+                        self.breakpoint_clicked_line = Some(line);
+                        return;
+                    }
                 }
                 let offset = self.offset_at(ui, pointer, origin, visual);
                 if command && response.clicked() {
@@ -1602,6 +1663,35 @@ impl Frame<'_> {
         let line = visual.buffer_line(row);
         self.blame_annotation_at(line).map(|_| line)
     }
+
+    /// The buffer line a click landed on, if `pointer` is over the
+    /// line-number digits -- to the right of the fold-arrow/code-action
+    /// marker lane, up to the gutter's right border (`docs/features/
+    /// debugger.md` §2.3). Unlike the other gutter click targets, this one
+    /// matches on *any* line, not just one that already has a mark: a
+    /// click here always toggles a breakpoint, the same way the reference
+    /// IDE's own line-number gutter always accepts a click.
+    fn breakpoint_click_target(
+        &self,
+        pointer: egui::Pos2,
+        origin: egui::Pos2,
+        viewport: egui::Rect,
+        visual: &VisualLines,
+    ) -> Option<usize> {
+        let gutter_left = origin.x + viewport.min.x;
+        let marker_left = gutter_left + self.metrics.blame_lane_width + self.tokens.space.sm;
+        let digits_left = marker_left + geometry::MARKER_LANE_CHARS * self.metrics.char_width;
+        let gutter_right = gutter_left + self.metrics.gutter_width;
+        if pointer.x < digits_left || pointer.x > gutter_right {
+            return None;
+        }
+        let row = geometry::line_at_y(
+            pointer.y - origin.y,
+            self.metrics.row_height,
+            visual.row_count(),
+        );
+        Some(visual.buffer_line(row))
+    }
 }
 
 /// Wall-clock "now" for `blame_gutter::relative_time`'s labels -- read once
@@ -1656,6 +1746,8 @@ mod tests {
         blame_on: bool,
         blame_annotations: Vec<BlameAnnotation>,
         blame_clicked_line: Option<usize>,
+        breakpoint_marks: Vec<BreakpointMark>,
+        breakpoint_clicked_line: Option<usize>,
     }
 
     const EDITOR_ID: &str = "test-editor";
@@ -1685,6 +1777,7 @@ mod tests {
         ));
         let marks = state.git_gutter_marks.clone();
         let annotations = state.blame_annotations.clone();
+        let breakpoints = state.breakpoint_marks.clone();
         let output = CodeEditor::new(
             editor_id(),
             &mut state.buffer,
@@ -1694,9 +1787,11 @@ mod tests {
         )
         .git_gutter_marks(&marks)
         .blame_annotations(state.blame_on, &annotations)
+        .breakpoints(&breakpoints)
         .show(ui);
         state.git_gutter_clicked_line = output.git_gutter_clicked_line;
         state.blame_clicked_line = output.blame_clicked_line;
+        state.breakpoint_clicked_line = output.breakpoint_clicked_line;
     }
 
     fn harness(text: &str) -> Harness<'static, Fixture> {
@@ -1740,6 +1835,8 @@ mod tests {
                     blame_on: false,
                     blame_annotations: Vec::new(),
                     blame_clicked_line: None,
+                    breakpoint_marks: Vec::new(),
+                    breakpoint_clicked_line: None,
                 },
             )
     }
@@ -1783,6 +1880,17 @@ mod tests {
         let origin = harness.state().origin;
         egui::pos2(
             origin.x + metrics.blame_lane_width * 0.5,
+            origin.y + (line as f32 + 0.5) * metrics.row_height,
+        )
+    }
+
+    /// A point over the line-number digits (`docs/features/debugger.md`
+    /// §2.3's breakpoint click target) on `line`, in screen space.
+    fn digits_pos(harness: &Harness<'static, Fixture>, line: usize) -> egui::Pos2 {
+        let metrics = harness.state().metrics.expect("a frame has run");
+        let origin = harness.state().origin;
+        egui::pos2(
+            origin.x + metrics.gutter_width - metrics.char_width * 0.5,
             origin.y + (line as f32 + 0.5) * metrics.row_height,
         )
     }
@@ -1958,6 +2066,36 @@ mod tests {
         click(&mut harness, pos);
 
         assert!(harness.state().blame_clicked_line.is_none());
+    }
+
+    #[test]
+    fn clicking_the_line_number_digits_reports_the_line_and_does_not_move_the_caret() {
+        let mut harness = harness_with_marks("one\ntwo\nthree\n", false, Vec::new());
+        harness.step();
+        harness.step();
+        let before = selection(&harness).head;
+
+        let pos = digits_pos(&harness, 1);
+        click(&mut harness, pos);
+
+        assert_eq!(harness.state().breakpoint_clicked_line, Some(1));
+        assert_eq!(
+            selection(&harness).head,
+            before,
+            "a line-number-digits click must not move the caret, even with no breakpoint there yet"
+        );
+    }
+
+    #[test]
+    fn clicking_the_fold_code_action_lane_does_not_report_a_breakpoint_click() {
+        let mut harness = harness_with_marks("one\ntwo\nthree\n", false, Vec::new());
+        harness.step();
+        harness.step();
+
+        let pos = gutter_leading_pos(&harness, 1);
+        click(&mut harness, pos);
+
+        assert!(harness.state().breakpoint_clicked_line.is_none());
     }
 
     #[test]

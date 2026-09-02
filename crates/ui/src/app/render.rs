@@ -1003,6 +1003,7 @@ impl IdeApp {
             let git_gutter_marks = self.git_gutter.clone();
             let blame_on = self.tabs[idx].blame.is_some();
             let blame_annotations = self.tabs[idx].blame.clone().unwrap_or_default();
+            let breakpoint_marks = self.breakpoint_marks_for_active_tab();
             let tab = &mut self.tabs[idx];
             let output = CodeEditor::new(
                 egui::Id::new(("code_editor", idx)),
@@ -1021,10 +1022,12 @@ impl IdeApp {
             .code_action_line(code_action_line)
             .git_gutter_marks(&git_gutter_marks)
             .blame_annotations(blame_on, &blame_annotations)
+            .breakpoints(&breakpoint_marks)
             .show(ui);
             self.tabs[idx].diagnostics = diagnostics;
             self.handle_git_gutter_click(&output);
             self.handle_blame_click(idx, &output);
+            self.handle_breakpoint_click(idx, &output);
 
             self.active_cursor_offset = Some(output.cursor_offset);
             if output.changed {
@@ -2831,6 +2834,60 @@ impl IdeApp {
         }
     }
 
+    /// The "Debug" popup (`docs/features/debugger.md` §2.3): a read-only
+    /// line showing the resolved adapter command for the active file's
+    /// language, and a multi-line raw-JSON launch-arguments field
+    /// (default `"{}"`) -- deliberately unpolished, a stand-in for F1's
+    /// eventual run-configuration model, per the doc's own rationale.
+    fn render_debug_launch_popup(&mut self, ctx: &egui::Context) {
+        if !self.debug.show_launch_popup {
+            return;
+        }
+        let danger = self.theme.tokens().color.danger;
+        let command_line = self
+            .active_tab
+            .and_then(|idx| self.tabs[idx].buffer.path())
+            .and_then(|path| ide_core::language_for_path(&self.active_languages, path))
+            .and_then(|c| c.debug_adapter())
+            .map(|(command, args)| command_line(command, args));
+
+        let mut open = true;
+        let mut launch = false;
+        egui::Window::new("Debug")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(
+                    command_line
+                        .as_deref()
+                        .unwrap_or("No debug adapter configured."),
+                );
+                ui.separator();
+                ui.label("Launch arguments (JSON):");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.debug.launch_args_draft)
+                        .desired_rows(6)
+                        .code_editor(),
+                );
+                if let Some(err) = &self.debug.error {
+                    ui.colored_label(danger, err);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Launch").clicked() {
+                        launch = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.debug.show_launch_popup = false;
+                    }
+                });
+            });
+        if launch {
+            self.confirm_debug_launch();
+        } else if !open {
+            self.debug.show_launch_popup = false;
+        }
+    }
+
     /// Search panel (`search-in-path-v2.md` §2.2/§3): a query field (Enter
     /// submits) with case/whole-word/regex checkboxes (same `"Aa"`/`"Word"`/
     /// `".*"` convention `render_find_bar` already uses), Include/Exclude
@@ -2950,6 +3007,125 @@ impl IdeApp {
         }
     }
 
+    /// "Debug" tool window (`docs/features/debugger.md` §2.3): an
+    /// execution-control toolbar mirroring the six commands, threads list
+    /// (left) / stack frames for the selected thread (right -- clicking a
+    /// frame with `source: Some(..)` jumps via `open_stack_frame`; one with
+    /// `source: None` is shown but not clickable), and the output log
+    /// (newest at bottom).
+    fn render_debug_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.is_command_enabled(CommandAction::ResumeProgram),
+                    egui::Button::new("Resume"),
+                )
+                .clicked()
+            {
+                self.debug.resume();
+            }
+            if ui
+                .add_enabled(
+                    self.is_command_enabled(CommandAction::StepOver),
+                    egui::Button::new("Step Over"),
+                )
+                .clicked()
+            {
+                self.debug.step_over();
+            }
+            if ui
+                .add_enabled(
+                    self.is_command_enabled(CommandAction::StepInto),
+                    egui::Button::new("Step Into"),
+                )
+                .clicked()
+            {
+                self.debug.step_into();
+            }
+            if ui
+                .add_enabled(
+                    self.is_command_enabled(CommandAction::StepOut),
+                    egui::Button::new("Step Out"),
+                )
+                .clicked()
+            {
+                self.debug.step_out();
+            }
+            if ui
+                .add_enabled(
+                    self.is_command_enabled(CommandAction::PauseProgram),
+                    egui::Button::new("Pause"),
+                )
+                .clicked()
+            {
+                self.debug.pause();
+            }
+            if ui
+                .add_enabled(
+                    self.is_command_enabled(CommandAction::StopDebugging),
+                    egui::Button::new("Stop"),
+                )
+                .clicked()
+            {
+                self.debug.stop();
+            }
+        });
+        if let Some(err) = &self.debug.error {
+            ui.colored_label(self.theme.tokens().color.danger, err);
+        }
+        ui.separator();
+
+        let mut selected_thread = None;
+        let mut clicked_frame = None;
+        ui.columns(2, |cols| {
+            egui::ScrollArea::vertical()
+                .id_salt("debug_threads_scroll")
+                .show(&mut cols[0], |ui| {
+                    for thread in &self.debug.threads {
+                        if ui
+                            .selectable_label(
+                                self.debug.selected_thread == Some(thread.id),
+                                &thread.name,
+                            )
+                            .clicked()
+                        {
+                            selected_thread = Some(thread.id);
+                        }
+                    }
+                });
+            egui::ScrollArea::vertical()
+                .id_salt("debug_stack_scroll")
+                .show(&mut cols[1], |ui| {
+                    for frame in &self.debug.stack {
+                        let label = format!("{} ({}:{})", frame.name, frame.line, frame.column);
+                        if let Some(source) = &frame.source {
+                            if ui.selectable_label(false, label).clicked() {
+                                clicked_frame = Some((source.clone(), frame.line, frame.column));
+                            }
+                        } else {
+                            ui.label(label);
+                        }
+                    }
+                });
+        });
+        if let Some(id) = selected_thread {
+            self.debug.select_thread(id);
+        }
+        if let Some((path, line, column)) = clicked_frame {
+            self.open_stack_frame(&path, line, column);
+        }
+
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("debug_output_scroll")
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for (_, text) in &self.debug.output {
+                    ui.label(text);
+                }
+            });
+    }
+
     /// "Languages…" settings window (doc §3): a fixed, non-interactive row
     /// for the built-in Rust config, each `custom_languages` entry with a
     /// "Remove" button, a three-field add-form, and any
@@ -2997,6 +3173,17 @@ impl IdeApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_language_args)
                             .hint_text("Arguments")
+                            .desired_width(160.0),
+                    )
+                    .on_hover_text("Not for secrets — visible to other local processes (ps).");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_language_debug_adapter_command)
+                            .hint_text("Debug adapter (optional)")
+                            .desired_width(160.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_language_debug_adapter_args)
+                            .hint_text("Debug adapter args")
                             .desired_width(160.0),
                     )
                     .on_hover_text("Not for secrets — visible to other local processes (ps).");
@@ -4165,6 +4352,16 @@ impl IdeApp {
                     {
                         self.bottom_view = BottomView::Search;
                     }
+                    if Self::render_boxed_tab(
+                        ui,
+                        tokens,
+                        self.bottom_view == BottomView::Debug,
+                        "Debug",
+                    )
+                    .clicked()
+                    {
+                        self.bottom_view = BottomView::Debug;
+                    }
                 });
                 ui.separator();
                 match self.bottom_view {
@@ -4172,6 +4369,7 @@ impl IdeApp {
                     BottomView::CargoOutput => self.render_cargo_output(ui),
                     BottomView::Usages => self.render_usages_panel(ui),
                     BottomView::Search => self.render_search_panel(ui),
+                    BottomView::Debug => self.render_debug_panel(ui),
                 }
             });
     }
@@ -4284,6 +4482,9 @@ impl eframe::App for IdeApp {
         self.handle_shortcuts(&ctx);
 
         if self.lsp.poll() {
+            ctx.request_repaint();
+        }
+        if self.debug.poll() {
             ctx.request_repaint();
         }
         if self.poll_menu_events(&ctx) {
@@ -4400,6 +4601,7 @@ impl eframe::App for IdeApp {
         self.render_recent_files_popup(&ctx);
         self.render_recent_locations_popup(&ctx);
         self.render_go_to_line_dialog(&ctx);
+        self.render_debug_launch_popup(&ctx);
         self.render_confirm_modal(&ctx);
         self.render_startup_restore_prompt(&ctx);
     }

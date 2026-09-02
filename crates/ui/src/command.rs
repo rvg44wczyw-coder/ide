@@ -225,6 +225,14 @@ pub enum CommandAction {
     ToggleBlameAnnotations,
     GitWorktrees,
     ShowFileHistory,
+    Debug,
+    ResumeProgram,
+    StepOver,
+    StepInto,
+    StepOut,
+    ToggleLineBreakpoint,
+    StopDebugging,
+    PauseProgram,
 }
 
 #[derive(Debug)]
@@ -847,6 +855,79 @@ pub fn commands() -> &'static [Command] {
                 // (`docs/features/code-generation.md` §2.2).
                 binding: None,
                 action: CommandAction::OptimizeImports,
+            },
+            Command {
+                id: "Debug",
+                title: "Debug",
+                category: "Run",
+                // Genuinely diverges (`docs/features/debugger.md` §2.3):
+                // literal Ctrl (not Cmd-substituted) on mac, an entirely
+                // different key+modifier set elsewhere -- not a
+                // mechanical substitution, so spelled out explicitly like
+                // `QuickDocumentation` above.
+                binding: Some(Binding {
+                    mac: KeyChord::new(Key::D).ctrl().alt(),
+                    other: KeyChord::new(Key::F9).alt().shift(),
+                }),
+                action: CommandAction::Debug,
+            },
+            Command {
+                id: "ResumeProgram",
+                title: "Resume Program",
+                category: "Run",
+                // Also a genuine divergence, not a substitution: a
+                // different key on each platform (`docs/features/
+                // debugger.md` §2.3).
+                binding: Some(Binding {
+                    mac: KeyChord::new(Key::R).command().alt(),
+                    other: KeyChord::new(Key::F9),
+                }),
+                action: CommandAction::ResumeProgram,
+            },
+            Command {
+                id: "StepOver",
+                title: "Step Over",
+                category: "Run",
+                binding: Some(Binding::same(KeyChord::new(Key::F8))),
+                action: CommandAction::StepOver,
+            },
+            Command {
+                id: "StepInto",
+                title: "Step Into",
+                category: "Run",
+                binding: Some(Binding::same(KeyChord::new(Key::F7))),
+                action: CommandAction::StepInto,
+            },
+            Command {
+                id: "StepOut",
+                title: "Step Out",
+                category: "Run",
+                binding: Some(Binding::same(KeyChord::new(Key::F8).shift())),
+                action: CommandAction::StepOut,
+            },
+            Command {
+                id: "ToggleLineBreakpoint",
+                title: "Toggle Line Breakpoint",
+                category: "Run",
+                binding: Some(Binding::same(KeyChord::new(Key::F8).command())),
+                action: CommandAction::ToggleLineBreakpoint,
+            },
+            Command {
+                id: "StopDebugging",
+                title: "Stop",
+                category: "Run",
+                binding: Some(Binding::same(KeyChord::new(Key::F2).command())),
+                action: CommandAction::StopDebugging,
+            },
+            Command {
+                id: "PauseProgram",
+                title: "Pause Program",
+                category: "Run",
+                // No default binding in either reference keymap
+                // (`docs/features/debugger.md` §2.3's table) -- palette
+                // only, per CLAUDE.md's "never invent a binding" rule.
+                binding: None,
+                action: CommandAction::PauseProgram,
             },
         ]
     })
