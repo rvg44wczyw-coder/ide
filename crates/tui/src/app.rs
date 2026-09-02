@@ -15,8 +15,8 @@ use crossterm::event::{
 use ide_core::{
     all_occurrences, detect_language, editorconfig, fuzzy_score, newline_indent, next_occurrence,
     splits_a_pair, syntax_for_path, word_at, Buffer, BufferError, Change, Charset, DirEntry,
-    EditorConfig, FileWatcher, IndentUnit, LineDirection, Project, ProjectError, ReplaceResult,
-    Selection, Selections, SyntaxRules, TextBuffer, Transaction, WatchEvent,
+    EditorConfig, FileWatcher, IndentUnit, LanguageConfig, LineDirection, Project, ProjectError,
+    ReplaceResult, Selection, Selections, SyntaxRules, TextBuffer, Transaction, WatchEvent,
 };
 use ide_lsp::{Diagnostic, Location, LspRequest, Position, Symbol};
 
@@ -24,6 +24,8 @@ use crate::cargo_panel::{CargoCommand, CargoPanel};
 use crate::claude_panel::ClaudePanel;
 use crate::claude_terminal::{self, ClaudeTerminalPanel};
 use crate::commands::{commands, Action, Command};
+use crate::debug_config::{self, DebugAdapterConfig, DebugAdapterEntry};
+use crate::debug_panel::DebugPanel;
 use crate::docker_panel::{DockerLifecycleAction, DockerPanel, DockerTab};
 use crate::editor::{
     closer_for, cursor_line_column, is_quoted_or_commented, line_end_offset, line_start_offset,
@@ -345,6 +347,66 @@ pub(crate) struct NewScratchFileState {
     pub(crate) name: String,
 }
 
+/// Which of `DebugAdapterConfigPopupState`'s two text fields `Tab`/
+/// `Shift+Tab` currently targets (`docs/features/tui-debugger.md` §2.2) --
+/// this crate's only existing text-entry popups are single-field, so this
+/// is the first two-field text popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DebugConfigField {
+    Command,
+    Args,
+}
+
+/// The "Configure Debug Adapter" popup's state (`docs/features/
+/// tui-debugger.md` §2.5) -- presence is visibility.
+pub(crate) struct DebugAdapterConfigPopupState {
+    pub(crate) command: String,
+    pub(crate) args: String,
+    pub(crate) field: DebugConfigField,
+}
+
+/// Which section of the Debug tool window (`docs/features/
+/// tui-debugger.md` §2.6) currently has keyboard focus -- `Tab`/
+/// `Shift+Tab` cycles, mirroring `GitPanelFocus`'s own cycle convention.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DebugPanelFocus {
+    #[default]
+    Threads,
+    Stack,
+    Output,
+}
+
+impl DebugPanelFocus {
+    fn next(self) -> Self {
+        match self {
+            DebugPanelFocus::Threads => DebugPanelFocus::Stack,
+            DebugPanelFocus::Stack => DebugPanelFocus::Output,
+            DebugPanelFocus::Output => DebugPanelFocus::Threads,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            DebugPanelFocus::Threads => DebugPanelFocus::Output,
+            DebugPanelFocus::Stack => DebugPanelFocus::Threads,
+            DebugPanelFocus::Output => DebugPanelFocus::Stack,
+        }
+    }
+}
+
+/// The Debug tool window's transient browsing cursor (`docs/features/
+/// tui-debugger.md` §2.6) -- `self.debug`'s own fields (session, threads,
+/// stack, output) persist across close/reopen; only this cursor resets on
+/// every open, the same "transient overlay cursor" role `GitPanelState`
+/// already plays relative to `App::git`.
+#[derive(Debug, Default)]
+pub(crate) struct DebugPanelState {
+    pub(crate) focus: DebugPanelFocus,
+    pub(crate) thread_selected: usize,
+    pub(crate) stack_selected: usize,
+    pub(crate) output_scroll: u16,
+}
+
 /// The Scratch Files browse-list popup's state -- presence is visibility,
 /// same shape `RecentFilesState` already establishes.
 pub(crate) struct ScratchFilesState {
@@ -446,6 +508,22 @@ pub struct App {
     /// §2.4 -- a deliberate scope cut, not an oversight).
     pub(crate) docker_panel: Option<DockerPanel>,
     pub(crate) k8s_panel: Option<K8sPanel>,
+    /// The one detected project language, retained instead of being a
+    /// `let` local `App::new` discards after starting the LSP server
+    /// (`docs/features/tui-debugger.md` §2.2) -- `None` for an
+    /// unrecognized project, same as `detect_language`'s own return type.
+    pub(crate) language: Option<LanguageConfig>,
+    /// Loaded once at startup (`debug_config::load`); mutated only by
+    /// `ConfigureDebugAdapter`'s popup.
+    pub(crate) debug_adapters: DebugAdapterConfig,
+    pub(crate) debug: DebugPanel,
+    /// Debug tool window visibility -- same bare-bool convention as
+    /// `cargo_panel_open`/`claude_panel_open`. `self.debug`'s own fields
+    /// persist across a close/reopen; only this flag changes.
+    pub(crate) debug_panel_open: bool,
+    /// "Configure Debug Adapter" popup state -- presence is visibility.
+    pub(crate) debug_adapter_config_popup: Option<DebugAdapterConfigPopupState>,
+    pub(crate) debug_panel: DebugPanelState,
     status: Option<String>,
     editor_viewport_rows: u16,
 }
@@ -473,13 +551,24 @@ impl App {
             }
         };
         let mut lsp = LspBridge::default();
+        let debug_adapters = debug_config::load();
         // No language-settings UI in `ide-tui` yet, so only the one
         // built-in language (Rust, via `Cargo.toml` detection) is ever
         // recognized -- `custom` is always empty (`docs/features/
         // tui-goto-and-usages.md` §4).
-        if let Some(lang) = detect_language(&tree, &[]) {
+        let language = detect_language(&tree, &[]).map(|mut lang| {
             lsp.start_with_command(project.root(), &lang.command, &lang.args);
-        }
+            // Enriches the retained `LanguageConfig` with any persisted
+            // debug-adapter override for this language's name, so
+            // `language.debug_adapter()` "just works" exactly like
+            // `ide-ui`'s persisted `custom_languages` does -- zero new
+            // `ide-core` API (`docs/features/tui-debugger.md` §2.2).
+            if let Some(entry) = debug_adapters.adapters.get(&lang.name) {
+                lang.debug_adapter_command = Some(entry.command.clone());
+                lang.debug_adapter_args = entry.args.clone();
+            }
+            lang
+        });
         Ok(Self {
             project_root: project.root().to_path_buf(),
             tree,
@@ -532,6 +621,12 @@ impl App {
             last_git_diff_target: None,
             docker_panel: None,
             k8s_panel: None,
+            language,
+            debug_adapters,
+            debug: DebugPanel::default(),
+            debug_panel_open: false,
+            debug_adapter_config_popup: None,
+            debug_panel: DebugPanelState::default(),
             status: None,
             // Real value arrives from `main.rs`'s next `set_editor_viewport_
             // rows` call, once the terminal size is known -- `u16::MAX`
@@ -640,6 +735,351 @@ impl App {
     pub fn poll_claude(&mut self) {
         self.claude.poll();
         self.claude_terminals.poll();
+    }
+
+    /// Called once per frame (`lib.rs`'s main loop), unconditionally --
+    /// same "keeps streaming into state while the panel is closed" shape
+    /// `poll_claude`/`poll_cargo` already use (`docs/features/
+    /// tui-debugger.md` §2.3).
+    pub fn poll_debug(&mut self) {
+        self.debug.poll();
+    }
+
+    /// `Debug` command (`docs/features/tui-debugger.md` §3): opens the
+    /// launch popup. Silent no-op if a session is already active or the
+    /// detected project language has no configured debug adapter -- the
+    /// same "no active file has a configured language" no-op `ide-ui`'s
+    /// own `trigger_debug` uses; this crate has no separate
+    /// command-enablement registry to gate on instead.
+    fn trigger_debug(&mut self) {
+        if self.debug.is_active() {
+            return;
+        }
+        if self
+            .language
+            .as_ref()
+            .and_then(|c| c.debug_adapter())
+            .is_none()
+        {
+            return;
+        }
+        if self.debug.launch_args_draft.trim().is_empty() {
+            self.debug.launch_args_draft = "{}".to_string();
+        }
+        self.debug.error = None;
+        self.close_all_overlays();
+        self.debug.show_launch_popup = true;
+    }
+
+    /// The launch popup's "Launch" entry point: parses `launch_args_draft`
+    /// as raw JSON, rejecting (via `debug.error`, popup stays open) rather
+    /// than sending anything on invalid JSON (`docs/features/
+    /// tui-debugger.md` §2.5). No-op with no configured adapter -- already
+    /// checked by `trigger_debug` before the popup could open, this is
+    /// just the same defensive re-check `confirm_debug_adapter_config`'s
+    /// empty-command check mirrors.
+    fn confirm_debug_launch(&mut self) {
+        let Some((command, args)) = self
+            .language
+            .as_ref()
+            .and_then(|c| c.debug_adapter())
+            .map(|(command, args)| (command.to_string(), args.to_vec()))
+        else {
+            return;
+        };
+        let arguments =
+            match serde_json::from_str::<serde_json::Value>(&self.debug.launch_args_draft) {
+                Ok(value) => value,
+                Err(e) => {
+                    self.debug.error = Some(format!("Invalid JSON: {e}"));
+                    return;
+                }
+            };
+        self.debug.show_launch_popup = false;
+        let root = self.project_root.clone();
+        self.debug.start_session(&command, &args, root, arguments);
+    }
+
+    fn handle_debug_launch_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.debug.show_launch_popup = false,
+            KeyCode::Backspace => {
+                self.debug.launch_args_draft.pop();
+            }
+            KeyCode::Enter => self.confirm_debug_launch(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.debug.launch_args_draft.push(c);
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// `ToggleLineBreakpoint` (`docs/features/tui-debugger.md` §2.7):
+    /// toggles a breakpoint on the active editor's current caret line.
+    /// There is no gutter click to also wire this to (§2.4) -- the
+    /// keyboard command is `ide-tui`'s only way to toggle a breakpoint.
+    fn toggle_breakpoint_at_caret(&mut self) {
+        let Some(buf) = self.active_buffer() else {
+            return;
+        };
+        let path = buf.path.clone();
+        let line = cursor_line_column(
+            buf.buffer.text_buffer(),
+            buf.buffer.text_buffer().selections().primary().head,
+        )
+        .0;
+        self.debug.toggle_breakpoint(path, line as u32 + 1);
+    }
+
+    /// `ToggleDebugPanel` command: opens/closes the Debug tool window.
+    /// Never resets `self.debug`'s own session/breakpoints/stack -- same
+    /// "closing never resets state" convention `toggle_cargo_panel`/
+    /// `toggle_git_panel` already establish. The browsing cursor
+    /// (`debug_panel`) does reset on every open, since it has no meaning
+    /// to preserve across a close.
+    fn toggle_debug_panel(&mut self) {
+        let opening = !self.debug_panel_open;
+        self.close_all_overlays();
+        self.debug_panel_open = opening;
+        if opening {
+            self.debug_panel = DebugPanelState::default();
+        }
+    }
+
+    fn handle_debug_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.debug_panel_open = false,
+            KeyCode::Tab => self.debug_panel.focus = self.debug_panel.focus.next(),
+            KeyCode::BackTab => self.debug_panel.focus = self.debug_panel.focus.previous(),
+            KeyCode::Char('c') => self.debug.resume(),
+            KeyCode::Char('o') => self.debug.step_over(),
+            KeyCode::Char('i') => self.debug.step_into(),
+            KeyCode::Char('u') => self.debug.step_out(),
+            KeyCode::Char('p') => self.debug.pause(),
+            KeyCode::Char('x') => self.debug.stop(),
+            KeyCode::Up => match self.debug_panel.focus {
+                DebugPanelFocus::Threads => {
+                    self.debug_panel.thread_selected =
+                        self.debug_panel.thread_selected.saturating_sub(1);
+                }
+                DebugPanelFocus::Stack => {
+                    self.debug_panel.stack_selected =
+                        self.debug_panel.stack_selected.saturating_sub(1);
+                }
+                // `output_scroll` counts lines held back from the tail
+                // (0 = following the latest output) -- `Up` reveals older
+                // lines, so it *increases* the hold-back amount.
+                DebugPanelFocus::Output => {
+                    self.debug_panel.output_scroll =
+                        self.debug_panel.output_scroll.saturating_add(1);
+                }
+            },
+            KeyCode::Down => match self.debug_panel.focus {
+                DebugPanelFocus::Threads => {
+                    if self.debug_panel.thread_selected + 1 < self.debug.threads.len() {
+                        self.debug_panel.thread_selected += 1;
+                    }
+                }
+                DebugPanelFocus::Stack => {
+                    if self.debug_panel.stack_selected + 1 < self.debug.stack.len() {
+                        self.debug_panel.stack_selected += 1;
+                    }
+                }
+                // `Down` moves back toward the latest output, the
+                // inverse of `Up` immediately above.
+                DebugPanelFocus::Output => {
+                    self.debug_panel.output_scroll =
+                        self.debug_panel.output_scroll.saturating_sub(1);
+                }
+            },
+            // Only meaningful for the Output section (`docs/features/
+            // tui-debugger.md` §2.6) -- gated on focus so paging doesn't
+            // silently scroll a pane that isn't even highlighted while
+            // Threads/Stack has focus.
+            KeyCode::PageUp if self.debug_panel.focus == DebugPanelFocus::Output => {
+                self.debug_panel.output_scroll = self.debug_panel.output_scroll.saturating_add(10);
+            }
+            KeyCode::PageDown if self.debug_panel.focus == DebugPanelFocus::Output => {
+                self.debug_panel.output_scroll = self.debug_panel.output_scroll.saturating_sub(10);
+            }
+            KeyCode::Enter => self.confirm_debug_panel_selection(),
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// `Enter` inside the Debug tool window: `Threads` commits the
+    /// highlighted row as the active thread (`DebugPanel::select_thread`);
+    /// `Stack` navigates to the highlighted frame's source, if it has one
+    /// (a frame with `source: None` is shown but `Enter` no-ops on it,
+    /// `docs/features/tui-debugger.md` §2.6); `Output` has nothing to
+    /// confirm.
+    fn confirm_debug_panel_selection(&mut self) {
+        match self.debug_panel.focus {
+            DebugPanelFocus::Threads => {
+                if let Some(thread) = self.debug.threads.get(self.debug_panel.thread_selected) {
+                    self.debug.select_thread(thread.id);
+                }
+            }
+            DebugPanelFocus::Stack => {
+                if let Some(frame) = self
+                    .debug
+                    .stack
+                    .get(self.debug_panel.stack_selected)
+                    .cloned()
+                {
+                    if let Some(path) = frame.source {
+                        self.open_stack_frame(path, frame.line, frame.column);
+                    }
+                }
+            }
+            DebugPanelFocus::Output => {}
+        }
+    }
+
+    /// Opens `path` (a `StackFrame::source` -- already canonicalized and
+    /// checked against `project_root` by `ide-dap`, `debugger.md` §3.6)
+    /// and best-effort places the cursor at `line`/`column`. DAP reports
+    /// both 1-based, unlike `ide_lsp::Position`'s 0-based convention
+    /// `open_location` assumes -- same conversion `ide-ui`'s
+    /// `open_stack_frame` already does.
+    fn open_stack_frame(&mut self, path: PathBuf, line: u32, column: u32) {
+        let position = Position {
+            line: line.saturating_sub(1),
+            character: column.saturating_sub(1),
+        };
+        self.open_location(Location {
+            path,
+            range: ide_lsp::Range {
+                start: position,
+                end: position,
+            },
+        });
+    }
+
+    /// `ConfigureDebugAdapter` command (`docs/features/tui-debugger.md`
+    /// §2.5): opens the two-field popup, pre-filled from `self.language`'s
+    /// current debug-adapter fields (or empty if `self.language` is
+    /// `None` or has no adapter configured yet).
+    fn toggle_debug_adapter_config_popup(&mut self) {
+        let opening = self.debug_adapter_config_popup.is_none();
+        let (command, args) = self
+            .language
+            .as_ref()
+            .map(|lang| {
+                (
+                    lang.debug_adapter_command.clone().unwrap_or_default(),
+                    lang.debug_adapter_args.join(" "),
+                )
+            })
+            .unwrap_or_default();
+        self.close_all_overlays();
+        if opening {
+            self.debug_adapter_config_popup = Some(DebugAdapterConfigPopupState {
+                command,
+                args,
+                field: DebugConfigField::Command,
+            });
+        }
+    }
+
+    fn handle_debug_adapter_config_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.debug_adapter_config_popup.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => self.debug_adapter_config_popup = None,
+            KeyCode::Tab | KeyCode::BackTab => {
+                state.field = match state.field {
+                    DebugConfigField::Command => DebugConfigField::Args,
+                    DebugConfigField::Args => DebugConfigField::Command,
+                };
+            }
+            KeyCode::Backspace => match state.field {
+                DebugConfigField::Command => {
+                    state.command.pop();
+                }
+                DebugConfigField::Args => {
+                    state.args.pop();
+                }
+            },
+            KeyCode::Enter => self.confirm_debug_adapter_config(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match state.field {
+                    DebugConfigField::Command => state.command.push(c),
+                    DebugConfigField::Args => state.args.push(c),
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Validates and saves the "Configure Debug Adapter" popup
+    /// (`docs/features/tui-debugger.md` §2.5): trims `command`, rejecting
+    /// (via `notify`, popup stays open) if empty; splits `args` on
+    /// whitespace. On success, updates `self.language`'s debug-adapter
+    /// fields in place, persists the override keyed by language name, and
+    /// closes the popup.
+    fn confirm_debug_adapter_config(&mut self) {
+        let Some(state) = self.debug_adapter_config_popup.as_ref() else {
+            return;
+        };
+        let command = state.command.trim().to_string();
+        if command.is_empty() {
+            self.notify("Debug adapter command cannot be empty.");
+            return;
+        }
+        let Some(lang) = self.language.as_mut() else {
+            self.notify("No detected project language to configure a debug adapter for.");
+            return;
+        };
+        let args: Vec<String> = state.args.split_whitespace().map(str::to_string).collect();
+        lang.debug_adapter_command = Some(command.clone());
+        lang.debug_adapter_args = args.clone();
+        let name = lang.name.clone();
+        self.debug_adapters
+            .adapters
+            .insert(name, DebugAdapterEntry { command, args });
+        debug_config::save(&self.debug_adapters);
+        self.debug_adapter_config_popup = None;
+    }
+
+    /// Both slices `ui.rs`'s `render_editor` folds into `LineOverlays`
+    /// (`docs/features/tui-debugger.md` §2.4): one whole-line byte range
+    /// per breakpoint on `path`, split by the adapter's `verified` status
+    /// (defaulting to `true`, i.e. solid, when no confirmation has arrived
+    /// yet -- same resolved default `ide-ui`'s own
+    /// `breakpoint_marks_for_active_tab` uses).
+    pub(crate) fn breakpoint_line_ranges(
+        &self,
+        path: &Path,
+        text_buffer: &TextBuffer,
+    ) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+        let mut verified_ranges = Vec::new();
+        let mut unverified_ranges = Vec::new();
+        let Some(lines) = self.debug.breakpoints.get(path) else {
+            return (verified_ranges, unverified_ranges);
+        };
+        let confirmed = self.debug.confirmed_breakpoints.get(path);
+        let text = text_buffer.text();
+        for &dap_line in lines {
+            let line = (dap_line as usize).saturating_sub(1);
+            let Some(range) = text_buffer.lines().line_range(line, text) else {
+                continue;
+            };
+            let verified = confirmed
+                .and_then(|c| c.iter().find(|v| v.line == dap_line))
+                .map(|v| v.verified)
+                .unwrap_or(true);
+            if verified {
+                verified_ranges.push(range);
+            } else {
+                unverified_ranges.push(range);
+            }
+        }
+        (verified_ranges, unverified_ranges)
     }
 
     /// Called once per frame (`lib.rs`'s main loop), mirrors `set_editor_
@@ -940,6 +1380,9 @@ impl App {
         self.scratch_files = None;
         self.claude_panel_open = false;
         self.new_claude_terminal = None;
+        self.debug_panel_open = false;
+        self.debug_adapter_config_popup = None;
+        self.debug.show_launch_popup = false;
     }
 
     /// `ToggleClaudePanel` command (palette-only, no default binding --
@@ -2786,6 +3229,15 @@ impl App {
         if self.claude_panel_open {
             return self.handle_claude_panel_key(key);
         }
+        if self.debug.show_launch_popup {
+            return self.handle_debug_launch_key(key);
+        }
+        if self.debug_adapter_config_popup.is_some() {
+            return self.handle_debug_adapter_config_key(key);
+        }
+        if self.debug_panel_open {
+            return self.handle_debug_panel_key(key);
+        }
         if let Some(action) = self.keymap.action_for(key.modifiers, key.code) {
             return self.run_action(action);
         }
@@ -2825,6 +3277,9 @@ impl App {
             || self.new_scratch_file.is_some()
             || self.scratch_files.is_some()
             || self.claude_panel_open
+            || self.debug.show_launch_popup
+            || self.debug_adapter_config_popup.is_some()
+            || self.debug_panel_open
     }
 
     /// Entry point for every `Event::Mouse` (`docs/features/
@@ -3070,6 +3525,16 @@ impl App {
             Action::NewScratchFile => self.toggle_new_scratch_file(),
             Action::ToggleScratchFiles => self.toggle_scratch_files(),
             Action::ToggleClaudePanel => self.toggle_claude_panel(),
+            Action::Debug => self.trigger_debug(),
+            Action::ResumeProgram => self.debug.resume(),
+            Action::StepOver => self.debug.step_over(),
+            Action::StepInto => self.debug.step_into(),
+            Action::StepOut => self.debug.step_out(),
+            Action::ToggleLineBreakpoint => self.toggle_breakpoint_at_caret(),
+            Action::StopDebugging => self.debug.stop(),
+            Action::PauseProgram => self.debug.pause(),
+            Action::ToggleDebugPanel => self.toggle_debug_panel(),
+            Action::ConfigureDebugAdapter => self.toggle_debug_adapter_config_popup(),
             Action::Exit => return LoopSignal::Exit,
         }
         LoopSignal::Continue
@@ -12174,5 +12639,425 @@ mod tests {
             &ui::HitMap::default(),
         );
         assert_eq!(app.palette.as_ref().unwrap().selected, before + 1);
+    }
+
+    // -- tui-debugger (T27) --
+
+    /// A one-file Rust project *with* a `Cargo.toml`, so `detect_language`
+    /// actually matches and `self.language` is `Some(rust())` -- unlike
+    /// `open_rust_tab`/`sample_project`, which deliberately have no
+    /// `Cargo.toml` so `App::new` never starts a language server. Clears
+    /// any debug-adapter override `debug_config::load()` picked up from
+    /// the real `$HOME` (the same real-filesystem risk `keymap::save`'s
+    /// own tests already accept) so every test below starts from a known
+    /// "no adapter configured" state regardless of the machine it runs on.
+    fn rust_project_with_debug_adapter(command: Option<&str>) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        fs::write(dir.path().join("f.rs"), "fn main() {}\n").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_adapters = DebugAdapterConfig::default();
+        let lang = app
+            .language
+            .as_mut()
+            .expect("Cargo.toml should be detected as Rust");
+        lang.debug_adapter_command = command.map(str::to_string);
+        lang.debug_adapter_args = Vec::new();
+        (dir, app)
+    }
+
+    #[test]
+    fn trigger_debug_with_no_language_detected_is_a_no_op() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.language.is_none());
+
+        app.trigger_debug();
+
+        assert!(!app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn trigger_debug_with_no_debug_adapter_configured_is_a_no_op() {
+        let (_dir, mut app) = rust_project_with_debug_adapter(None);
+
+        app.trigger_debug();
+
+        assert!(!app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn trigger_debug_opens_the_launch_popup_when_enabled() {
+        let (_dir, mut app) = rust_project_with_debug_adapter(Some("codelldb"));
+
+        app.trigger_debug();
+
+        assert!(app.debug.show_launch_popup);
+        assert_eq!(app.debug.launch_args_draft, "{}");
+    }
+
+    #[test]
+    fn trigger_debug_is_a_no_op_while_a_session_is_already_active() {
+        let (dir, mut app) = rust_project_with_debug_adapter(Some("cat"));
+        app.debug
+            .start_session("cat", &[], dir.path(), serde_json::json!({}));
+        assert!(app.debug.is_active());
+
+        app.trigger_debug();
+
+        assert!(!app.debug.show_launch_popup);
+    }
+
+    #[test]
+    fn confirm_debug_launch_with_invalid_json_sets_error_and_keeps_popup_open() {
+        let (_dir, mut app) = rust_project_with_debug_adapter(Some("codelldb"));
+        app.trigger_debug();
+        app.debug.launch_args_draft = "{ not json".to_string();
+
+        app.confirm_debug_launch();
+
+        assert!(app.debug.show_launch_popup);
+        assert!(app.debug.error.is_some());
+        assert!(!app.debug.is_active());
+    }
+
+    #[test]
+    fn confirm_debug_launch_starts_a_session_on_valid_json() {
+        let (_dir, mut app) = rust_project_with_debug_adapter(Some("cat"));
+        app.trigger_debug();
+
+        app.confirm_debug_launch();
+
+        assert!(!app.debug.show_launch_popup);
+        assert!(app.debug.is_active());
+        app.debug.stop();
+    }
+
+    #[test]
+    fn handle_debug_launch_key_esc_closes_without_launching() {
+        let (_dir, mut app) = rust_project_with_debug_adapter(Some("codelldb"));
+        app.trigger_debug();
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.debug.show_launch_popup);
+        assert!(!app.debug.is_active());
+    }
+
+    #[test]
+    fn toggle_breakpoint_at_caret_toggles_on_the_current_line() {
+        let (_dir, mut app) = open_rust_tab("fn main() {\n    let x = 1;\n}\n");
+        set_caret(&mut app, "fn main() {\n    let ".len());
+        let path = app.active_buffer().unwrap().path.clone();
+
+        app.toggle_breakpoint_at_caret();
+        assert_eq!(app.debug.breakpoints.get(&path), Some(&vec![2]));
+
+        app.toggle_breakpoint_at_caret();
+        assert!(!app.debug.breakpoints.contains_key(&path));
+    }
+
+    #[test]
+    fn breakpoint_line_ranges_splits_verified_and_unverified() {
+        let (_dir, mut app) = open_rust_tab("fn main() {\n    let x = 1;\n}\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.debug.toggle_breakpoint(path.clone(), 1);
+        app.debug.toggle_breakpoint(path.clone(), 2);
+        app.debug.confirmed_breakpoints.insert(
+            path.clone(),
+            vec![ide_dap::VerifiedBreakpoint {
+                line: 2,
+                verified: false,
+                message: None,
+            }],
+        );
+        let text_buffer = app.active_buffer().unwrap().buffer.text_buffer();
+
+        let (verified, unverified) = app.breakpoint_line_ranges(&path, text_buffer);
+
+        assert_eq!(verified.len(), 1);
+        assert_eq!(unverified.len(), 1);
+    }
+
+    #[test]
+    fn breakpoint_line_ranges_is_empty_with_no_breakpoints() {
+        let (_dir, app) = open_rust_tab("fn main() {}\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        let text_buffer = app.active_buffer().unwrap().buffer.text_buffer();
+
+        let (verified, unverified) = app.breakpoint_line_ranges(&path, text_buffer);
+
+        assert!(verified.is_empty());
+        assert!(unverified.is_empty());
+    }
+
+    #[test]
+    fn toggle_debug_panel_opens_and_closes_and_resets_the_cursor() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel.thread_selected = 3;
+
+        app.run_action(Action::ToggleDebugPanel);
+        assert!(app.debug_panel_open);
+        assert_eq!(app.debug_panel.thread_selected, 0);
+
+        app.debug_panel.thread_selected = 5;
+        app.run_action(Action::ToggleDebugPanel);
+        assert!(!app.debug_panel_open);
+    }
+
+    #[test]
+    fn close_all_overlays_closes_every_debug_related_overlay() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug.show_launch_popup = true;
+        app.debug_adapter_config_popup = Some(DebugAdapterConfigPopupState {
+            command: String::new(),
+            args: String::new(),
+            field: DebugConfigField::Command,
+        });
+        app.debug_panel_open = true;
+
+        app.toggle_new_scratch_file(); // any overlay-opener triggers close_all_overlays
+
+        assert!(!app.debug.show_launch_popup);
+        assert!(app.debug_adapter_config_popup.is_none());
+        assert!(!app.debug_panel_open);
+    }
+
+    #[test]
+    fn handle_debug_panel_key_navigates_threads_and_selects_on_enter() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel_open = true;
+        app.debug.threads = vec![
+            ide_dap::ThreadInfo {
+                id: 1,
+                name: "main".to_string(),
+            },
+            ide_dap::ThreadInfo {
+                id: 2,
+                name: "worker".to_string(),
+            },
+        ];
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.debug_panel.thread_selected, 1);
+        app.handle_key(plain_key(KeyCode::Down)); // clamps at the end
+        assert_eq!(app.debug_panel.thread_selected, 1);
+
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.debug.selected_thread, Some(2));
+    }
+
+    #[test]
+    fn handle_debug_panel_key_tab_cycles_focus() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel_open = true;
+        assert_eq!(app.debug_panel.focus, DebugPanelFocus::Threads);
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.debug_panel.focus, DebugPanelFocus::Stack);
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.debug_panel.focus, DebugPanelFocus::Output);
+        app.handle_key(plain_key(KeyCode::BackTab));
+        assert_eq!(app.debug_panel.focus, DebugPanelFocus::Stack);
+    }
+
+    #[test]
+    fn handle_debug_panel_key_output_scroll_up_reveals_older_lines_down_returns_to_the_tail() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel_open = true;
+        app.debug_panel.focus = DebugPanelFocus::Output;
+
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.debug_panel.output_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.debug_panel.output_scroll, 11);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.debug_panel.output_scroll, 10);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.debug_panel.output_scroll, 0);
+    }
+
+    #[test]
+    fn handle_debug_panel_key_page_up_down_are_no_ops_outside_output_focus() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel_open = true;
+        assert_eq!(app.debug_panel.focus, DebugPanelFocus::Threads);
+
+        app.handle_key(plain_key(KeyCode::PageUp));
+        app.handle_key(plain_key(KeyCode::PageDown));
+
+        assert_eq!(app.debug_panel.output_scroll, 0);
+    }
+
+    #[test]
+    fn handle_debug_panel_key_single_letter_shortcuts_control_the_session() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel_open = true;
+        app.debug
+            .start_session("cat", &[], dir.path(), serde_json::json!({}));
+        assert!(app.debug.is_active());
+
+        app.handle_key(plain_key(KeyCode::Char('x'))); // stop
+
+        assert!(!app.debug.is_active());
+    }
+
+    #[test]
+    fn handle_debug_panel_key_esc_closes_the_panel() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel_open = true;
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.debug_panel_open);
+    }
+
+    #[test]
+    fn toggle_debug_adapter_config_popup_pre_fills_from_the_current_language() {
+        let (_dir, mut app) = rust_project_with_debug_adapter(Some("codelldb"));
+        app.language.as_mut().unwrap().debug_adapter_args =
+            vec!["--port".to_string(), "1234".to_string()];
+
+        app.toggle_debug_adapter_config_popup();
+
+        let state = app.debug_adapter_config_popup.as_ref().unwrap();
+        assert_eq!(state.command, "codelldb");
+        assert_eq!(state.args, "--port 1234");
+        assert_eq!(state.field, DebugConfigField::Command);
+    }
+
+    #[test]
+    fn toggle_debug_adapter_config_popup_is_empty_with_no_language() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.toggle_debug_adapter_config_popup();
+
+        let state = app.debug_adapter_config_popup.as_ref().unwrap();
+        assert_eq!(state.command, "");
+        assert_eq!(state.args, "");
+    }
+
+    #[test]
+    fn confirm_debug_adapter_config_with_empty_command_notifies_and_keeps_popup_open() {
+        let (_dir, mut app) = rust_project_with_debug_adapter(None);
+        app.toggle_debug_adapter_config_popup();
+
+        app.confirm_debug_adapter_config();
+
+        assert!(app.debug_adapter_config_popup.is_some());
+        assert_eq!(app.notifications.len(), 1);
+    }
+
+    #[test]
+    fn confirm_debug_adapter_config_with_no_detected_language_notifies_and_keeps_popup_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_adapter_config_popup = Some(DebugAdapterConfigPopupState {
+            command: "codelldb".to_string(),
+            args: String::new(),
+            field: DebugConfigField::Command,
+        });
+
+        app.confirm_debug_adapter_config();
+
+        assert!(app.debug_adapter_config_popup.is_some());
+        assert_eq!(app.notifications.len(), 1);
+    }
+
+    #[test]
+    fn confirm_debug_adapter_config_saves_and_updates_the_language() {
+        let (dir, mut app) = rust_project_with_debug_adapter(None);
+        app.toggle_debug_adapter_config_popup();
+        {
+            let state = app.debug_adapter_config_popup.as_mut().unwrap();
+            state.command = "codelldb".to_string();
+            state.args = "--port 1234".to_string();
+        }
+
+        app.confirm_debug_adapter_config();
+
+        assert!(app.debug_adapter_config_popup.is_none());
+        let lang = app.language.as_ref().unwrap();
+        assert_eq!(lang.debug_adapter_command.as_deref(), Some("codelldb"));
+        assert_eq!(lang.debug_adapter_args, vec!["--port", "1234"]);
+        assert_eq!(
+            app.debug_adapters.adapters.get("Rust"),
+            Some(&DebugAdapterEntry {
+                command: "codelldb".to_string(),
+                args: vec!["--port".to_string(), "1234".to_string()],
+            })
+        );
+        // Round-trips through the real persisted config file, same
+        // real-filesystem convention `keymap::save`'s own tests accept.
+        let reloaded = debug_config::load();
+        assert_eq!(
+            reloaded.adapters.get("Rust"),
+            Some(&DebugAdapterEntry {
+                command: "codelldb".to_string(),
+                args: vec!["--port".to_string(), "1234".to_string()],
+            })
+        );
+        let _ = dir; // keeps the tempdir alive for the duration of the test
+    }
+
+    #[test]
+    fn handle_debug_adapter_config_key_tab_switches_field_and_edits_route_correctly() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_adapter_config_popup = Some(DebugAdapterConfigPopupState {
+            command: String::new(),
+            args: String::new(),
+            field: DebugConfigField::Command,
+        });
+
+        app.handle_key(plain_key(KeyCode::Char('c')));
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Char('a')));
+
+        let state = app.debug_adapter_config_popup.as_ref().unwrap();
+        assert_eq!(state.command, "c");
+        assert_eq!(state.args, "a");
+        assert_eq!(state.field, DebugConfigField::Args);
+    }
+
+    #[test]
+    fn handle_debug_adapter_config_key_esc_cancels() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_adapter_config_popup = Some(DebugAdapterConfigPopupState {
+            command: "x".to_string(),
+            args: String::new(),
+            field: DebugConfigField::Command,
+        });
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(app.debug_adapter_config_popup.is_none());
+    }
+
+    #[test]
+    fn debug_action_bindings_reach_run_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug.threads = vec![ide_dap::ThreadInfo {
+            id: 1,
+            name: "main".to_string(),
+        }];
+
+        app.handle_key(key(KeyModifiers::CONTROL, KeyCode::F(8))); // ToggleLineBreakpoint -- no active tab, so a documented no-op
+        assert!(app.debug.breakpoints.is_empty());
+
+        app.handle_key(plain_key(KeyCode::F(9))); // ResumeProgram, no session: no-op
+        assert!(!app.debug.is_active());
     }
 }

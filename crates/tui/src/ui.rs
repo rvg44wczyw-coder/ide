@@ -21,7 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ClaudeView, Focus, GitPanelFocus};
+use crate::app::{App, ClaudeView, DebugPanelFocus, Focus, GitPanelFocus};
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
 use crate::docker_panel::DockerTab;
@@ -159,6 +159,15 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.new_claude_terminal.is_some() {
         render_new_claude_terminal_prompt(frame, app, size);
     }
+    if app.debug.show_launch_popup {
+        render_debug_launch_popup(frame, app, size);
+    }
+    if app.debug_adapter_config_popup.is_some() {
+        render_debug_adapter_config_popup(frame, app, size);
+    }
+    if app.debug_panel_open {
+        render_debug_panel(frame, app, size);
+    }
 }
 
 /// The terminal-grid rows/cols implied by the current terminal
@@ -294,12 +303,19 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         .map(|s| s.range())
         .filter(|r| !r.is_empty())
         .collect();
+    // `docs/features/tui-debugger.md` §2.4 -- `ide-tui` has no gutter to
+    // paint a breakpoint marker into, so a breakpointed line washes its
+    // whole background instead.
+    let (breakpoints_verified, breakpoints_unverified) =
+        app.breakpoint_line_ranges(&buf.path, text_buffer);
     let overlays = LineOverlays {
         semantic_tokens: &semantic_tokens,
         highlights: &highlights,
         inlay_hints: &inlay_hints,
         bracket_pair: &bracket_pair,
         selections: &selections,
+        breakpoints_verified: &breakpoints_verified,
+        breakpoints_unverified: &breakpoints_unverified,
     };
     let lines: Vec<Line> = (visible_start..visible_end)
         .map(|row| {
@@ -1115,6 +1131,234 @@ fn render_new_claude_terminal_prompt(frame: &mut Frame, app: &App, area: Rect) {
         "New Claude Terminal (directory, blank = project root, Enter to create, Esc to cancel):",
     );
     frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// The "Debug" launch popup (`docs/features/tui-debugger.md` §2.5) --
+/// shows the resolved adapter command (read-only) and a single-line raw-
+/// JSON field for launch arguments. `Enter` parses and launches
+/// (`confirm_debug_launch`), `Esc` closes without launching.
+fn render_debug_launch_popup(frame: &mut Frame, app: &App, area: Rect) {
+    if !app.debug.show_launch_popup {
+        return;
+    }
+    let width = area.width.clamp(30, 70);
+    let height = if app.debug.error.is_some() { 5 } else { 4 }.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let command_line = app
+        .language
+        .as_ref()
+        .and_then(|c| c.debug_adapter())
+        .map(|(command, args)| {
+            if args.is_empty() {
+                command.to_string()
+            } else {
+                format!("{command} {}", args.join(" "))
+            }
+        })
+        .unwrap_or_else(|| "(no debug adapter configured)".to_string());
+    let mut items = vec![
+        ListItem::new(Line::from(format!("Command: {command_line}"))),
+        ListItem::new(Line::from(format!(
+            "Launch args (JSON): {}",
+            app.debug.launch_args_draft
+        ))),
+    ];
+    if let Some(error) = &app.debug.error {
+        items.push(ListItem::new(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        ))));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Debug  (Enter: launch, Esc: cancel)");
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// The "Configure Debug Adapter" popup (`docs/features/tui-debugger.md`
+/// §2.5) -- `ide-tui`'s only way to set a debug adapter command, since it
+/// has no Languages… settings window the way `ide-ui` does. `Tab`/
+/// `Shift+Tab` switches the focused field; the focused field's row is
+/// marked with a leading `>`.
+fn render_debug_adapter_config_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.debug_adapter_config_popup.as_ref() else {
+        return;
+    };
+    let width = area.width.clamp(30, 70);
+    let height = 4u16.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let field_marker = |field: crate::app::DebugConfigField| {
+        if state.field == field {
+            ">"
+        } else {
+            " "
+        }
+    };
+    let items = vec![
+        ListItem::new(Line::from(format!(
+            "{} Command: {}",
+            field_marker(crate::app::DebugConfigField::Command),
+            state.command
+        ))),
+        ListItem::new(Line::from(format!(
+            "{} Args: {}",
+            field_marker(crate::app::DebugConfigField::Args),
+            state.args
+        ))),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Configure Debug Adapter  (Tab: switch field, Enter: save, Esc: cancel)");
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// The Debug tool window (`docs/features/tui-debugger.md` §2.6): Threads/
+/// Stack/Output sections, `Tab`-cycled focus (the focused section's title
+/// is marked `*`). Single-key shortcuts (c/o/i/u/p/x) run regardless of
+/// which section has focus, listed in the outer block's title.
+fn render_debug_panel(frame: &mut Frame, app: &App, area: Rect) {
+    if !app.debug_panel_open {
+        return;
+    }
+    let width = area.width.saturating_sub(4).max(20);
+    let height = area.height.saturating_sub(4).max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let outer = Block::default().borders(Borders::ALL).title(
+        "Debug  (c: continue, o: step over, i: step into, u: step out, p: pause, x: stop, Esc: close)",
+    );
+    let inner = outer.inner(popup);
+    frame.render_widget(outer, popup);
+
+    let sections = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+        ])
+        .split(inner);
+
+    let section_title = |base: &str, focus: DebugPanelFocus| {
+        if app.debug_panel.focus == focus {
+            format!("* {base}")
+        } else {
+            base.to_string()
+        }
+    };
+
+    let thread_items: Vec<ListItem> = if app.debug.threads.is_empty() {
+        vec![ListItem::new(Line::from("No threads."))]
+    } else {
+        app.debug
+            .threads
+            .iter()
+            .enumerate()
+            .map(|(i, thread)| {
+                let style = if i == app.debug_panel.thread_selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!("{}: {}", thread.id, thread.name),
+                    style,
+                )))
+            })
+            .collect()
+    };
+    frame.render_widget(
+        List::new(thread_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(section_title("Threads", DebugPanelFocus::Threads)),
+        ),
+        sections[0],
+    );
+
+    let stack_items: Vec<ListItem> = if app.debug.stack.is_empty() {
+        vec![ListItem::new(Line::from("No stack frames."))]
+    } else {
+        app.debug
+            .stack
+            .iter()
+            .enumerate()
+            .map(|(i, frame_info)| {
+                let style = if i == app.debug_panel.stack_selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let location = frame_info
+                    .source
+                    .as_ref()
+                    .map(|p| format!("{}:{}", p.display(), frame_info.line))
+                    .unwrap_or_else(|| "<no source>".to_string());
+                ListItem::new(Line::from(Span::styled(
+                    format!("{} ({location})", frame_info.name),
+                    style,
+                )))
+            })
+            .collect()
+    };
+    frame.render_widget(
+        List::new(stack_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(section_title("Stack", DebugPanelFocus::Stack)),
+        ),
+        sections[1],
+    );
+
+    let visible_rows = sections[2].height.saturating_sub(2) as usize;
+    let output = &app.debug.output;
+    let scroll = app.debug_panel.output_scroll as usize;
+    let start = output
+        .len()
+        .saturating_sub(visible_rows)
+        .saturating_sub(scroll);
+    let end = output.len().saturating_sub(scroll.min(output.len()));
+    let output_items: Vec<ListItem> = if output.is_empty() {
+        vec![ListItem::new(Line::from("No output yet."))]
+    } else {
+        output
+            .iter()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|(_, line)| ListItem::new(Line::from(line.as_str())))
+            .collect()
+    };
+    frame.render_widget(
+        List::new(output_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(section_title("Output", DebugPanelFocus::Output)),
+        ),
+        sections[2],
+    );
 }
 
 fn render_notifications_panel(frame: &mut Frame, app: &App, area: Rect) {

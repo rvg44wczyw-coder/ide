@@ -34,6 +34,8 @@ mod cargo_panel;
 mod claude_panel;
 mod claude_terminal;
 mod commands;
+mod debug_config;
+mod debug_panel;
 mod docker_panel;
 mod editor;
 mod files_search;
@@ -239,6 +241,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // closed (the exact DoS shape `ide-ui`'s own `hacker` pass found
         // and fixed for this same feature).
         app.poll_claude();
+        // Same reasoning, for the debug session's DAP event stream
+        // (`docs/features/tui-debugger.md` §2.3) -- unconditional so a
+        // `Stopped`/`Terminated` event lands even while the Debug tool
+        // window is closed.
+        app.poll_debug();
         if crossterm::event::poll(Duration::from_millis(100))? {
             match crossterm::event::read()? {
                 Event::Key(key) => {

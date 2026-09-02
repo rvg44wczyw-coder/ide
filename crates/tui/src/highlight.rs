@@ -199,6 +199,16 @@ pub struct LineOverlays<'a> {
     /// from `highlights` (`Color::DarkGray`) and `bracket_pair`
     /// (`Color::Blue`).
     pub selections: &'a [Range<usize>],
+    /// Whole-line ranges with a *verified* breakpoint (`Color::Red`
+    /// background) -- `docs/features/tui-debugger.md` §2.4. `ide-tui` has
+    /// no gutter column to paint a mark into, so a breakpointed line
+    /// washes its entire background instead.
+    pub breakpoints_verified: &'a [Range<usize>],
+    /// Whole-line ranges with an adapter-reported *unverified* breakpoint
+    /// (`Color::DarkGray` background, distinct from `breakpoints_verified`
+    /// -- mirrors `ide-ui`'s dimmed/hollow-vs-solid circle distinction,
+    /// `docs/features/tui-debugger.md` §2.4).
+    pub breakpoints_unverified: &'a [Range<usize>],
 }
 
 /// Builds `line`'s styled `Line` from `text_buffer.line_text(line)`,
@@ -295,6 +305,26 @@ pub fn styled_line(
         })
         .collect();
 
+    let breakpoints_verified: Vec<Range<usize>> = overlays
+        .breakpoints_verified
+        .iter()
+        .filter_map(|b| {
+            let start = b.start.clamp(line_start, line_end);
+            let end = b.end.clamp(line_start, line_end);
+            (start < end).then_some(start..end)
+        })
+        .collect();
+
+    let breakpoints_unverified: Vec<Range<usize>> = overlays
+        .breakpoints_unverified
+        .iter()
+        .filter_map(|b| {
+            let start = b.start.clamp(line_start, line_end);
+            let end = b.end.clamp(line_start, line_end);
+            (start < end).then_some(start..end)
+        })
+        .collect();
+
     let chips: Vec<&(usize, String)> = overlays
         .inlay_hints
         .iter()
@@ -317,6 +347,10 @@ pub fn styled_line(
     for selection in &selections {
         boundaries.push(selection.start);
         boundaries.push(selection.end);
+    }
+    for breakpoint in breakpoints_verified.iter().chain(&breakpoints_unverified) {
+        boundaries.push(breakpoint.start);
+        boundaries.push(breakpoint.end);
     }
     for (offset, _) in &chips {
         boundaries.push(*offset);
@@ -355,6 +389,18 @@ pub fn styled_line(
                 .find(|t| t.range.start <= b0 && b1 <= t.range.end)
                 .map(|t| style_for(t.kind))
                 .unwrap_or_default();
+            if breakpoints_unverified
+                .iter()
+                .any(|b| b.start <= b0 && b1 <= b.end)
+            {
+                style = style.bg(Color::DarkGray);
+            }
+            if breakpoints_verified
+                .iter()
+                .any(|b| b.start <= b0 && b1 <= b.end)
+            {
+                style = style.bg(Color::Red);
+            }
             if highlights.iter().any(|h| h.start <= b0 && b1 <= h.end) {
                 style = style.bg(Color::DarkGray);
             }
@@ -458,6 +504,8 @@ mod tests {
             inlay_hints: &[],
             bracket_pair: &[],
             selections: &[],
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         }
     }
 
@@ -664,6 +712,8 @@ mod tests {
                 inlay_hints: &[],
                 bracket_pair: &[],
                 selections: &[],
+                breakpoints_verified: &[],
+                breakpoints_unverified: &[],
             },
             4,
         );
@@ -1002,6 +1052,8 @@ mod tests {
             inlay_hints: &[],
             bracket_pair: &[],
             selections: &[],
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "let x = 1;");
@@ -1030,6 +1082,8 @@ mod tests {
             inlay_hints: &[(4, ": i32".to_string())],
             bracket_pair: &[],
             selections: &[],
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         let chip_index = line
@@ -1067,6 +1121,8 @@ mod tests {
             inlay_hints: &[(9, ";".to_string())],
             bracket_pair: &[],
             selections: &[],
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "let x = 1;");
@@ -1087,6 +1143,8 @@ mod tests {
             inlay_hints: &[],
             bracket_pair: &[],
             selections: &[],
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         let foo_span = line
@@ -1113,6 +1171,8 @@ mod tests {
             inlay_hints: &[(4, "«".to_string()), (19, "»".to_string())],
             bracket_pair: &[],
             selections: &[],
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         // Reconstructing every span *except* the two pure-insertion chips
@@ -1139,6 +1199,8 @@ mod tests {
             inlay_hints: &[],
             bracket_pair: &bracket_pair,
             selections: &[],
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "let x = (1);");
@@ -1169,6 +1231,8 @@ mod tests {
             inlay_hints: &[],
             bracket_pair: &[],
             selections: &selections,
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         let x_span = line
@@ -1202,6 +1266,8 @@ mod tests {
             inlay_hints: &[],
             bracket_pair: &[],
             selections: &selections,
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "let x = 1;");
@@ -1221,6 +1287,8 @@ mod tests {
             inlay_hints: &[],
             bracket_pair: &[],
             selections: &selections,
+            breakpoints_verified: &[],
+            breakpoints_unverified: &[],
         };
         let line = styled_line(&b, 0, &overlays, 4);
         assert_eq!(rebuild(&line), "abcdef");
