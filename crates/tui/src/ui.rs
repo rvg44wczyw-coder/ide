@@ -1839,10 +1839,10 @@ fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanel
         .title(format!("{unstaged_title}  (Enter: stage, x: discard)"));
     frame.render_widget(List::new(unstaged_items).block(block), rows[1]);
 
-    if app.git.pending_discard.is_some() {
+    if let Some(path) = app.git.pending_discard.as_ref() {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title("Discard this change? (y/n)");
+            .title(format!("Discard changes to {}? (y/n)", path.display()));
         frame.render_widget(Paragraph::new(""), block.inner(rows[1]));
         frame.render_widget(block, rows[1]);
     }
