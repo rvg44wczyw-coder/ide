@@ -1,0 +1,34 @@
+@startuml tui-debugger-adapter-resolution
+title ide-tui: resolving the debug adapter command
+
+start
+:App::new(root);
+:tree = project.scan_tree();
+:detect_language(&tree, &[]);
+
+if (language detected?) then (yes)
+  :lang: LanguageConfig;
+  :debug_adapters = debug_config::load()\n(~/.config/ide-tui/debug_adapters.json);
+  if (debug_adapters.adapters.get(&lang.name)?) then (found)
+    :lang.debug_adapter_command = Some(entry.command);
+    :lang.debug_adapter_args = entry.args;
+  else (not found)
+    :lang.debug_adapter_command stays None;
+  endif
+  :self.language = Some(lang);
+else (no)
+  :self.language = None;
+endif
+
+stop
+
+note right
+  Later, at Debug-time:
+  self.language.as_ref()
+    .and_then(|c| c.debug_adapter())
+  -- identical accessor ide-ui's
+  language_for_path(...).debug_adapter()
+  already uses; zero new ide-core API.
+end note
+
+@enduml
