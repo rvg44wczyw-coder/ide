@@ -11956,6 +11956,44 @@ mod tests {
     }
 
     #[test]
+    fn click_on_the_editor_pane_with_no_file_open_is_a_noop() {
+        let (_dir, mut app) = two_file_project();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 10,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
+            &hits,
+        );
+        assert_eq!(app.focus, Focus::Editor, "the click still hit the pane");
+        assert!(app.active_buffer().is_none());
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_editor_pane_with_no_file_open_is_a_noop() {
+        let (_dir, mut app) = two_file_project();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 10,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
+        assert!(app.active_buffer().is_none());
+    }
+
+    #[test]
     fn handle_mouse_click_is_ignored_while_a_popup_is_open() {
         let (_dir, mut app) = open_rust_tab("abc\n");
         app.open_palette();
