@@ -1,6 +1,8 @@
 use crate::error::DapError;
 use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::{timeout_at, Instant};
 
 /// Content-Length above this is rejected before any body buffer is
 /// allocated -- a malicious or buggy debug adapter can't force an
@@ -17,6 +19,19 @@ pub const MAX_CONTENT_LENGTH: usize = 16 * 1024 * 1024;
 /// unboundedly many small ones) before any `Content-Length` is ever
 /// parsed.
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Once a message has visibly begun (its first header byte has arrived),
+/// the adapter must finish sending the rest of it within this window.
+/// Without this, an adapter that sends a `Content-Length` header it never
+/// fully honors -- and simply keeps its process alive without closing its
+/// output -- wedges the read forever: no `ReadOutcome::Error`/`Eof` is ever
+/// produced, so `DapEvent::AdapterExited` never fires and the session looks
+/// alive but is permanently stuck (found live during `hacker`'s review,
+/// `docs/security-findings/ide-dap-2026-09-02.md`). Deliberately generous
+/// and, just as deliberately, applies only from the first byte of a message
+/// onward -- never to the idle wait for the *next* message to start, which
+/// a healthy session (no breakpoint hit yet) can sit in arbitrarily long.
+const IN_PROGRESS_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum ReadOutcome {
     Message(Vec<u8>),
@@ -36,17 +51,40 @@ pub enum ReadOutcome {
 /// on malformed input -- treats the debug adapter subprocess's output as
 /// fully untrusted.
 pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> ReadOutcome {
+    read_message_with_timeout(reader, IN_PROGRESS_READ_TIMEOUT).await
+}
+
+async fn read_message_with_timeout<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    in_progress_timeout: Duration,
+) -> ReadOutcome {
     let mut content_length: Option<usize> = None;
-    let mut headers_started = false;
+    // `Some` from the moment the first header byte of this message has
+    // arrived -- both "is this message in progress" (mirrors the old
+    // `headers_started` flag exactly) and the deadline the rest of this
+    // message must finish by.
+    let mut deadline: Option<Instant> = None;
 
     let mut limited = tokio::io::AsyncReadExt::take(reader, MAX_HEADER_BYTES as u64);
 
     loop {
         let mut line = String::new();
-        let n = match limited.read_line(&mut line).await {
+        let read_line_result = match deadline {
+            Some(dl) => match timeout_at(dl, limited.read_line(&mut line)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return ReadOutcome::Error(DapError::Protocol(
+                        "timed out waiting for the adapter to finish a message it had already started sending"
+                            .to_string(),
+                    ));
+                }
+            },
+            None => limited.read_line(&mut line).await,
+        };
+        let n = match read_line_result {
             Ok(n) => n,
             Err(e) => {
-                return if headers_started {
+                return if deadline.is_some() {
                     ReadOutcome::Error(DapError::Protocol(format!("io error reading headers: {e}")))
                 } else {
                     ReadOutcome::Eof
@@ -54,7 +92,7 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> ReadOutcom
             }
         };
         if n == 0 {
-            return if headers_started {
+            return if deadline.is_some() {
                 ReadOutcome::Error(DapError::Protocol(
                     "connection closed mid-headers".to_string(),
                 ))
@@ -62,7 +100,9 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> ReadOutcom
                 ReadOutcome::Eof
             };
         }
-        headers_started = true;
+        if deadline.is_none() {
+            deadline = Some(Instant::now() + in_progress_timeout);
+        }
 
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
@@ -100,9 +140,21 @@ pub async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> ReadOutcom
         ));
     };
 
+    let dl = deadline.expect("deadline is set once any header line has been read");
     let reader = limited.into_inner();
     let mut body = vec![0u8; content_length];
-    if let Err(e) = tokio::io::AsyncReadExt::read_exact(reader, &mut body).await {
+    let body_result = match timeout_at(dl, tokio::io::AsyncReadExt::read_exact(reader, &mut body))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            return ReadOutcome::Error(DapError::Protocol(
+                "timed out waiting for the adapter to finish a message it had already started sending"
+                    .to_string(),
+            ));
+        }
+    };
+    if let Err(e) = body_result {
         return ReadOutcome::Error(DapError::Protocol(format!(
             "connection closed while reading body: {e}"
         )));
@@ -341,6 +393,65 @@ mod tests {
             _ => panic!("expected a protocol error for a body cut short by connection close"),
         }
         write_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_wait_for_the_next_message_is_never_time_bounded() {
+        // No bytes at all yet -- this must resolve immediately via Eof
+        // (clean stream close), not via the in-progress timeout, since no
+        // message has started. Proves the timeout doesn't fire on the
+        // ordinary "nothing has happened yet" idle case.
+        let outcome =
+            read_message_with_timeout(&mut BufReader::new(&b""[..]), Duration::from_millis(1))
+                .await;
+        assert!(matches!(outcome, ReadOutcome::Eof));
+    }
+
+    #[tokio::test]
+    async fn a_message_that_stalls_mid_body_times_out_instead_of_hanging_forever() {
+        let (tx, rx) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(rx);
+
+        // Header promises 100 bytes; only 10 are ever sent, and `tx` is
+        // kept alive (not dropped) -- the adapter equivalent of staying
+        // running without ever finishing or closing the frame.
+        let _tx = {
+            let mut tx = tx;
+            tx.write_all(b"Content-Length: 100\r\n\r\n0123456789")
+                .await
+                .unwrap();
+            tx
+        };
+
+        let outcome = read_message_with_timeout(&mut reader, Duration::from_millis(50)).await;
+        match outcome {
+            ReadOutcome::Error(DapError::Protocol(msg)) => {
+                assert!(msg.contains("timed out"), "message: {msg}");
+            }
+            _ => panic!("expected a timeout error for a message stalled mid-body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_that_stalls_mid_headers_times_out_instead_of_hanging_forever() {
+        let (tx, rx) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(rx);
+
+        // First header line arrives; the blank line that would end the
+        // header block never does, and `tx` is kept alive.
+        let _tx = {
+            let mut tx = tx;
+            tx.write_all(b"Content-Length: 5\r\n").await.unwrap();
+            tx
+        };
+
+        let outcome = read_message_with_timeout(&mut reader, Duration::from_millis(50)).await;
+        match outcome {
+            ReadOutcome::Error(DapError::Protocol(msg)) => {
+                assert!(msg.contains("timed out"), "message: {msg}");
+            }
+            _ => panic!("expected a timeout error for headers stalled mid-message"),
+        }
     }
 
     #[test]
