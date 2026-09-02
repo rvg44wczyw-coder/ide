@@ -144,6 +144,19 @@
 //! `NewScratchFile`/`ScratchFiles`, both palette-only for the same
 //! reason -- no default keybinding for either action exists in the
 //! tracked JetBrains macOS keymap table.
+//!
+//! `T27` (`docs/features/tui-debugger.md` §2.7) adds `Debug`/
+//! `ResumeProgram`/`StepOver`/`StepInto`/`StepOut`/`ToggleLineBreakpoint`/
+//! `StopDebugging`/`PauseProgram`/`ToggleDebugPanel`/
+//! `ConfigureDebugAdapter` -- the same real JetBrains Windows/Linux
+//! debugger bindings `debugger.md` §3's own keymap table already
+//! specifies for `ide-ui`'s identical actions, used verbatim (no
+//! translation needed: none of them start from a `Cmd`/`Ctrl` chord).
+//! `PauseProgram`/`ToggleDebugPanel`/`ConfigureDebugAdapter` are
+//! palette-only, the first two for the same "not in the reference keymap
+//! either" reason `ide-ui`'s own copy of this table already has, the
+//! third because it's an `ide-tui`-only command with no `ide-ui`
+//! analogue to translate a binding from.
 
 #[cfg(test)]
 use crossterm::event::KeyEvent;
@@ -207,6 +220,16 @@ pub enum Action {
     ToggleClaudePanel,
     ToggleDockerPanel,
     ToggleK8sPanel,
+    Debug,
+    ResumeProgram,
+    StepOver,
+    StepInto,
+    StepOut,
+    ToggleLineBreakpoint,
+    StopDebugging,
+    PauseProgram,
+    ToggleDebugPanel,
+    ConfigureDebugAdapter,
     Exit,
 }
 
@@ -741,6 +764,78 @@ pub fn commands() -> &'static [Command] {
             action: Action::ToggleK8sPanel,
         },
         Command {
+            id: "Debug",
+            title: "Debug",
+            // `⌃⌥D` / `Alt+Shift+F9` -- the real `debugger.md` §3 keymap
+            // table entry, already used verbatim by `ide-ui`'s own
+            // `Debug` command (`docs/features/tui-debugger.md` §2.7).
+            binding: Some((KeyModifiers::ALT.union(KeyModifiers::SHIFT), KeyCode::F(9))),
+            action: Action::Debug,
+        },
+        Command {
+            id: "ResumeProgram",
+            title: "Resume Program",
+            binding: Some((KeyModifiers::NONE, KeyCode::F(9))),
+            action: Action::ResumeProgram,
+        },
+        Command {
+            id: "StepOver",
+            title: "Step Over",
+            binding: Some((KeyModifiers::NONE, KeyCode::F(8))),
+            action: Action::StepOver,
+        },
+        Command {
+            id: "StepInto",
+            title: "Step Into",
+            binding: Some((KeyModifiers::NONE, KeyCode::F(7))),
+            action: Action::StepInto,
+        },
+        Command {
+            id: "StepOut",
+            title: "Step Out",
+            binding: Some((KeyModifiers::SHIFT, KeyCode::F(8))),
+            action: Action::StepOut,
+        },
+        Command {
+            id: "ToggleLineBreakpoint",
+            title: "Toggle Line Breakpoint",
+            // `⌘F8` translated -- `ide-tui` has no gutter click to also
+            // wire this to, so this is the *only* way to toggle a
+            // breakpoint here (`docs/features/tui-debugger.md` §2.7).
+            binding: Some((KeyModifiers::CONTROL, KeyCode::F(8))),
+            action: Action::ToggleLineBreakpoint,
+        },
+        Command {
+            id: "StopDebugging",
+            title: "Stop Debugging",
+            binding: Some((KeyModifiers::CONTROL, KeyCode::F(2))),
+            action: Action::StopDebugging,
+        },
+        Command {
+            id: "PauseProgram",
+            title: "Pause Program",
+            // Palette-only -- not in the reference keymap either
+            // (`docs/features/debugger.md` §3 note), same as `ide-ui`.
+            binding: None,
+            action: Action::PauseProgram,
+        },
+        Command {
+            id: "ToggleDebugPanel",
+            title: "Debug",
+            // Palette-only, same reasoning as `ToggleCargoPanel`/
+            // `ToggleGitPanel` above.
+            binding: None,
+            action: Action::ToggleDebugPanel,
+        },
+        Command {
+            id: "ConfigureDebugAdapter",
+            title: "Configure Debug Adapter",
+            // Palette-only -- `ide-tui`-only command, no `ide-ui`
+            // analogue to translate a binding from.
+            binding: None,
+            action: Action::ConfigureDebugAdapter,
+        },
+        Command {
             id: "Exit",
             title: "Exit",
             binding: None,
@@ -1020,5 +1115,57 @@ mod tests {
     fn ctrl_f3_maps_to_show_bookmarks() {
         let action = binding_for(key(KeyModifiers::CONTROL, KeyCode::F(3)));
         assert_eq!(action, Some(Action::ShowBookmarks));
+    }
+
+    #[test]
+    fn alt_shift_f9_maps_to_debug_not_plain_f9() {
+        let debug = binding_for(key(
+            KeyModifiers::ALT.union(KeyModifiers::SHIFT),
+            KeyCode::F(9),
+        ));
+        assert_eq!(debug, Some(Action::Debug));
+        let resume = binding_for(key(KeyModifiers::NONE, KeyCode::F(9)));
+        assert_eq!(resume, Some(Action::ResumeProgram));
+    }
+
+    #[test]
+    fn f8_and_shift_f8_map_to_step_over_and_step_out() {
+        let step_over = binding_for(key(KeyModifiers::NONE, KeyCode::F(8)));
+        assert_eq!(step_over, Some(Action::StepOver));
+        let step_out = binding_for(key(KeyModifiers::SHIFT, KeyCode::F(8)));
+        assert_eq!(step_out, Some(Action::StepOut));
+    }
+
+    #[test]
+    fn f7_maps_to_step_into() {
+        let action = binding_for(key(KeyModifiers::NONE, KeyCode::F(7)));
+        assert_eq!(action, Some(Action::StepInto));
+    }
+
+    #[test]
+    fn ctrl_f8_maps_to_toggle_line_breakpoint_not_plain_f8() {
+        let action = binding_for(key(KeyModifiers::CONTROL, KeyCode::F(8)));
+        assert_eq!(action, Some(Action::ToggleLineBreakpoint));
+    }
+
+    #[test]
+    fn ctrl_f2_maps_to_stop_debugging() {
+        let action = binding_for(key(KeyModifiers::CONTROL, KeyCode::F(2)));
+        assert_eq!(action, Some(Action::StopDebugging));
+    }
+
+    #[test]
+    fn pause_toggle_debug_panel_and_configure_debug_adapter_have_no_default_binding() {
+        for id in ["PauseProgram", "ToggleDebugPanel", "ConfigureDebugAdapter"] {
+            assert!(
+                commands()
+                    .iter()
+                    .find(|c| c.id == id)
+                    .unwrap()
+                    .binding
+                    .is_none(),
+                "{id} should have no default binding"
+            );
+        }
     }
 }
