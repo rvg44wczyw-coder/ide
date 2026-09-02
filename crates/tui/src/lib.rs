@@ -205,6 +205,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // Same reasoning, for the Git Panel's ambient working-tree-diff
         // refetch (`docs/features/tui-git-panel.md` §3.1).
         app.sync_git_working_tree_diff();
+        // Same reasoning, for the Git Panel's Staged/Unstaged lists
+        // (`docs/features/tui-git-staging-branches-and-log-filters.md`
+        // §3.1).
+        app.sync_git_status();
         // Same reasoning, for Go to File's live per-keystroke refresh and
         // Go to Symbol's outline/workspace-query refetch (`docs/features/
         // tui-go-to-file-and-symbol.md` §3.1/§3.2).

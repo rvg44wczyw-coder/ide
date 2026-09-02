@@ -1,13 +1,20 @@
-//! Source Control panel state/logic: commit graph, side-by-side diff, and
-//! three-way conflict resolution, all backed by `ide_core::GitRepo`. See
-//! `docs/features/tui-git-panel.md` §2.1/§3 (itself porting `docs/
-//! features/git-support.md` §2.2/§3). Rendering lives in `ui.rs`
-//! alongside the rest of `App`'s rendering; everything here is plain
-//! state transitions, unit-testable without a terminal harness -- ported
-//! near-verbatim from `crates/ui/src/git_panel.rs`, which has zero
+//! Source Control panel state/logic: commit graph, side-by-side diff,
+//! three-way conflict resolution, staging/commit, branch operations, and
+//! log filtering, all backed by `ide_core::GitRepo`. See `docs/features/
+//! tui-git-panel.md` §2.1/§3 (T11, itself porting `docs/features/
+//! git-support.md` §2.2/§3) and `docs/features/
+//! tui-git-staging-branches-and-log-filters.md` §2.1/§3 (T28, itself
+//! porting `git-commit-and-staging.md`, the branch half of
+//! `git-branches-and-blame.md`, and `git-log-viewer.md`). Rendering lives
+//! in `ui.rs` alongside the rest of `App`'s rendering; everything here is
+//! plain state transitions, unit-testable without a terminal harness --
+//! ported near-verbatim from `crates/ui/src/git_panel.rs`, which has zero
 //! `egui`/`eframe` dependency itself.
 
-use ide_core::{CommitLogFilter, CommitNode, ConflictSides, FileDiff, GitRepo};
+use ide_core::{
+    BranchInfo, CommitLogFilter, CommitNode, ConflictSides, FileDiff, GitRepo, MergeOutcome,
+    WorkingTreeStatus,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -33,6 +40,64 @@ impl ConflictResolutionState {
     }
 }
 
+/// The branches popup's own transient UI state (`docs/features/
+/// tui-git-staging-branches-and-log-filters.md` §2.1, porting
+/// `git-branches-and-blame.md` §2.2.1) -- separate from `GitPanel`'s
+/// always-empty-until-opened `branches` list, the same split `active_
+/// conflict`/`conflicts` already keep.
+#[derive(Default)]
+pub struct BranchesPopupState {
+    pub open: bool,
+    /// Fuzzy-filter text, scored via `ide_core::fuzzy_score` against each
+    /// branch name (`App::filtered_branch_rows`) -- persists across
+    /// leaving `typing_filter` mode (`Esc` there only stops editing, the
+    /// same "stop editing, not discard" convention every other text-entry
+    /// state in this popup follows), cleared only when the whole popup
+    /// closes.
+    pub filter: String,
+    /// `true` while `/` has put the popup into filter-typing mode
+    /// (`docs/features/tui-git-staging-branches-and-log-filters.md`
+    /// §3.4) -- gates `Char`/`Backspace` to editing `filter` instead of
+    /// falling through to the `m`/`n`/`d` single-letter commands, the same
+    /// text-entry-vs-command-conflict fix shape as `Message`/`Filter`
+    /// focus elsewhere in this doc.
+    pub typing_filter: bool,
+    pub selected: usize,
+    pub new_branch_name: String,
+    pub show_new_branch_input: bool,
+    /// Branch name pending a "not fully merged -- force delete?" confirm
+    /// (`delete_branch`'s `Err(BranchNotMerged)` lands here instead of
+    /// just being shown as an error) -- cleared on a successful delete,
+    /// but left set on failure so the same confirm can retry with `force`
+    /// without a second click/keypress chain.
+    pub pending_delete: Option<String>,
+}
+
+/// The log viewer's own filter-bar state (`docs/features/
+/// tui-git-staging-branches-and-log-filters.md` §2.1, porting
+/// `git-log-viewer.md` §2.2) -- kept separate from `GitPanel::graph`
+/// itself (which stays "last query's result set").
+#[derive(Default)]
+pub struct LogFilterState {
+    pub branch: String,
+    pub author: String,
+    pub path: String,
+    /// Free-typed date bounds (`YYYY-MM-DD`); parsed to Unix-seconds
+    /// bounds only when applying the filter -- kept as raw text here so a
+    /// partially-typed date doesn't get silently discarded mid-edit.
+    pub since: String,
+    pub until: String,
+    pub query: String,
+    /// Set when applying produced a `GitError` (an unresolvable `branch`,
+    /// or an unparsable `since`/`until`). The graph is left as whatever it
+    /// last successfully was, not cleared, on a failed apply.
+    pub error: Option<String>,
+    /// `true` while `GitPanel::graph` holds a `file_history` result
+    /// instead of a `commit_graph` result -- the filter bar is hidden
+    /// while this is set and a "back to log" affordance takes its place.
+    pub viewing_file_history: Option<PathBuf>,
+}
+
 #[derive(Default)]
 pub struct GitPanel {
     repo: Option<GitRepo>,
@@ -51,6 +116,25 @@ pub struct GitPanel {
     pub binary_conflict: Option<PathBuf>,
     /// Cached at `refresh()` time, same pattern as `graph`/`conflicts`.
     pub current_branch: Option<String>,
+    pub status: WorkingTreeStatus,
+    pub commit_message: String,
+    pub amend: bool,
+    /// A path awaiting a user's confirm/cancel on Discard -- distinct
+    /// from the editor's unrelated "discard unsaved tab changes" modal.
+    pub pending_discard: Option<PathBuf>,
+    /// Loaded by `open_branches_popup` and refreshed after every mutating
+    /// branch operation -- not eagerly loaded by `refresh()` itself,
+    /// matching `ide-ui`'s own laziness (a manual reset shouldn't pay for
+    /// a branch listing nobody's currently looking at).
+    pub branches: Vec<BranchInfo>,
+    pub branches_popup: BranchesPopupState,
+    /// `true` between a `merge_branch` call that returned `Conflicts(_)`
+    /// and the resulting commit actually landing -- purely a UI label/
+    /// default-message concern. Cleared the moment `commit()` succeeds,
+    /// and reset to `false` by `refresh()` alongside `active_conflict`/
+    /// `pending_discard`.
+    pub merging: bool,
+    pub log_filter: LogFilterState,
 }
 
 impl GitPanel {
@@ -73,6 +157,7 @@ impl GitPanel {
                     .unwrap_or_default();
                 self.conflicts = repo.conflicts().unwrap_or_default();
                 self.current_branch = repo.current_branch();
+                self.status = repo.status().unwrap_or_default();
                 self.repo = Some(repo);
             }
             Err(_) => {
@@ -80,12 +165,21 @@ impl GitPanel {
                 self.graph.clear();
                 self.conflicts.clear();
                 self.current_branch = None;
+                self.status = WorkingTreeStatus::default();
             }
         }
         self.selected_commit = None;
         self.diff = None;
         self.active_conflict = None;
         self.binary_conflict = None;
+        self.commit_message.clear();
+        self.amend = false;
+        self.pending_discard = None;
+        self.merging = false;
+        // `branches` is deliberately not reloaded here -- it stays lazily
+        // loaded only by `open_branches_popup`, matching `ide-ui`'s own
+        // laziness (`branches` field doc comment above).
+        self.log_filter = LogFilterState::default();
     }
 
     /// Selects a commit from `graph` and loads its diff. `commit_id` must
@@ -181,6 +275,354 @@ impl GitPanel {
         self.active_conflict = None;
         Ok(())
     }
+
+    /// Refreshes `status` from the open repository. No-op with no repo. A
+    /// transient git error mid-frame degrades to "nothing changed," not an
+    /// error banner spamming every frame -- same permissive-on-error
+    /// convention `refresh()`'s own graph/conflicts loads already use.
+    pub fn sync_status(&mut self) {
+        let Some(repo) = &self.repo else { return };
+        if let Ok(status) = repo.status() {
+            self.status = status;
+        }
+    }
+
+    pub fn stage(&mut self, path: &Path) -> Result<(), String> {
+        let Some(repo) = &self.repo else {
+            return Ok(());
+        };
+        repo.stage_path(path).map_err(|e| e.to_string())?;
+        self.sync_status();
+        Ok(())
+    }
+
+    pub fn unstage(&mut self, path: &Path) -> Result<(), String> {
+        let Some(repo) = &self.repo else {
+            return Ok(());
+        };
+        repo.unstage_path(path).map_err(|e| e.to_string())?;
+        self.sync_status();
+        Ok(())
+    }
+
+    pub fn request_discard(&mut self, path: &Path) {
+        self.pending_discard = Some(path.to_path_buf());
+    }
+
+    pub fn cancel_discard(&mut self) {
+        self.pending_discard = None;
+    }
+
+    /// No-op `Ok(())` if there's nothing pending (mirrors `mark_resolved`'s
+    /// "no active target" no-op). Clears `pending_discard` either way --
+    /// an error still closes the modal, retrying a failed discard is a
+    /// fresh attempt, not a modal that lingers on failure.
+    pub fn confirm_discard(&mut self) -> Result<(), String> {
+        let (Some(path), Some(repo)) = (self.pending_discard.take(), &self.repo) else {
+            self.pending_discard = None;
+            return Ok(());
+        };
+        let result = repo.discard_path(&path).map_err(|e| e.to_string());
+        if result.is_ok() {
+            self.sync_status();
+        }
+        result
+    }
+
+    /// No-op `Ok(())` if there's nothing to commit (mirrors the core
+    /// layer's own empty-message rejection, checked here too).
+    pub fn commit(&mut self) -> Result<(), String> {
+        if self.commit_message.trim().is_empty() && !self.amend {
+            return Ok(());
+        }
+        let Some(repo) = &self.repo else {
+            return Ok(());
+        };
+        repo.commit(&self.commit_message, self.amend)
+            .map_err(|e| e.to_string())?;
+        self.commit_message.clear();
+        self.amend = false;
+        self.merging = false;
+        self.sync_status();
+        let repo = self.repo.as_ref().expect("checked above");
+        self.graph = repo
+            .commit_graph(COMMIT_GRAPH_LIMIT, &CommitLogFilter::default())
+            .unwrap_or_default();
+        self.log_filter.viewing_file_history = None;
+        Ok(())
+    }
+
+    /// Rebuilds a `CommitLogFilter` from `log_filter`'s text fields and
+    /// reloads `graph` via the two-argument `commit_graph`. On any parse/
+    /// git error, sets `log_filter.error` and leaves `graph` untouched --
+    /// never a half-applied filter silently showing the wrong graph.
+    pub fn apply_log_filter(&mut self) {
+        let Some(repo) = &self.repo else { return };
+        let filter = match Self::build_log_filter(&self.log_filter) {
+            Ok(filter) => filter,
+            Err(message) => {
+                self.log_filter.error = Some(message);
+                return;
+            }
+        };
+        match repo.commit_graph(COMMIT_GRAPH_LIMIT, &filter) {
+            Ok(graph) => {
+                self.graph = graph;
+                self.log_filter.error = None;
+                self.log_filter.viewing_file_history = None;
+                self.selected_commit = None;
+                self.diff = None;
+            }
+            Err(e) => self.log_filter.error = Some(e.to_string()),
+        }
+    }
+
+    fn build_log_filter(state: &LogFilterState) -> Result<CommitLogFilter, String> {
+        Ok(CommitLogFilter {
+            branch: non_empty(&state.branch),
+            author: non_empty(&state.author),
+            path: non_empty(&state.path).map(PathBuf::from),
+            since: parse_date_bound(&state.since, false)?,
+            until: parse_date_bound(&state.until, true)?,
+            query: non_empty(&state.query),
+        })
+    }
+
+    /// Clears every `LogFilterState` field and reloads the unfiltered
+    /// graph -- the "Clear Filter" action.
+    pub fn clear_log_filter(&mut self) {
+        self.log_filter = LogFilterState::default();
+        self.apply_log_filter();
+    }
+
+    /// Loads `path`'s rename-aware history into `graph` via
+    /// `GitRepo::file_history` and sets `log_filter.viewing_file_history`.
+    /// `path` must already be repository-relative -- the caller strips the
+    /// project root off the active tab's absolute path first.
+    pub fn show_file_history(&mut self, path: &Path) {
+        let Some(repo) = &self.repo else { return };
+        self.graph = repo
+            .file_history(path, COMMIT_GRAPH_LIMIT)
+            .unwrap_or_default();
+        self.log_filter.error = None;
+        self.log_filter.viewing_file_history = Some(path.to_path_buf());
+        self.selected_commit = None;
+        self.diff = None;
+    }
+
+    /// Leaves file-history view and reloads the graph under whatever
+    /// `LogFilterState` currently holds (not necessarily unfiltered).
+    pub fn back_to_log(&mut self) {
+        self.log_filter.viewing_file_history = None;
+        self.apply_log_filter();
+    }
+
+    fn reload_branches(&mut self) {
+        self.branches = self
+            .repo
+            .as_ref()
+            .and_then(|r| r.branches().ok())
+            .unwrap_or_default();
+    }
+
+    /// Loads the branch list fresh and opens the popup with a clean
+    /// transient state. Defensively re-opens the repository if it somehow
+    /// isn't loaded yet (mirrors `refresh`'s own not-a-repo handling)
+    /// rather than showing an empty popup with no way to recover.
+    pub fn open_branches_popup(&mut self, project_root: &Path) {
+        if self.repo.is_none() {
+            self.refresh(project_root);
+        }
+        self.reload_branches();
+        self.branches_popup = BranchesPopupState {
+            open: true,
+            ..BranchesPopupState::default()
+        };
+    }
+
+    pub fn close_branches_popup(&mut self) {
+        self.branches_popup = BranchesPopupState::default();
+    }
+
+    /// Checks out `name` (safe-mode checkout) and closes the popup on
+    /// success -- on error, the popup stays open so the caller can
+    /// surface the git2 error text inline.
+    pub fn checkout_branch(&mut self, project_root: &Path, name: &str) -> Result<(), String> {
+        let Some(repo) = &self.repo else {
+            return Ok(());
+        };
+        repo.switch_branch(name).map_err(|e| e.to_string())?;
+        self.refresh(project_root);
+        self.reload_branches();
+        self.close_branches_popup();
+        Ok(())
+    }
+
+    /// Creates `name` from `HEAD` and, if `checkout` is set, switches to
+    /// it. The branch list and popup input are refreshed/cleared even if
+    /// the follow-up checkout fails (the branch itself was still
+    /// created), but the popup only closes when the whole operation
+    /// succeeds.
+    pub fn create_branch(
+        &mut self,
+        project_root: &Path,
+        name: &str,
+        checkout: bool,
+    ) -> Result<(), String> {
+        let Some(repo) = &self.repo else {
+            return Ok(());
+        };
+        repo.create_branch(name, None).map_err(|e| e.to_string())?;
+        let switch_result = if checkout {
+            self.repo
+                .as_ref()
+                .expect("checked above")
+                .switch_branch(name)
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(())
+        };
+        self.refresh(project_root);
+        self.reload_branches();
+        self.branches_popup.show_new_branch_input = false;
+        self.branches_popup.new_branch_name.clear();
+        if switch_result.is_ok() {
+            self.close_branches_popup();
+        }
+        switch_result
+    }
+
+    /// Marks `name` as pending a delete confirm. Never called for the
+    /// branch `HEAD` currently points at -- the caller must not offer
+    /// Delete on that row at all.
+    pub fn request_delete_branch(&mut self, name: &str) {
+        self.branches_popup.pending_delete = Some(name.to_string());
+    }
+
+    pub fn cancel_delete_branch(&mut self) {
+        self.branches_popup.pending_delete = None;
+    }
+
+    /// Attempts to delete the pending branch. On `BranchNotMerged` (or any
+    /// other error), `pending_delete` is left set so the same confirm can
+    /// retry with `force: true` without a second click/keypress chain --
+    /// deliberately different from `confirm_discard`, which always clears
+    /// its pending target since a failed discard has nothing further to
+    /// escalate to.
+    pub fn confirm_delete_branch(
+        &mut self,
+        project_root: &Path,
+        force: bool,
+    ) -> Result<(), String> {
+        let Some(name) = self.branches_popup.pending_delete.clone() else {
+            return Ok(());
+        };
+        let Some(repo) = &self.repo else {
+            self.branches_popup.pending_delete = None;
+            return Ok(());
+        };
+        let result = repo.delete_branch(&name, force).map_err(|e| e.to_string());
+        if result.is_ok() {
+            self.branches_popup.pending_delete = None;
+            self.refresh(project_root);
+            self.reload_branches();
+        }
+        result
+    }
+
+    /// Starts a merge of `name` into the current branch. On `Conflicts`,
+    /// refreshes state (which repopulates `conflicts` from the repo's own
+    /// index) and sets `merging` plus a pre-filled default commit message,
+    /// but leaves the popup open (the caller -- `App::handle_git_branches_
+    /// key` -- closes it and redirects to conflict resolution itself, a
+    /// deliberate `ide-tui`-side deviation from `ide-ui`'s "leave it open"
+    /// behaviour documented in `tui-git-staging-branches-and-log-filters
+    /// .md` §3.4). On `Merged`/`FastForward`/`UpToDate`, refreshes and
+    /// closes the popup.
+    pub fn merge_branch(&mut self, project_root: &Path, name: &str) -> Result<(), String> {
+        let Some(repo) = &self.repo else {
+            return Ok(());
+        };
+        let outcome = repo.merge_branch(name).map_err(|e| e.to_string())?;
+        self.refresh(project_root);
+        self.reload_branches();
+        if matches!(outcome, MergeOutcome::Conflicts(_)) {
+            self.merging = true;
+            let current = self
+                .current_branch
+                .clone()
+                .unwrap_or_else(|| "HEAD".to_string());
+            self.commit_message = format!("Merge branch '{name}' into {current}");
+        } else {
+            self.close_branches_popup();
+        }
+        Ok(())
+    }
+}
+
+fn non_empty(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parses `YYYY-MM-DD`, rejecting anything but exactly 4/2/2 ASCII digits
+/// per field -- an unbounded-width year string here was a real DoS finding
+/// (integer overflow) against the pre-fix `ide-ui` version; this fixed-
+/// width validation is what closed it, ported verbatim.
+fn parse_date_bound(text: &str, end_of_day: bool) -> Result<Option<i64>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || format!("invalid date {trimmed:?}, expected YYYY-MM-DD");
+    let mut parts = trimmed.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid());
+    };
+    let is_ascii_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return Err(invalid());
+    }
+    if !is_ascii_digits(y) || !is_ascii_digits(m) || !is_ascii_digits(d) {
+        return Err(invalid());
+    }
+    let year: i64 = y.parse().map_err(|_| invalid())?;
+    let month: u32 = m.parse().map_err(|_| invalid())?;
+    let day: u32 = d.parse().map_err(|_| invalid())?;
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return Err(invalid());
+    }
+    let seconds_at_midnight = days_from_civil(year, month, day) * 86_400;
+    Ok(Some(if end_of_day {
+        seconds_at_midnight + 86_399
+    } else {
+        seconds_at_midnight
+    }))
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    const DAYS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if month == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+        29
+    } else {
+        DAYS[(month - 1) as usize]
+    }
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Assigns each commit in `graph` (newest-first, as returned by
@@ -476,6 +918,417 @@ mod tests {
 
         assert!(panel.active_conflict.is_none());
         assert_eq!(panel.binary_conflict, Some(PathBuf::from("f.bin")));
+    }
+
+    // ---- T28: staging/commit ----
+
+    #[test]
+    fn stage_and_unstage_move_a_path_between_lists() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        std::fs::write(dir.path().join("f.txt"), "two\n").unwrap();
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert_eq!(panel.status.unstaged.len(), 1);
+        assert!(panel.status.staged.is_empty());
+
+        panel.stage(Path::new("f.txt")).unwrap();
+        assert!(panel.status.unstaged.is_empty());
+        assert_eq!(panel.status.staged.len(), 1);
+
+        panel.unstage(Path::new("f.txt")).unwrap();
+        assert_eq!(panel.status.unstaged.len(), 1);
+        assert!(panel.status.staged.is_empty());
+    }
+
+    #[test]
+    fn request_discard_then_confirm_removes_the_working_tree_change() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        std::fs::write(dir.path().join("f.txt"), "two\n").unwrap();
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.request_discard(Path::new("f.txt"));
+        assert!(panel.pending_discard.is_some());
+
+        panel.confirm_discard().unwrap();
+        assert!(panel.pending_discard.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\n"
+        );
+    }
+
+    #[test]
+    fn cancel_discard_clears_pending_without_touching_the_file() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        std::fs::write(dir.path().join("f.txt"), "two\n").unwrap();
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.request_discard(Path::new("f.txt"));
+        panel.cancel_discard();
+
+        assert!(panel.pending_discard.is_none());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "two\n"
+        );
+    }
+
+    #[test]
+    fn commit_with_empty_message_and_no_amend_is_a_noop() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        let before = panel.graph.len();
+
+        panel.commit().unwrap();
+        assert_eq!(panel.graph.len(), before);
+    }
+
+    #[test]
+    fn commit_stages_message_creates_a_commit_and_clears_state() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        std::fs::write(dir.path().join("f.txt"), "two\n").unwrap();
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.stage(Path::new("f.txt")).unwrap();
+        panel.commit_message = "second".to_string();
+
+        panel.commit().unwrap();
+
+        assert!(panel.commit_message.is_empty());
+        assert!(!panel.amend);
+        assert_eq!(panel.graph.len(), 2);
+        assert_eq!(panel.graph[0].summary, "second");
+    }
+
+    // ---- T28: log filter ----
+
+    #[test]
+    fn non_empty_trims_and_maps_blank_to_none() {
+        assert_eq!(non_empty("  main  "), Some("main".to_string()));
+        assert_eq!(non_empty("   "), None);
+        assert_eq!(non_empty(""), None);
+    }
+
+    #[test]
+    fn parse_date_bound_accepts_a_well_formed_date() {
+        let start = parse_date_bound("2024-01-02", false).unwrap();
+        let end = parse_date_bound("2024-01-02", true).unwrap();
+        assert_eq!(end.unwrap() - start.unwrap(), 86_399);
+    }
+
+    #[test]
+    fn parse_date_bound_blank_is_none() {
+        assert_eq!(parse_date_bound("", false).unwrap(), None);
+        assert_eq!(parse_date_bound("   ", true).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_date_bound_rejects_malformed_and_out_of_range_input() {
+        assert!(parse_date_bound("2024-1-2", false).is_err());
+        assert!(parse_date_bound("2024/01/02", false).is_err());
+        assert!(parse_date_bound("2024-13-01", false).is_err());
+        assert!(parse_date_bound("2024-02-30", false).is_err());
+        assert!(parse_date_bound("not-a-date", false).is_err());
+    }
+
+    #[test]
+    fn parse_date_bound_rejects_an_unbounded_width_year_without_overflowing() {
+        // Regression test for the DoS finding this fixed-width validation
+        // closed against the pre-fix `ide-ui` version (integer overflow
+        // via an unbounded-width year string).
+        let huge_year = "9".repeat(400);
+        let text = format!("{huge_year}-01-01");
+        assert!(parse_date_bound(&text, false).is_err());
+    }
+
+    #[test]
+    fn days_in_month_handles_leap_years() {
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2023, 2), 28);
+        assert_eq!(days_in_month(1900, 2), 28);
+        assert_eq!(days_in_month(2000, 2), 29);
+    }
+
+    #[test]
+    fn days_from_civil_matches_a_known_epoch_offset() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+    }
+
+    #[test]
+    fn apply_log_filter_by_author_narrows_the_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "second"],
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert_eq!(panel.graph.len(), 2);
+
+        panel.log_filter.query = "second".to_string();
+        panel.apply_log_filter();
+
+        assert!(panel.log_filter.error.is_none());
+        assert_eq!(panel.graph.len(), 1);
+        assert_eq!(panel.graph[0].summary, "second");
+    }
+
+    #[test]
+    fn apply_log_filter_with_an_unparsable_date_sets_error_and_leaves_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        let before = panel.graph.len();
+
+        panel.log_filter.since = "not-a-date".to_string();
+        panel.apply_log_filter();
+
+        assert!(panel.log_filter.error.is_some());
+        assert_eq!(panel.graph.len(), before);
+    }
+
+    #[test]
+    fn clear_log_filter_resets_state_and_reloads_the_unfiltered_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "second"],
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.log_filter.query = "second".to_string();
+        panel.apply_log_filter();
+        assert_eq!(panel.graph.len(), 1);
+
+        panel.clear_log_filter();
+
+        assert!(panel.log_filter.query.is_empty());
+        assert_eq!(panel.graph.len(), 2);
+    }
+
+    #[test]
+    fn show_file_history_then_back_to_log_restores_the_commit_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        commit(dir.path(), "other.txt", "x\n", "second");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        let unfiltered_len = panel.graph.len();
+
+        panel.show_file_history(Path::new("f.txt"));
+        assert_eq!(
+            panel.log_filter.viewing_file_history,
+            Some(PathBuf::from("f.txt"))
+        );
+        assert_eq!(panel.graph.len(), 1);
+
+        panel.back_to_log();
+        assert!(panel.log_filter.viewing_file_history.is_none());
+        assert_eq!(panel.graph.len(), unfiltered_len);
+    }
+
+    // ---- T28: branches ----
+
+    #[test]
+    fn open_branches_popup_loads_branches_and_reset_is_lazy_on_refresh() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(dir.path(), &["branch", "feature"]);
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert!(panel.branches.is_empty(), "branches stay lazily loaded");
+
+        panel.open_branches_popup(dir.path());
+        assert!(panel.branches_popup.open);
+        assert_eq!(panel.branches.len(), 2);
+
+        panel.refresh(dir.path());
+        assert_eq!(
+            panel.branches.len(),
+            2,
+            "refresh() must not clear an already-loaded branches list"
+        );
+    }
+
+    #[test]
+    fn close_branches_popup_resets_transient_popup_state() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_branches_popup(dir.path());
+        panel.branches_popup.filter = "leftover".to_string();
+        panel.branches_popup.selected = 3;
+
+        panel.close_branches_popup();
+
+        assert!(!panel.branches_popup.open);
+        assert!(panel.branches_popup.filter.is_empty());
+        assert_eq!(panel.branches_popup.selected, 0);
+    }
+
+    #[test]
+    fn checkout_branch_switches_and_closes_the_popup() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(dir.path(), &["branch", "feature"]);
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_branches_popup(dir.path());
+
+        panel.checkout_branch(dir.path(), "feature").unwrap();
+
+        assert_eq!(panel.current_branch.as_deref(), Some("feature"));
+        assert!(!panel.branches_popup.open);
+    }
+
+    #[test]
+    fn create_branch_with_checkout_switches_to_the_new_branch() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_branches_popup(dir.path());
+        panel.branches_popup.show_new_branch_input = true;
+        panel.branches_popup.new_branch_name = "feature".to_string();
+
+        panel.create_branch(dir.path(), "feature", true).unwrap();
+
+        assert_eq!(panel.current_branch.as_deref(), Some("feature"));
+        assert!(!panel.branches_popup.open);
+        assert!(!panel.branches_popup.show_new_branch_input);
+        assert!(panel.branches.iter().any(|b| b.name == "feature"));
+    }
+
+    #[test]
+    fn request_and_cancel_delete_branch_leaves_the_branch_intact() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(dir.path(), &["branch", "feature"]);
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_branches_popup(dir.path());
+
+        panel.request_delete_branch("feature");
+        assert_eq!(
+            panel.branches_popup.pending_delete.as_deref(),
+            Some("feature")
+        );
+
+        panel.cancel_delete_branch();
+        assert!(panel.branches_popup.pending_delete.is_none());
+        assert!(panel.branches.iter().any(|b| b.name == "feature"));
+    }
+
+    #[test]
+    fn confirm_delete_branch_removes_a_fully_merged_branch() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(dir.path(), &["branch", "feature"]);
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_branches_popup(dir.path());
+        panel.request_delete_branch("feature");
+
+        panel.confirm_delete_branch(dir.path(), false).unwrap();
+
+        assert!(panel.branches_popup.pending_delete.is_none());
+        assert!(!panel.branches.iter().any(|b| b.name == "feature"));
+    }
+
+    #[test]
+    fn confirm_delete_branch_on_unmerged_branch_leaves_pending_for_a_force_retry() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(dir.path(), &["checkout", "-qb", "feature"]);
+        commit(dir.path(), "f.txt", "two\n", "second");
+        run(dir.path(), &["checkout", "-q", "main"]);
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_branches_popup(dir.path());
+        panel.request_delete_branch("feature");
+
+        let err = panel.confirm_delete_branch(dir.path(), false);
+        assert!(err.is_err());
+        assert_eq!(
+            panel.branches_popup.pending_delete.as_deref(),
+            Some("feature")
+        );
+
+        panel.confirm_delete_branch(dir.path(), true).unwrap();
+        assert!(panel.branches_popup.pending_delete.is_none());
+        assert!(!panel.branches.iter().any(|b| b.name == "feature"));
+    }
+
+    #[test]
+    fn merge_branch_up_to_date_closes_the_popup() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(dir.path(), &["branch", "feature"]);
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_branches_popup(dir.path());
+
+        panel.merge_branch(dir.path(), "feature").unwrap();
+
+        assert!(!panel.merging);
+        assert!(!panel.branches_popup.open);
+    }
+
+    #[test]
+    fn merge_branch_with_conflicts_sets_merging_and_leaves_the_popup_open() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        run(dir.path(), &["checkout", "-qb", "feature"]);
+        std::fs::write(dir.path().join("f.txt"), "feature-side\n").unwrap();
+        run(dir.path(), &["add", "."]);
+        run(dir.path(), &["commit", "-q", "-m", "feature change"]);
+        run(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("f.txt"), "main-side\n").unwrap();
+        run(dir.path(), &["add", "."]);
+        run(dir.path(), &["commit", "-q", "-m", "main change"]);
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_branches_popup(dir.path());
+
+        panel.merge_branch(dir.path(), "feature").unwrap();
+
+        assert!(panel.merging);
+        assert!(
+            panel.branches_popup.open,
+            "merge_branch itself leaves the popup open on Conflicts -- the \
+             caller (App::handle_git_branches_key) closes it and redirects"
+        );
+        assert!(!panel.conflicts.is_empty());
     }
 
     // ---- assign_lanes ----
