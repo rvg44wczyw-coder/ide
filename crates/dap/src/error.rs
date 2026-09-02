@@ -6,6 +6,6 @@ pub enum DapError {
     AdapterNotFound(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
-    #[error("malformed DAP frame: {0}")]
+    #[error("debug adapter protocol error: {0}")]
     Protocol(String),
 }

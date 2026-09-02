@@ -235,7 +235,7 @@ async fn run_event_loop(
                             Ok(()) => {}
                             Err(e) => {
                                 let _ = event_tx.send(DapEvent::AdapterExited {
-                                    message: format!("debug adapter protocol error: {e}"),
+                                    message: e.to_string(),
                                 }).await;
                                 break;
                             }
@@ -249,7 +249,7 @@ async fn run_event_loop(
                     }
                     ReadOutcome::Error(e) => {
                         let _ = event_tx.send(DapEvent::AdapterExited {
-                            message: format!("debug adapter protocol error: {e}"),
+                            message: e.to_string(),
                         }).await;
                         break;
                     }

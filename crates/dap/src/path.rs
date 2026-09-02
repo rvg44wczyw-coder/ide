@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// response must never cause the UI to open or navigate to a file outside
 /// the project (`docs/features/debugger.md` §3.6). Mirrors `ide-lsp`'s
 /// `path::validate_path` exactly; duplicated rather than shared since
-/// `ide-dap` depends on no sibling crate but `ide-core`.
+/// `ide-dap` depends on no sibling crate at all.
 pub fn validate_path(root: &Path, path: &Path) -> Option<PathBuf> {
     let canonical = fs::canonicalize(path).ok()?;
     if canonical.starts_with(root) {

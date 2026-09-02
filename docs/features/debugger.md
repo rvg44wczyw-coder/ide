@@ -79,7 +79,7 @@ pub enum DapError {
     AdapterNotFound(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("malformed DAP frame: {0}")]
+    #[error("debug adapter protocol error: {0}")]
     Protocol(String),
 }
 
@@ -545,8 +545,12 @@ a panic on an `unwrap`/index into attacker-shaped JSON.
 - Adapter command/args come only from `LanguageConfig` (user-typed,
   persisted config) — never constructed from file contents, environment,
   or anything else at spawn time.
-- `crates/dap` depends on `ide-core` only. `ide-lsp` is untouched;
-  `ide-tui` is untouched (TUI parity for the debugger is a `T`-track
+- `crates/dap` depends on no sibling crate at all (its public API takes
+  plain `&str`/`&[String]` rather than `ide_core::LanguageConfig`
+  directly — the caller calls `LanguageConfig::debug_adapter()` and
+  passes the result in), matching `ide-lsp`'s own zero-path-dependency
+  precedent. `ide-lsp` is untouched; `ide-tui` is untouched (TUI parity
+  for the debugger is a `T`-track
   follow-up doc, not part of this run).
 
 ## 5. Examples
@@ -640,3 +644,17 @@ finding):
   requests from rapid thread switching) can be disambiguated.
 - Renumbered §3.2–§3.7 to make room for the new §3.1; all internal
   cross-references updated to match.
+
+Per `rev`'s `rust-dap-dev` code review (two Low findings, no blocking
+security finding):
+
+- §2.1's `DapError::Protocol` display template changed from `"malformed
+  DAP frame: {0}"` to `"debug adapter protocol error: {0}"` — the
+  original wording was misleading when reused for a non-framing failure
+  (an `initialize` rejection), which would otherwise surface to the user
+  as e.g. "malformed DAP frame: fixture: initialize rejected" even
+  though nothing was actually malformed.
+- §4 corrected: `crates/dap` depends on no sibling crate at all (the
+  doc previously said "`ide-core` only," which never matched
+  `crates/dap/Cargo.toml`'s actual dependency list — the public API's
+  plain `&str`/`&[String]` signature needs no `ide-core` type).
