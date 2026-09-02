@@ -224,6 +224,7 @@ pub enum CommandAction {
     GitBranches,
     ToggleBlameAnnotations,
     GitWorktrees,
+    ShowFileHistory,
 }
 
 #[derive(Debug)]
@@ -514,6 +515,16 @@ pub fn commands() -> &'static [Command] {
                 // palette/menu-only (`git-worktrees.md` §2.2.2).
                 binding: None,
                 action: CommandAction::GitWorktrees,
+            },
+            Command {
+                id: "ShowFileHistory",
+                title: "Show History of File",
+                category: "Git",
+                // No JetBrains-IDE macOS binding for this action either --
+                // same "never invent a binding" precedent as `GitWorktrees`/
+                // `ToggleBlameAnnotations` above (`git-log-viewer.md` §2.2).
+                binding: None,
+                action: CommandAction::ShowFileHistory,
             },
             Command {
                 id: "ToggleZenMode",

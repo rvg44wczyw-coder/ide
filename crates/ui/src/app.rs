@@ -4631,6 +4631,15 @@ impl IdeApp {
                 .active_tab
                 .is_some_and(|idx| self.tabs[idx].buffer.path().is_some()),
             CommandAction::GitWorktrees => self.project.is_some(),
+            // Same "active tab, and it's a real git repo" precondition as
+            // `ToggleBlameAnnotations` -- this command needs a concrete
+            // file, not just a project (`GitWorktrees`'s weaker check).
+            CommandAction::ShowFileHistory => {
+                self.git.is_repo()
+                    && self
+                        .active_tab
+                        .is_some_and(|idx| self.tabs[idx].buffer.path().is_some())
+            }
         }
     }
 
@@ -4746,7 +4755,30 @@ impl IdeApp {
                     self.git.open_worktrees_popup(&root);
                 }
             }
+            CommandAction::ShowFileHistory => self.trigger_show_file_history(),
         }
+    }
+
+    /// `CommandAction::ShowFileHistory` (`git-log-viewer.md` §2.2/§3.4):
+    /// strips the project root off the active tab's absolute path before
+    /// handing it to `GitPanel::show_file_history`, which expects a
+    /// repository-relative path -- unlike `show_working_tree_diff`'s own
+    /// `diff_file` call, that method does not strip the prefix itself
+    /// (the doc's own §2.2 puts this responsibility on this call site). A
+    /// tab open from outside the project root (no project, or the path
+    /// doesn't resolve under it) silently no-ops, same as
+    /// `is_command_enabled`'s precondition failing would.
+    fn trigger_show_file_history(&mut self) {
+        let Some(idx) = self.active_tab else { return };
+        let Some(path) = self.tabs[idx].buffer.path() else {
+            return;
+        };
+        let Some(project) = &self.project else { return };
+        let Ok(relative) = path.strip_prefix(project.root()) else {
+            return;
+        };
+        let relative = relative.to_path_buf();
+        self.git.show_file_history(&relative);
     }
 
     /// `CollapseFold` (`code-folding.md` §2.4/§2.5): collapses the
@@ -5753,6 +5785,59 @@ b
 
         let idx = app.active_tab.unwrap();
         assert!(app.tabs[idx].blame.is_some());
+    }
+
+    #[test]
+    fn is_command_enabled_show_file_history_needs_a_repo_and_a_saved_tab() {
+        let mut app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::ShowFileHistory));
+        app.tabs.push(Tab::untitled("Untitled".to_string()));
+        app.active_tab = Some(0);
+        // A saved tab but no repo yet -- `git.is_repo()` is still false.
+        assert!(!app.is_command_enabled(CommandAction::ShowFileHistory));
+    }
+
+    #[test]
+    fn run_command_show_file_history_loads_that_files_history_relative_to_the_project_root() {
+        let dir = git_init_repo();
+        git_commit(dir.path(), "f.txt", "one\n");
+        git_commit(dir.path(), "other.txt", "x\n");
+        git_commit(dir.path(), "f.txt", "two\n");
+        let file = dir.path().join("f.txt");
+
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.git.refresh(dir.path());
+        app.open_file(&file);
+        assert!(app.is_command_enabled(CommandAction::ShowFileHistory));
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::ShowFileHistory, &ctx);
+
+        assert_eq!(
+            app.git.log_filter.viewing_file_history,
+            Some(PathBuf::from("f.txt"))
+        );
+        assert_eq!(app.git.graph.len(), 2);
+    }
+
+    #[test]
+    fn run_command_show_file_history_is_a_noop_for_a_tab_outside_the_project_root() {
+        let dir = git_init_repo();
+        git_commit(dir.path(), "f.txt", "one\n");
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("elsewhere.txt");
+        std::fs::write(&file, "x\n").unwrap();
+
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.git.refresh(dir.path());
+        app.open_file(&file);
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::ShowFileHistory, &ctx);
+
+        assert_eq!(app.git.log_filter.viewing_file_history, None);
     }
 
     #[test]

@@ -3488,6 +3488,8 @@ impl IdeApp {
         self.render_changes_section(ui);
         ui.separator();
 
+        self.render_log_filter_bar(ui);
+
         ui.heading("Commits");
         let lanes = crate::git_panel::assign_lanes(&self.git.graph);
         let mut clicked_commit = None;
@@ -3591,6 +3593,60 @@ impl IdeApp {
         if let Some(path) = to_discard {
             self.git.request_discard(&path);
         }
+    }
+
+    /// The Log tab's filter bar (`git-log-viewer.md` §2.2/§3.2), or --
+    /// while `log_filter.viewing_file_history` is set -- a "← Back to Log"
+    /// affordance in its place (§3.3: the two are mutually exclusive
+    /// modes of the same graph list, never shown active at once).
+    fn render_log_filter_bar(&mut self, ui: &mut egui::Ui) {
+        let tokens = self.theme.tokens();
+        if let Some(path) = self.git.log_filter.viewing_file_history.clone() {
+            ui.horizontal(|ui| {
+                ui.label(format!("History of {}", path.display()));
+                if ui.button("← Back to Log").clicked() {
+                    self.git.back_to_log();
+                }
+            });
+            ui.separator();
+            return;
+        }
+
+        let mut submitted = false;
+        let mut clear_clicked = false;
+        ui.collapsing("Filter", |ui| {
+            egui::Grid::new("log_filter_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for (label, field) in [
+                        ("Branch", &mut self.git.log_filter.branch),
+                        ("Author", &mut self.git.log_filter.author),
+                        ("Path", &mut self.git.log_filter.path),
+                        ("Since (YYYY-MM-DD)", &mut self.git.log_filter.since),
+                        ("Until (YYYY-MM-DD)", &mut self.git.log_filter.until),
+                        ("Message contains", &mut self.git.log_filter.query),
+                    ] {
+                        ui.label(label);
+                        let response = ui.text_edit_singleline(field);
+                        submitted |=
+                            response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.end_row();
+                    }
+                });
+            ui.horizontal(|ui| {
+                submitted |= ui.button("Apply").clicked();
+                clear_clicked = ui.button("Clear Filter").clicked();
+            });
+            if let Some(error) = &self.git.log_filter.error {
+                ui.colored_label(tokens.color.warning, error);
+            }
+        });
+        if clear_clicked {
+            self.git.clear_log_filter();
+        } else if submitted {
+            self.git.apply_log_filter();
+        }
+        ui.separator();
     }
 
     fn render_change_row(

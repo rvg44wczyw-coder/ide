@@ -8,8 +8,8 @@
 use crate::editor::blame_gutter::{strip_bidi_controls, truncate_display};
 use crate::editor::{marks_from_hunks, GutterMark};
 use ide_core::{
-    BlameLine, BranchInfo, CommitDetail, CommitNode, ConflictSides, DiffHunk, FileDiff, GitError,
-    GitRepo, MergeOutcome, WorkingTreeStatus, WorktreeInfo,
+    BlameLine, BranchInfo, CommitDetail, CommitLogFilter, CommitNode, ConflictSides, DiffHunk,
+    FileDiff, GitError, GitRepo, MergeOutcome, WorkingTreeStatus, WorktreeInfo,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -124,6 +124,39 @@ pub struct GitPanel {
     /// worktree operation — same lazy-load convention `branches`/
     /// `branches_popup` already keep (`git-worktrees.md` §2.2.1).
     pub worktrees_popup: WorktreesPopupState,
+    /// The Log tab's own filter-bar/file-history state (`docs/features/
+    /// git-log-viewer.md` §2.2).
+    pub log_filter: LogFilterState,
+}
+
+/// The log viewer's own filter-bar state — kept separate from
+/// `GitPanel::graph` itself (which stays "last query's result set",
+/// mirroring how `worktrees_popup.worktrees`/`branches` are already
+/// separate from their popups' input fields).
+#[derive(Default)]
+pub struct LogFilterState {
+    pub branch: String,
+    pub author: String,
+    pub path: String,
+    /// Free-typed date bounds (`YYYY-MM-DD`); parsed to Unix-seconds
+    /// bounds only when applying the filter (§3.2) — kept as raw text
+    /// here so a partially-typed date doesn't get silently discarded
+    /// mid-edit.
+    pub since: String,
+    pub until: String,
+    pub query: String,
+    /// Set when applying produced an error (an unresolvable `branch`, or
+    /// an unparsable `since`/`until`) — shown inline, same pattern
+    /// `worktrees_popup.error`/`branches_popup`'s inline error already
+    /// use. The graph is left as whatever it last successfully was, not
+    /// cleared, on a failed apply.
+    pub error: Option<String>,
+    /// `true` while `GitPanel::graph` holds a `file_history` result
+    /// instead of a `commit_graph` result — the filter bar is hidden
+    /// while this is set (§3.3: file history doesn't compose with the
+    /// other filters, so showing controls that don't apply would be
+    /// misleading) and a "← Back to Log" affordance takes its place.
+    pub viewing_file_history: Option<PathBuf>,
 }
 
 impl GitPanel {
@@ -139,7 +172,9 @@ impl GitPanel {
     pub fn refresh(&mut self, project_root: &Path) {
         match GitRepo::open(project_root) {
             Ok(repo) => {
-                self.graph = repo.commit_graph(COMMIT_GRAPH_LIMIT).unwrap_or_default();
+                self.graph = repo
+                    .commit_graph(COMMIT_GRAPH_LIMIT, &CommitLogFilter::default())
+                    .unwrap_or_default();
                 self.conflicts = repo.conflicts().unwrap_or_default();
                 self.current_branch = repo.current_branch();
                 self.status = repo.status().unwrap_or_default();
@@ -161,6 +196,13 @@ impl GitPanel {
         self.amend = false;
         self.pending_discard = None;
         self.merging = false;
+        // A different repository (project switch) or a plain manual
+        // Refresh both make a stale filter/file-history view actively
+        // misleading -- e.g. an `author` substring typed against the
+        // previous repo's contributors, or `viewing_file_history` pointing
+        // at a path whose history no longer applies to the graph this
+        // call just loaded unfiltered.
+        self.log_filter = LogFilterState::default();
     }
 
     /// Selects a commit from `graph` and loads its diff. `commit_id` must
@@ -350,8 +392,85 @@ impl GitPanel {
         self.merging = false;
         self.sync_status();
         let repo = self.repo.as_ref().expect("checked above");
-        self.graph = repo.commit_graph(COMMIT_GRAPH_LIMIT).unwrap_or_default();
+        self.graph = repo
+            .commit_graph(COMMIT_GRAPH_LIMIT, &CommitLogFilter::default())
+            .unwrap_or_default();
+        // `graph` above is unconditionally a plain unfiltered log now --
+        // if the user had been viewing a file's history, leaving that flag
+        // set would hide the filter bar and show "Back to Log" over data
+        // that already *is* the log.
+        self.log_filter.viewing_file_history = None;
         Ok(())
+    }
+
+    /// Rebuilds a `CommitLogFilter` from `log_filter`'s text fields and
+    /// reloads `graph` via the two-argument `commit_graph`. On any parse/
+    /// git error, sets `log_filter.error` and leaves `graph` untouched
+    /// (§3.2 of `git-log-viewer.md`) -- never a half-applied filter
+    /// silently showing the wrong graph.
+    pub fn apply_log_filter(&mut self) {
+        let Some(repo) = &self.repo else { return };
+        let filter = match Self::build_log_filter(&self.log_filter) {
+            Ok(filter) => filter,
+            Err(message) => {
+                self.log_filter.error = Some(message);
+                return;
+            }
+        };
+        match repo.commit_graph(COMMIT_GRAPH_LIMIT, &filter) {
+            Ok(graph) => {
+                self.graph = graph;
+                self.log_filter.error = None;
+                self.log_filter.viewing_file_history = None;
+                self.selected_commit = None;
+                self.diff = None;
+            }
+            Err(e) => self.log_filter.error = Some(e.to_string()),
+        }
+    }
+
+    fn build_log_filter(state: &LogFilterState) -> Result<CommitLogFilter, String> {
+        Ok(CommitLogFilter {
+            branch: non_empty(&state.branch),
+            author: non_empty(&state.author),
+            path: non_empty(&state.path).map(PathBuf::from),
+            since: parse_date_bound(&state.since, false)?,
+            until: parse_date_bound(&state.until, true)?,
+            query: non_empty(&state.query),
+        })
+    }
+
+    /// Clears every `LogFilterState` field and reloads the unfiltered
+    /// graph -- the toolbar's "Clear Filter" action.
+    pub fn clear_log_filter(&mut self) {
+        self.log_filter = LogFilterState::default();
+        self.apply_log_filter();
+    }
+
+    /// Loads `path`'s rename-aware history into `graph` via
+    /// `GitRepo::file_history` and sets `log_filter.viewing_file_history`.
+    /// `path` must already be repository-relative -- the caller
+    /// (`CommandAction::ShowFileHistory`'s handler in `app.rs`) strips the
+    /// project root off the active tab's absolute path first, the same
+    /// convention `show_working_tree_diff`'s own `diff_file` call follows.
+    pub fn show_file_history(&mut self, path: &Path) {
+        let Some(repo) = &self.repo else { return };
+        self.graph = repo
+            .file_history(path, COMMIT_GRAPH_LIMIT)
+            .unwrap_or_default();
+        self.log_filter.error = None;
+        self.log_filter.viewing_file_history = Some(path.to_path_buf());
+        self.selected_commit = None;
+        self.diff = None;
+    }
+
+    /// Leaves file-history view and reloads the graph under whatever
+    /// `LogFilterState` currently holds (not necessarily unfiltered -- if
+    /// the user had an active filter before switching to file history,
+    /// returning restores it rather than discarding it).
+    pub fn back_to_log(&mut self) {
+        self.log_filter.viewing_file_history = None;
+        self.apply_log_filter();
     }
 
     fn reload_branches(&mut self) {
@@ -707,6 +826,70 @@ pub fn assign_lanes(graph: &[CommitNode]) -> HashMap<String, usize> {
     assigned
 }
 
+/// Trims `text` and turns an empty result into `None` -- the shared rule
+/// every `LogFilterState` text field uses to decide whether it's "set" for
+/// `CommitLogFilter` purposes (§3.2 of `git-log-viewer.md`).
+fn non_empty(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Parses a `YYYY-MM-DD` bound into Unix seconds -- the start of that day
+/// if `end_of_day` is `false`, or its last second (`23:59:59`) if `true`,
+/// so a user-typed `until` date covers the whole day inclusively. Empty
+/// input is `Ok(None)` (no bound), matching `LogFilterState`'s "free text
+/// until applied" contract.
+///
+/// `ide-ui` has no timezone-database dependency (`CLAUDE.md`'s Dependencies
+/// table lists none, and this feature adds none per its own §6) and Rust's
+/// standard library exposes no local-timezone offset without one, so
+/// unlike the doc's "local timezone" wording this treats the parsed date
+/// as UTC. Documented here and in the feature doc's revision notes as a
+/// deliberate scope call, not an oversight.
+fn parse_date_bound(text: &str, end_of_day: bool) -> Result<Option<i64>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || format!("invalid date {trimmed:?}, expected YYYY-MM-DD");
+    let mut parts = trimmed.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid());
+    };
+    let year: i64 = y.parse().map_err(|_| invalid())?;
+    let month: u32 = m.parse().map_err(|_| invalid())?;
+    let day: u32 = d.parse().map_err(|_| invalid())?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(invalid());
+    }
+    let seconds_at_midnight = days_from_civil(year, month, day) * 86_400;
+    Ok(Some(if end_of_day {
+        seconds_at_midnight + 86_399
+    } else {
+        seconds_at_midnight
+    }))
+}
+
+/// Howard Hinnant's `days_from_civil` (proleptic Gregorian, valid for any
+/// year) -- days since the Unix epoch (1970-01-01) for civil date
+/// `(y, m, d)`, `1 <= m <= 12` (caller-validated). See
+/// <https://howardhinnant.github.io/date_algorithms.html#days_from_civil>.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m as i64 + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,6 +1006,379 @@ mod tests {
         assert_eq!(panel.selected_commit, Some(first));
         let diffs = panel.diff.expect("diff loaded");
         assert_eq!(diffs.len(), 1);
+    }
+
+    /// Like `commit`, but lets the caller pick author identity and/or an
+    /// explicit commit date (`GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`, ISO
+    /// 8601 accepted directly by git) instead of `run`'s fixed
+    /// `"Test User"`/`"test@example.com"` -- needed to exercise
+    /// `CommitLogFilter`'s `author`/`since`/`until` fields against commits
+    /// that actually differ on those axes.
+    fn commit_as(
+        dir: &Path,
+        name: &str,
+        content: &str,
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+        date: Option<&str>,
+    ) -> String {
+        std::fs::write(dir.join(name), content).unwrap();
+        run(dir, &["add", "."]);
+        let mut cmd = Command::new("git");
+        cmd.args(["commit", "-q", "-m", message])
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", author_name)
+            .env("GIT_AUTHOR_EMAIL", author_email)
+            .env("GIT_COMMITTER_NAME", author_name)
+            .env("GIT_COMMITTER_EMAIL", author_email);
+        if let Some(date) = date {
+            cmd.env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date);
+        }
+        assert!(cmd.status().unwrap().success());
+        String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    #[test]
+    fn apply_log_filter_by_author_narrows_graph() {
+        let dir = init_repo();
+        commit_as(
+            dir.path(),
+            "a.txt",
+            "a\n",
+            "by alice",
+            "Alice",
+            "alice@example.com",
+            None,
+        );
+        let bob = commit_as(
+            dir.path(),
+            "b.txt",
+            "b\n",
+            "by bob",
+            "Bob",
+            "bob@example.com",
+            None,
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert_eq!(panel.graph.len(), 2);
+
+        panel.log_filter.author = "bob".to_string();
+        panel.apply_log_filter();
+
+        assert_eq!(panel.log_filter.error, None);
+        assert_eq!(panel.graph.len(), 1);
+        assert_eq!(panel.graph[0].id, bob);
+    }
+
+    #[test]
+    fn apply_log_filter_by_author_matches_email_too() {
+        let dir = init_repo();
+        commit_as(
+            dir.path(),
+            "a.txt",
+            "a\n",
+            "by someone",
+            "Someone Else",
+            "carol@example.com",
+            None,
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.log_filter.author = "CAROL".to_string();
+        panel.apply_log_filter();
+
+        assert_eq!(panel.graph.len(), 1);
+    }
+
+    #[test]
+    fn apply_log_filter_by_query_narrows_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "add feature");
+        let fix = commit(dir.path(), "b.txt", "b\n", "fix panic on empty input");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.log_filter.query = "fix panic".to_string();
+        panel.apply_log_filter();
+
+        assert_eq!(panel.graph.len(), 1);
+        assert_eq!(panel.graph[0].id, fix);
+    }
+
+    #[test]
+    fn apply_log_filter_by_path_narrows_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "touch a");
+        let b = commit(dir.path(), "b.txt", "b\n", "touch b");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.log_filter.path = "b.txt".to_string();
+        panel.apply_log_filter();
+
+        assert_eq!(panel.graph.len(), 1);
+        assert_eq!(panel.graph[0].id, b);
+    }
+
+    #[test]
+    fn apply_log_filter_by_since_and_until_narrows_graph() {
+        let dir = init_repo();
+        commit_as(
+            dir.path(),
+            "a.txt",
+            "a\n",
+            "old",
+            "Test",
+            "test@example.com",
+            Some("2020-01-01T00:00:00+0000"),
+        );
+        let mid = commit_as(
+            dir.path(),
+            "b.txt",
+            "b\n",
+            "mid",
+            "Test",
+            "test@example.com",
+            Some("2022-06-15T00:00:00+0000"),
+        );
+        commit_as(
+            dir.path(),
+            "c.txt",
+            "c\n",
+            "new",
+            "Test",
+            "test@example.com",
+            Some("2024-01-01T00:00:00+0000"),
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.log_filter.since = "2021-01-01".to_string();
+        panel.log_filter.until = "2023-01-01".to_string();
+        panel.apply_log_filter();
+
+        assert_eq!(panel.log_filter.error, None);
+        assert_eq!(panel.graph.len(), 1);
+        assert_eq!(panel.graph[0].id, mid);
+    }
+
+    #[test]
+    fn apply_log_filter_by_branch_walks_from_that_branch() {
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "base");
+        run(dir.path(), &["checkout", "-q", "-b", "topic"]);
+        let topic_commit = commit(dir.path(), "b.txt", "b\n", "on topic");
+        run(dir.path(), &["checkout", "-q", "-"]);
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert_eq!(panel.graph.len(), 1);
+
+        panel.log_filter.branch = "topic".to_string();
+        panel.apply_log_filter();
+
+        assert_eq!(panel.log_filter.error, None);
+        assert_eq!(panel.graph.len(), 2);
+        assert_eq!(panel.graph[0].id, topic_commit);
+    }
+
+    #[test]
+    fn apply_log_filter_with_unresolvable_branch_sets_error_and_leaves_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "base");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        let before = panel.graph.clone();
+
+        panel.log_filter.branch = "does-not-exist".to_string();
+        panel.apply_log_filter();
+
+        assert!(panel.log_filter.error.is_some());
+        assert_eq!(panel.graph, before);
+    }
+
+    #[test]
+    fn apply_log_filter_with_unparsable_date_sets_error_and_leaves_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "base");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        let before = panel.graph.clone();
+
+        panel.log_filter.since = "not-a-date".to_string();
+        panel.apply_log_filter();
+
+        assert!(panel.log_filter.error.is_some());
+        assert_eq!(panel.graph, before);
+    }
+
+    #[test]
+    fn clear_log_filter_resets_state_and_reloads_full_graph() {
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "add feature");
+        commit(dir.path(), "b.txt", "b\n", "fix panic");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.log_filter.query = "fix panic".to_string();
+        panel.apply_log_filter();
+        assert_eq!(panel.graph.len(), 1);
+
+        panel.clear_log_filter();
+
+        assert_eq!(panel.log_filter.query, "");
+        assert_eq!(panel.log_filter.error, None);
+        assert_eq!(panel.graph.len(), 2);
+    }
+
+    #[test]
+    fn show_file_history_sets_flag_and_loads_history_then_back_to_log_restores_view() {
+        let dir = init_repo();
+        commit(dir.path(), "tracked.txt", "one\n", "first");
+        commit(dir.path(), "other.txt", "x\n", "unrelated");
+        let second = commit(dir.path(), "tracked.txt", "two\n", "second");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert_eq!(panel.graph.len(), 3);
+
+        panel.show_file_history(Path::new("tracked.txt"));
+
+        assert_eq!(
+            panel.log_filter.viewing_file_history,
+            Some(PathBuf::from("tracked.txt"))
+        );
+        assert_eq!(panel.graph.len(), 2);
+        assert_eq!(panel.graph[0].id, second);
+
+        panel.back_to_log();
+
+        assert_eq!(panel.log_filter.viewing_file_history, None);
+        assert_eq!(panel.graph.len(), 3);
+    }
+
+    #[test]
+    fn back_to_log_restores_an_active_filter_rather_than_clearing_it() {
+        let dir = init_repo();
+        commit(dir.path(), "tracked.txt", "one\n", "add feature");
+        let fix = commit(dir.path(), "other.txt", "x\n", "fix panic");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.log_filter.query = "fix panic".to_string();
+        panel.apply_log_filter();
+        assert_eq!(panel.graph.len(), 1);
+
+        panel.show_file_history(Path::new("tracked.txt"));
+        assert_eq!(panel.graph.len(), 1);
+
+        panel.back_to_log();
+
+        assert_eq!(panel.log_filter.viewing_file_history, None);
+        assert_eq!(panel.log_filter.query, "fix panic");
+        assert_eq!(panel.graph.len(), 1);
+        assert_eq!(panel.graph[0].id, fix);
+    }
+
+    #[test]
+    fn refresh_resets_log_filter_state() {
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "first");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.log_filter.author = "someone".to_string();
+        panel.log_filter.error = Some("stale".to_string());
+        panel.log_filter.viewing_file_history = Some(PathBuf::from("a.txt"));
+
+        panel.refresh(dir.path());
+
+        assert_eq!(panel.log_filter.author, "");
+        assert_eq!(panel.log_filter.error, None);
+        assert_eq!(panel.log_filter.viewing_file_history, None);
+    }
+
+    #[test]
+    fn commit_clears_viewing_file_history_but_keeps_filter_text() {
+        let dir = init_repo();
+        commit(dir.path(), "tracked.txt", "one\n", "first");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.show_file_history(Path::new("tracked.txt"));
+        panel.log_filter.author = "someone".to_string();
+
+        std::fs::write(dir.path().join("tracked.txt"), "two\n").unwrap();
+        run(dir.path(), &["add", "."]);
+        panel.commit_message = "second".to_string();
+        panel.commit().unwrap();
+
+        assert_eq!(panel.log_filter.viewing_file_history, None);
+        assert_eq!(panel.log_filter.author, "someone");
+        assert_eq!(panel.graph.len(), 2);
+    }
+
+    #[test]
+    fn non_empty_trims_and_maps_blank_to_none() {
+        assert_eq!(non_empty("  hello  "), Some("hello".to_string()));
+        assert_eq!(non_empty(""), None);
+        assert_eq!(non_empty("   "), None);
+    }
+
+    #[test]
+    fn parse_date_bound_empty_is_no_bound() {
+        assert_eq!(parse_date_bound("", false).unwrap(), None);
+        assert_eq!(parse_date_bound("   ", true).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_date_bound_matches_the_docs_worked_example() {
+        // `git-log-viewer.md` §5: 2026-01-01T00:00:00Z == 1_767_225_600.
+        assert_eq!(
+            parse_date_bound("2026-01-01", false).unwrap(),
+            Some(1_767_225_600)
+        );
+    }
+
+    #[test]
+    fn parse_date_bound_end_of_day_is_last_second() {
+        assert_eq!(
+            parse_date_bound("2026-01-01", true).unwrap(),
+            Some(1_767_225_600 + 86_399)
+        );
+    }
+
+    #[test]
+    fn parse_date_bound_rejects_malformed_input() {
+        assert!(parse_date_bound("2026/01/01", false).is_err());
+        assert!(parse_date_bound("2026-13-01", false).is_err());
+        assert!(parse_date_bound("2026-01-32", false).is_err());
+        assert!(parse_date_bound("not-a-date", false).is_err());
+        assert!(parse_date_bound("2026-01", false).is_err());
+    }
+
+    #[test]
+    fn days_from_civil_matches_known_epoch_offsets() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(days_from_civil(2000, 3, 1), 11_017);
     }
 
     #[test]
