@@ -48,6 +48,12 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// tui-scroll-follows-cursor.md` §2.1).
 pub const EDITOR_CHROME_ROWS: u16 = 4;
 
+/// Right-margin guide column (`docs/features/right-margin-guide.md` §1) --
+/// always this literal value in `ide-tui`, unlike `ide-ui` where it's
+/// per-language configurable: this crate has no per-language settings
+/// storage/UI to read an override from.
+const RIGHT_MARGIN_COLUMN: u16 = 120;
+
 /// Click/wheel hit-test targets from the most recently rendered frame
 /// (`docs/features/tui-mouse-support.md` §2.2) -- rebuilt from scratch by
 /// every [`render`] call, so a rect is `None`/absent whenever that panel
@@ -319,6 +325,25 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         .collect();
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, text_area);
+
+    // Right-margin guide (`docs/features/right-margin-guide.md` §1/§2.4):
+    // always the fixed default column here -- this crate has no
+    // per-language settings surface to read a `LanguageConfig` override
+    // from. Tints the existing cell's background rather than replacing its
+    // glyph, so whatever was already drawn there (text, or blank space on
+    // an empty buffer) stays visible. Skipped entirely when the terminal
+    // is too narrow to show column 120 -- there's no horizontal scroll in
+    // this crate to bring it into view.
+    if let Some(guide_x) = text_area.x.checked_add(RIGHT_MARGIN_COLUMN) {
+        if guide_x < text_area.x + text_area.width {
+            let buffer = frame.buffer_mut();
+            for y in text_area.y..text_area.y + text_area.height {
+                if let Some(cell) = buffer.cell_mut((guide_x, y)) {
+                    cell.set_bg(Color::DarkGray);
+                }
+            }
+        }
+    }
 
     if app.focus == Focus::Editor {
         let offset = buf.buffer.text_buffer().selections().primary().head;
