@@ -273,6 +273,7 @@ pub struct CodeEditor<'a> {
     blame_on: bool,
     blame_annotations: &'a [BlameAnnotation],
     breakpoint_marks: &'a [BreakpointMark],
+    right_margin_column: u32,
 }
 
 impl<'a> CodeEditor<'a> {
@@ -305,6 +306,7 @@ impl<'a> CodeEditor<'a> {
             blame_on: false,
             blame_annotations: &[],
             breakpoint_marks: &[],
+            right_margin_column: 120,
         }
     }
 
@@ -408,6 +410,16 @@ impl<'a> CodeEditor<'a> {
         self
     }
 
+    /// The right-margin guide's column for this tab's language
+    /// (`docs/features/right-margin-guide.md` §2.3/§3) -- default `120`
+    /// (`CodeEditor::new`'s initial value) matches `LanguageConfig::
+    /// right_margin_column()`'s own default, so a caller that never calls
+    /// this builder method still gets the correct fallback.
+    pub fn right_margin_column(mut self, column: u32) -> Self {
+        self.right_margin_column = column;
+        self
+    }
+
     pub fn show(self, ui: &mut egui::Ui) -> EditorOutput {
         let Self {
             id,
@@ -428,6 +440,7 @@ impl<'a> CodeEditor<'a> {
             blame_on,
             blame_annotations,
             breakpoint_marks,
+            right_margin_column,
         } = self;
 
         let font_id = egui::TextStyle::Monospace.resolve(ui.style());
@@ -490,6 +503,7 @@ impl<'a> CodeEditor<'a> {
             git_gutter_marks,
             blame_annotations,
             breakpoint_marks,
+            right_margin_column,
             changed: false,
             hovered_word: None,
             clicked_link: None,
@@ -541,6 +555,7 @@ struct Frame<'a> {
     git_gutter_marks: &'a [GutterMark],
     blame_annotations: &'a [BlameAnnotation],
     breakpoint_marks: &'a [BreakpointMark],
+    right_margin_column: u32,
     changed: bool,
     hovered_word: Option<Range<usize>>,
     clicked_link: Option<Range<usize>>,
@@ -685,6 +700,24 @@ impl Frame<'_> {
                 self.tokens.color.current_line_bg,
             );
         }
+
+        // Right-margin guide (`docs/features/right-margin-guide.md` §2.3):
+        // drawn before the per-row text loop below, so it sits behind
+        // glyphs rather than over them -- same ordering sense as the
+        // current-line band above ("everything else draws over it"),
+        // applied in reverse here since this is chrome, not content.
+        // `top`/`bottom` span the full viewport height, the same span
+        // `paint_gutter`'s own full-height background rect uses, so the
+        // guide runs the whole visible editor height rather than stopping
+        // at the buffer's last line.
+        let guide_x = text_left + self.right_margin_column as f32 * self.metrics.char_width;
+        paint::paint_right_margin_guide(
+            ui.painter(),
+            guide_x,
+            origin.y + viewport.min.y,
+            origin.y + viewport.min.y + viewport.height(),
+            self.tokens.color.border,
+        );
 
         let mut widest: f32 = 0.0;
         for row in visible_rows.clone() {

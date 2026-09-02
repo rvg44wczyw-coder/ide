@@ -1025,6 +1025,9 @@ pub struct IdeApp {
     new_language_args: String,
     new_language_debug_adapter_command: String,
     new_language_debug_adapter_args: String,
+    /// `docs/features/right-margin-guide.md` §2.2 -- blank means "use the
+    /// global default (120)"; parsed by `add_custom_language`.
+    new_language_right_margin_column: String,
     language_settings_error: Option<String>,
     show_language_settings: bool,
     /// Mirrors `ProjectPreferences::dismissed_language_suggestions`,
@@ -1250,6 +1253,7 @@ impl IdeApp {
             new_language_args: String::new(),
             new_language_debug_adapter_command: String::new(),
             new_language_debug_adapter_args: String::new(),
+            new_language_right_margin_column: String::new(),
             language_settings_error: None,
             show_language_settings: false,
             dismissed_language_suggestions: Vec::new(),
@@ -3594,10 +3598,14 @@ impl IdeApp {
     /// (`docs/features/language-server-arguments.md` §2.3 -- naive
     /// splitting, no quoting support; an empty/all-whitespace field parses
     /// to `vec![]`, matching "no arguments needed" rather than an error).
-    /// On success: pushes the new config, clears the draft fields and
-    /// `language_settings_error`, and re-runs `resync_active_languages` so a
-    /// matching language added while its project is already open takes
-    /// effect immediately.
+    /// `new_language_right_margin_column` is optional too
+    /// (`docs/features/right-margin-guide.md` §2.2): blank means "use the
+    /// global default (120)"; a non-blank value must parse as a positive
+    /// `u32` -- a `0` or unparseable value rejects the same way the
+    /// required-fields check above does. On success: pushes the new
+    /// config, clears the draft fields and `language_settings_error`, and
+    /// re-runs `resync_active_languages` so a matching language added
+    /// while its project is already open takes effect immediately.
     fn add_custom_language(&mut self) {
         let name = self.new_language_name.trim().to_string();
         let extension = self
@@ -3633,6 +3641,19 @@ impl IdeApp {
                 Some(format!("Extension \".{extension}\" is already in use."));
             return;
         }
+        let right_margin_input = self.new_language_right_margin_column.trim();
+        let right_margin_column: Option<u32> = if right_margin_input.is_empty() {
+            None
+        } else {
+            match right_margin_input.parse::<u32>() {
+                Ok(value) if value > 0 => Some(value),
+                _ => {
+                    self.language_settings_error =
+                        Some("Right margin column must be a positive number.".to_string());
+                    return;
+                }
+            }
+        };
 
         self.custom_languages.push(LanguageConfig {
             name,
@@ -3643,6 +3664,7 @@ impl IdeApp {
             debug_adapter_command: (!debug_adapter_command.is_empty())
                 .then_some(debug_adapter_command),
             debug_adapter_args,
+            right_margin_column,
         });
         self.new_language_name.clear();
         self.new_language_extension.clear();
@@ -3650,6 +3672,7 @@ impl IdeApp {
         self.new_language_args.clear();
         self.new_language_debug_adapter_command.clear();
         self.new_language_debug_adapter_args.clear();
+        self.new_language_right_margin_column.clear();
         self.language_settings_error = None;
         self.resync_active_languages();
     }
@@ -5393,6 +5416,7 @@ mod tests {
             new_language_args: String::new(),
             new_language_debug_adapter_command: String::new(),
             new_language_debug_adapter_args: String::new(),
+            new_language_right_margin_column: String::new(),
             language_settings_error: None,
             show_language_settings: false,
             dismissed_language_suggestions: Vec::new(),
@@ -7686,6 +7710,67 @@ b
         app.add_custom_language();
 
         assert_eq!(app.custom_languages, vec![go_config_with_command("gopls")]);
+    }
+
+    #[test]
+    fn add_custom_language_with_a_blank_right_margin_column_defaults_to_120() {
+        let mut app = app_without_gui();
+        app.new_language_name = "Go".to_string();
+        app.new_language_extension = "go".to_string();
+        app.new_language_command = "gopls".to_string();
+        app.new_language_right_margin_column = "   ".to_string();
+
+        app.add_custom_language();
+
+        assert_eq!(app.custom_languages[0].right_margin_column, None);
+        assert_eq!(app.custom_languages[0].right_margin_column(), 120);
+        assert!(app.new_language_right_margin_column.is_empty());
+    }
+
+    #[test]
+    fn add_custom_language_with_a_valid_right_margin_column_sets_it() {
+        let mut app = app_without_gui();
+        app.new_language_name = "Python".to_string();
+        app.new_language_extension = "py".to_string();
+        app.new_language_command = "pylsp".to_string();
+        app.new_language_right_margin_column = " 79 ".to_string();
+
+        app.add_custom_language();
+
+        assert_eq!(app.custom_languages[0].right_margin_column, Some(79));
+        assert!(app.language_settings_error.is_none());
+    }
+
+    #[test]
+    fn add_custom_language_rejects_a_zero_right_margin_column() {
+        let mut app = app_without_gui();
+        app.new_language_name = "Go".to_string();
+        app.new_language_extension = "go".to_string();
+        app.new_language_command = "gopls".to_string();
+        app.new_language_right_margin_column = "0".to_string();
+
+        app.add_custom_language();
+
+        assert!(app.custom_languages.is_empty());
+        assert!(app.language_settings_error.is_some());
+        // Rejection leaves every draft field untouched, same convention the
+        // required-fields/extension-collision rejections above already use.
+        assert_eq!(app.new_language_right_margin_column, "0");
+        assert_eq!(app.new_language_name, "Go");
+    }
+
+    #[test]
+    fn add_custom_language_rejects_a_non_numeric_right_margin_column() {
+        let mut app = app_without_gui();
+        app.new_language_name = "Go".to_string();
+        app.new_language_extension = "go".to_string();
+        app.new_language_command = "gopls".to_string();
+        app.new_language_right_margin_column = "not-a-number".to_string();
+
+        app.add_custom_language();
+
+        assert!(app.custom_languages.is_empty());
+        assert!(app.language_settings_error.is_some());
     }
 
     #[test]
