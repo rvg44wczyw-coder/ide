@@ -862,6 +862,23 @@ fn parse_date_bound(text: &str, end_of_day: bool) -> Result<Option<i64>, String>
     else {
         return Err(invalid());
     };
+    // Enforce the `YYYY-MM-DD` format's own implied widths -- not just
+    // "parses as an integer" -- *before* parsing. A bare integer check let
+    // a year like `9223372036854775807` (near `i64::MAX`) through, which
+    // overflowed the arithmetic below into a panic in dev-profile builds
+    // (`docs/security-findings/git-log-viewer-ui-2026-09-02.md`, finding
+    // 1). Fixing the width up front keeps every representable year within
+    // `0..=9999`, closing the whole overflow class rather than adding a
+    // checked-arithmetic patch at just this one call site (`days_from_civil`
+    // has its own internal multiplications that would need the same
+    // treatment otherwise).
+    let is_ascii_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return Err(invalid());
+    }
+    if !is_ascii_digits(y) || !is_ascii_digits(m) || !is_ascii_digits(d) {
+        return Err(invalid());
+    }
     let year: i64 = y.parse().map_err(|_| invalid())?;
     let month: u32 = m.parse().map_err(|_| invalid())?;
     let day: u32 = d.parse().map_err(|_| invalid())?;
@@ -1395,6 +1412,30 @@ mod tests {
         assert!(parse_date_bound("2026-02-29", false).is_err());
         assert!(parse_date_bound("2026-04-31", false).is_err());
         assert!(parse_date_bound("2026-01-00", false).is_err());
+    }
+
+    #[test]
+    fn parse_date_bound_rejects_a_year_near_i64_max_instead_of_overflowing() {
+        // `docs/security-findings/git-log-viewer-ui-2026-09-02.md` finding
+        // 1: this used to overflow `days_from_civil`'s arithmetic and
+        // panic in dev-profile builds. Must now be a plain parse error.
+        assert!(parse_date_bound("9223372036854775807-01-01", false).is_err());
+        assert!(parse_date_bound("9223372036854775807-02-28", false).is_err());
+        assert!(parse_date_bound("18446744073709551615-01-01", false).is_err());
+    }
+
+    #[test]
+    fn parse_date_bound_requires_the_exact_yyyy_mm_dd_widths() {
+        // Not just "parses as an integer" -- widths matching the format
+        // the field's own label advertises, which is also what keeps
+        // `year` bounded to `0..=9999` (see the finding above).
+        assert!(parse_date_bound("26-01-01", false).is_err()); // 2-digit year
+        assert!(parse_date_bound("02026-01-01", false).is_err()); // 5-digit year
+        assert!(parse_date_bound("2026-1-01", false).is_err()); // 1-digit month
+        assert!(parse_date_bound("2026-01-1", false).is_err()); // 1-digit day
+        assert!(parse_date_bound("2026-001-01", false).is_err()); // 3-digit month
+        assert!(parse_date_bound("+026-01-01", false).is_err()); // sign, not a digit
+        assert!(parse_date_bound("2026-01-01", false).is_ok()); // still accepted
     }
 
     #[test]
