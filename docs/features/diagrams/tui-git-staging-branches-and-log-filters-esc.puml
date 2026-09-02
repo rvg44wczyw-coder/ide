@@ -1,0 +1,49 @@
+@startuml tui-git-staging-branches-and-log-filters-esc
+title Esc precedence inside the Git Panel overlay (T28)
+skinparam state {
+  BackgroundColor White
+  BorderColor Black
+}
+
+state "Git Panel open" as open {
+  state "Discard confirm pending" as discard
+  state "Branch delete pending" as delete
+  state "Typing new branch name" as newbranch
+  state "Branches popup open" as branches
+  state "Resolving a conflict" as conflict
+  state "Viewing file history (Graph focus)" as filehistory
+  state "Ordinary browsing" as browsing
+}
+
+[*] --> browsing
+
+browsing --> discard : x on an\nunstaged row
+discard --> browsing : Esc / n\n(cancel_discard)
+
+browsing --> branches : b
+branches --> newbranch : n
+newbranch --> branches : Esc\n(discard typed name)
+branches --> delete : d (not is_head)
+delete --> branches : Esc\n(cancel_delete_branch)
+branches --> browsing : Esc\n(close_branches_popup)
+
+browsing --> conflict : Enter on a\nConflicts row
+conflict --> browsing : Esc\n(cancel_conflict)
+
+browsing --> filehistory : ShowFileHistory command
+filehistory --> browsing : Esc\n(back_to_log)
+
+browsing --> [*] : Esc\n(close whole overlay)
+
+note bottom of open
+  Esc checked in this order (first match wins):
+  1. pending_discard
+  2. branches_popup.pending_delete
+  3. branches_popup.show_new_branch_input
+  4. branches_popup.open
+  5. active_conflict / binary_conflict
+  6. log_filter.viewing_file_history (Graph focus)
+  7. otherwise: close the overlay
+end note
+
+@enduml
