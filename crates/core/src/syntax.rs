@@ -1143,6 +1143,612 @@ pub const GITIGNORE: SyntaxRules = SyntaxRules {
     indent_line_suffixes: &[],
 };
 
+pub const RUBY: SyntaxRules = SyntaxRules {
+    name: "Ruby",
+    extensions: &["rb"],
+    line_comment_prefixes: &["#"],
+    // Only valid at column 0 in real Ruby; the tokenizer has no
+    // column-position awareness, so `x =begin` mid-line also opens one --
+    // see docs/features/syntax-highlighting-lsp-parity.md §3.
+    block_comment: Some(("=begin", "=end")),
+    string_quotes: &['"', '\''],
+    keywords: &[
+        "alias", "and", "begin", "break", "case", "class", "def", "defined?", "do", "else",
+        "elsif", "end", "ensure", "false", "for", "if", "in", "module", "next", "nil", "not", "or",
+        "redo", "rescue", "retry", "return", "self", "super", "then", "true", "undef", "unless",
+        "until", "when", "while", "yield",
+    ],
+    type_keywords: &[],
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';', ':'],
+    operators: &[
+        '=', '<', '>', '+', '-', '*', '/', '%', '!', '|', '&', '^', '.', '?',
+    ],
+    filenames: &[],
+    filename_prefixes: &[],
+    // Line-start only: a mid-line `@foo` read stays plain. See the doc's
+    // cross-cutting limitations note.
+    line_prefix_tokens: &[("@", TokenKind::Macro)],
+    sigil_words: &[],
+    key_separator: None,
+    capitalized_is_type: true,
+    upper_case_is_constant: true,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
+pub const PHP: SyntaxRules = SyntaxRules {
+    name: "PHP",
+    extensions: &["php"],
+    line_comment_prefixes: &["//", "#"],
+    block_comment: Some(("/*", "*/")),
+    string_quotes: &['"', '\''],
+    keywords: &[
+        "abstract",
+        "and",
+        "array",
+        "as",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "clone",
+        "const",
+        "continue",
+        "declare",
+        "default",
+        "do",
+        "echo",
+        "else",
+        "elseif",
+        "enddeclare",
+        "endfor",
+        "endforeach",
+        "endif",
+        "endswitch",
+        "endwhile",
+        "enum",
+        "extends",
+        "final",
+        "finally",
+        "fn",
+        "for",
+        "foreach",
+        "function",
+        "global",
+        "if",
+        "implements",
+        "include",
+        "include_once",
+        "instanceof",
+        "insteadof",
+        "interface",
+        "match",
+        "namespace",
+        "new",
+        "null",
+        "or",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "require",
+        "require_once",
+        "return",
+        "static",
+        "switch",
+        "throw",
+        "trait",
+        "true",
+        "false",
+        "try",
+        "use",
+        "var",
+        "while",
+        "xor",
+        "yield",
+    ],
+    type_keywords: &[
+        "bool", "int", "float", "string", "void", "mixed", "object", "callable", "iterable",
+        "self", "parent",
+    ],
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';', ':'],
+    operators: &[
+        '=', '<', '>', '+', '-', '*', '/', '%', '!', '|', '&', '^', '.', '?',
+    ],
+    filenames: &[],
+    filename_prefixes: &[],
+    line_prefix_tokens: &[],
+    // Colored Constant, matching SHELL's existing "$" -> Constant
+    // convention for the same "$name" shape (see
+    // `TokenKind::Constant`'s own doc comment).
+    sigil_words: &[("$", TokenKind::Constant)],
+    key_separator: None,
+    capitalized_is_type: true,
+    upper_case_is_constant: true,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
+pub const SWIFT: SyntaxRules = SyntaxRules {
+    name: "Swift",
+    extensions: &["swift"],
+    line_comment_prefixes: &["//"],
+    block_comment: Some(("/*", "*/")),
+    string_quotes: &['"'],
+    keywords: &[
+        "associatedtype",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "continue",
+        "default",
+        "defer",
+        "deinit",
+        "do",
+        "else",
+        "enum",
+        "extension",
+        "fallthrough",
+        "false",
+        "fileprivate",
+        "final",
+        "for",
+        "func",
+        "guard",
+        "if",
+        "import",
+        "in",
+        "init",
+        "inout",
+        "internal",
+        "is",
+        "lazy",
+        "let",
+        "mutating",
+        "nil",
+        "open",
+        "operator",
+        "private",
+        "protocol",
+        "public",
+        "repeat",
+        "rethrows",
+        "return",
+        "self",
+        "Self",
+        "static",
+        "struct",
+        "subscript",
+        "super",
+        "switch",
+        "throw",
+        "throws",
+        "true",
+        "try",
+        "typealias",
+        "var",
+        "where",
+        "while",
+    ],
+    type_keywords: &[
+        "Int",
+        "Double",
+        "Float",
+        "Bool",
+        "String",
+        "Character",
+        "Any",
+        "AnyObject",
+        "Void",
+    ],
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';', ':'],
+    operators: &[
+        '=', '<', '>', '+', '-', '*', '/', '%', '!', '|', '&', '^', '.', '?',
+    ],
+    filenames: &[],
+    filename_prefixes: &[],
+    line_prefix_tokens: &[],
+    // Compiler directives (`#available`, `#selector`).
+    sigil_words: &[("#", TokenKind::Macro)],
+    key_separator: None,
+    capitalized_is_type: true,
+    upper_case_is_constant: true,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
+pub const KOTLIN: SyntaxRules = SyntaxRules {
+    name: "Kotlin",
+    extensions: &["kt", "kts"],
+    line_comment_prefixes: &["//"],
+    block_comment: Some(("/*", "*/")),
+    string_quotes: &['"'],
+    keywords: &[
+        "as",
+        "break",
+        "class",
+        "continue",
+        "do",
+        "else",
+        "false",
+        "for",
+        "fun",
+        "if",
+        "in",
+        "interface",
+        "is",
+        "null",
+        "object",
+        "package",
+        "return",
+        "super",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typealias",
+        "typeof",
+        "val",
+        "var",
+        "when",
+        "while",
+        "by",
+        "catch",
+        "constructor",
+        "data",
+        "enum",
+        "finally",
+        "import",
+        "init",
+        "inline",
+        "internal",
+        "override",
+        "private",
+        "protected",
+        "public",
+        "sealed",
+        "suspend",
+    ],
+    type_keywords: &[
+        "Int", "Long", "Double", "Float", "Boolean", "Char", "String", "Unit", "Any", "Nothing",
+    ],
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';', ':'],
+    operators: &[
+        '=', '<', '>', '+', '-', '*', '/', '%', '!', '|', '&', '^', '.', '?',
+    ],
+    filenames: &[],
+    filename_prefixes: &[],
+    // Line-start only: an annotation on the same line as code stays
+    // plain. See the doc's cross-cutting limitations note.
+    line_prefix_tokens: &[("@", TokenKind::Macro)],
+    sigil_words: &[],
+    key_separator: None,
+    capitalized_is_type: true,
+    upper_case_is_constant: true,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
+pub const LUA: SyntaxRules = SyntaxRules {
+    name: "Lua",
+    extensions: &["lua"],
+    line_comment_prefixes: &["--"],
+    // Not `Some(("--[[", "]]"))`: `tokenize_span` checks line comments
+    // before block comments, and "--[[" starts with "--", so the line
+    // rule would always win and a real multi-line block comment would
+    // break after its first line. See
+    // docs/features/syntax-highlighting-lsp-parity.md §3.
+    block_comment: None,
+    string_quotes: &['"', '\''],
+    keywords: &[
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if",
+        "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+    ],
+    type_keywords: &[],
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';', ':'],
+    operators: &['=', '<', '>', '+', '-', '*', '/', '%', '~', '#', '.'],
+    filenames: &[],
+    filename_prefixes: &[],
+    line_prefix_tokens: &[],
+    sigil_words: &[],
+    key_separator: None,
+    // Lua has no capitalization convention for types -- turning this on
+    // would just color arbitrary capitalized identifiers.
+    capitalized_is_type: false,
+    upper_case_is_constant: true,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
+pub const ZIG: SyntaxRules = SyntaxRules {
+    name: "Zig",
+    extensions: &["zig"],
+    line_comment_prefixes: &["//"],
+    // Zig has no block-comment syntax at all.
+    block_comment: None,
+    string_quotes: &['"'],
+    keywords: &[
+        "align",
+        "allowzero",
+        "and",
+        "anyframe",
+        "anytype",
+        "asm",
+        "async",
+        "await",
+        "break",
+        "callconv",
+        "catch",
+        "comptime",
+        "const",
+        "continue",
+        "defer",
+        "else",
+        "enum",
+        "errdefer",
+        "error",
+        "export",
+        "extern",
+        "fn",
+        "for",
+        "if",
+        "inline",
+        "noalias",
+        "noinline",
+        "nosuspend",
+        "opaque",
+        "or",
+        "orelse",
+        "packed",
+        "pub",
+        "resume",
+        "return",
+        "linksection",
+        "struct",
+        "suspend",
+        "switch",
+        "test",
+        "threadlocal",
+        "try",
+        "union",
+        "unreachable",
+        "usingnamespace",
+        "var",
+        "volatile",
+        "while",
+        "true",
+        "false",
+        "null",
+        "undefined",
+    ],
+    type_keywords: &[
+        "bool", "void", "type", "anyerror", "u8", "u16", "u32", "u64", "u128", "usize", "i8",
+        "i16", "i32", "i64", "i128", "isize", "f16", "f32", "f64", "f128",
+    ],
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';', ':'],
+    operators: &[
+        '=', '<', '>', '+', '-', '*', '/', '%', '!', '|', '&', '^', '.', '?',
+    ],
+    filenames: &[],
+    filename_prefixes: &[],
+    line_prefix_tokens: &[],
+    // Builtins (`@import`, `@as`) are always "@" plus an identifier.
+    sigil_words: &[("@", TokenKind::Macro)],
+    key_separator: None,
+    capitalized_is_type: true,
+    upper_case_is_constant: true,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
+pub const HASKELL: SyntaxRules = SyntaxRules {
+    name: "Haskell",
+    extensions: &["hs", "lhs"],
+    line_comment_prefixes: &["--"],
+    block_comment: Some(("{-", "-}")),
+    // '\'' excluded: Haskell overloads it for both character literals and
+    // trailing identifier characters (`x'`, `n'`) -- the same "ambiguous,
+    // excluded" call as Rust's lifetime `'`.
+    string_quotes: &['"'],
+    keywords: &[
+        "case", "class", "data", "default", "deriving", "do", "else", "foreign", "if", "import",
+        "in", "infix", "infixl", "infixr", "instance", "let", "module", "newtype", "of", "then",
+        "type", "where",
+    ],
+    type_keywords: &[
+        "Int", "Integer", "Float", "Double", "Bool", "Char", "String", "IO", "Maybe", "Either",
+    ],
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';'],
+    operators: &[
+        '=', '<', '>', '+', '-', '*', '/', '!', '|', '&', '.', '$', ':', '\\',
+    ],
+    filenames: &[],
+    filename_prefixes: &[],
+    line_prefix_tokens: &[],
+    sigil_words: &[],
+    key_separator: None,
+    capitalized_is_type: true,
+    // Haskell's SCREAMING_SNAKE_CASE constant convention is far weaker
+    // than C-family languages' -- top-level constants are ordinary
+    // camelCase bindings.
+    upper_case_is_constant: false,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
+pub const ELIXIR: SyntaxRules = SyntaxRules {
+    name: "Elixir",
+    extensions: &["ex", "exs"],
+    line_comment_prefixes: &["#"],
+    // Elixir has no block-comment syntax.
+    block_comment: None,
+    string_quotes: &['"', '\''],
+    keywords: &[
+        "after",
+        "alias",
+        "and",
+        "case",
+        "catch",
+        "cond",
+        "def",
+        "defexception",
+        "defguard",
+        "defimpl",
+        "defmacro",
+        "defmodule",
+        "defp",
+        "defprotocol",
+        "defstruct",
+        "do",
+        "else",
+        "end",
+        "false",
+        "fn",
+        "for",
+        "if",
+        "import",
+        "in",
+        "nil",
+        "not",
+        "or",
+        "quote",
+        "raise",
+        "receive",
+        "require",
+        "rescue",
+        "true",
+        "try",
+        "unless",
+        "unquote",
+        "use",
+        "when",
+        "with",
+    ],
+    type_keywords: &[],
+    // ':' must stay here (not just reachable via sigil_words): a ':' not
+    // immediately followed by an identifier (`do:`) needs somewhere to
+    // land, per docs/features/syntax-highlighting-lsp-parity.md §3.
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';', ':'],
+    operators: &['=', '<', '>', '+', '-', '*', '/', '!', '|', '&', '.', '^'],
+    filenames: &[],
+    filename_prefixes: &[],
+    line_prefix_tokens: &[],
+    // Module attributes (`@moduledoc`) and `:atom` literals. Neither
+    // prefix is a prefix of the other, so order doesn't matter here.
+    sigil_words: &[("@", TokenKind::Macro), (":", TokenKind::Type)],
+    key_separator: None,
+    capitalized_is_type: true,
+    upper_case_is_constant: true,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
+pub const DART: SyntaxRules = SyntaxRules {
+    name: "Dart",
+    extensions: &["dart"],
+    line_comment_prefixes: &["//"],
+    block_comment: Some(("/*", "*/")),
+    string_quotes: &['"', '\''],
+    keywords: &[
+        "abstract",
+        "as",
+        "assert",
+        "async",
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "default",
+        "deferred",
+        "do",
+        "dynamic",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "extension",
+        "factory",
+        "false",
+        "final",
+        "finally",
+        "for",
+        "function",
+        "get",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "interface",
+        "is",
+        "late",
+        "library",
+        "mixin",
+        "new",
+        "null",
+        "on",
+        "operator",
+        "part",
+        "required",
+        "rethrow",
+        "return",
+        "set",
+        "static",
+        "super",
+        "switch",
+        "sync",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typedef",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    ],
+    type_keywords: &[
+        "int", "double", "num", "bool", "String", "Object", "List", "Map", "Set", "Future",
+    ],
+    punctuation: &['(', ')', '[', ']', '{', '}', ',', ';', ':'],
+    operators: &[
+        '=', '<', '>', '+', '-', '*', '/', '%', '!', '|', '&', '^', '.', '?',
+    ],
+    filenames: &[],
+    filename_prefixes: &[],
+    // Line-start only: an annotation on the same line as code stays
+    // plain. See the doc's cross-cutting limitations note.
+    line_prefix_tokens: &[("@", TokenKind::Macro)],
+    sigil_words: &[],
+    key_separator: None,
+    capitalized_is_type: true,
+    upper_case_is_constant: true,
+    macro_bang: false,
+    attribute_names: false,
+    brackets: &[('{', '}'), ('(', ')'), ('[', ']')],
+    indent_line_suffixes: &[],
+};
+
 /// Every built-in language, in lookup order -- the single list both
 /// `syntax_for_path` and `syntax_for_extension` iterate, so adding a
 /// language never leaves one of them stale.
@@ -1167,6 +1773,15 @@ const BUILTINS: &[&SyntaxRules] = &[
     &MARKDOWN,
     &XML,
     &GITIGNORE,
+    &RUBY,
+    &PHP,
+    &SWIFT,
+    &KOTLIN,
+    &LUA,
+    &ZIG,
+    &HASKELL,
+    &ELIXIR,
+    &DART,
 ];
 
 /// Above this size, `tokenize` returns `Vec::new()` immediately without
@@ -2508,6 +3123,114 @@ mod tests {
                 syntax_for_path(Path::new(path)).unwrap_or_else(|| panic!("{path} should resolve"));
             assert_eq!(rules.name, expected, "for {path}");
         }
+    }
+
+    #[test]
+    fn syntax_for_path_resolves_every_lsp_parity_language() {
+        for (path, expected) in [
+            ("app.rb", "Ruby"),
+            ("index.php", "PHP"),
+            ("main.swift", "Swift"),
+            ("Main.kt", "Kotlin"),
+            ("build.gradle.kts", "Kotlin"),
+            ("init.lua", "Lua"),
+            ("main.zig", "Zig"),
+            ("Main.hs", "Haskell"),
+            ("Doc.lhs", "Haskell"),
+            ("lib/app.ex", "Elixir"),
+            ("mix.exs", "Elixir"),
+            ("main.dart", "Dart"),
+        ] {
+            let rules =
+                syntax_for_path(Path::new(path)).unwrap_or_else(|| panic!("{path} should resolve"));
+            assert_eq!(rules.name, expected, "for {path}");
+        }
+    }
+
+    #[test]
+    fn ruby_worked_example_matches_doc() {
+        let text = "def greet(name)\n  puts \"hi\"\n  # done\nend\n";
+        assert_eq!(
+            tokenize(text, &RUBY),
+            vec![
+                tok(0..3, TokenKind::Keyword),
+                tok(4..9, TokenKind::Function),
+                tok(9..10, TokenKind::Punctuation),
+                tok(14..15, TokenKind::Punctuation),
+                tok(23..27, TokenKind::String),
+                tok(30..36, TokenKind::Comment),
+                tok(37..40, TokenKind::Keyword),
+            ]
+        );
+    }
+
+    #[test]
+    fn php_worked_example_matches_doc() {
+        let text = "function greet($name) {\n    return $name;\n}\n";
+        assert_eq!(
+            tokenize(text, &PHP),
+            vec![
+                tok(0..8, TokenKind::Keyword),
+                tok(9..14, TokenKind::Function),
+                tok(14..15, TokenKind::Punctuation),
+                tok(15..20, TokenKind::Constant),
+                tok(20..21, TokenKind::Punctuation),
+                tok(22..23, TokenKind::Punctuation),
+                tok(28..34, TokenKind::Keyword),
+                tok(35..40, TokenKind::Constant),
+                tok(40..41, TokenKind::Punctuation),
+                tok(42..43, TokenKind::Punctuation),
+            ]
+        );
+    }
+
+    #[test]
+    fn zig_worked_example_matches_doc() {
+        let text = "const std = @import(\"std\");\n";
+        assert_eq!(
+            tokenize(text, &ZIG),
+            vec![
+                tok(0..5, TokenKind::Keyword),
+                tok(10..11, TokenKind::Operator),
+                tok(12..19, TokenKind::Macro),
+                tok(19..20, TokenKind::Punctuation),
+                tok(20..25, TokenKind::String),
+                tok(25..26, TokenKind::Punctuation),
+                tok(26..27, TokenKind::Punctuation),
+            ]
+        );
+    }
+
+    #[test]
+    fn elixir_worked_example_matches_doc() {
+        let text = "def run(opts), do: :ok\n";
+        assert_eq!(
+            tokenize(text, &ELIXIR),
+            vec![
+                tok(0..3, TokenKind::Keyword),
+                tok(4..7, TokenKind::Function),
+                tok(7..8, TokenKind::Punctuation),
+                tok(12..13, TokenKind::Punctuation),
+                tok(13..14, TokenKind::Punctuation),
+                tok(15..17, TokenKind::Keyword),
+                tok(17..18, TokenKind::Punctuation),
+                tok(19..22, TokenKind::Type),
+            ]
+        );
+    }
+
+    #[test]
+    fn lua_worked_example_matches_doc() {
+        let text = "-- setup\nlocal x = 42\n";
+        assert_eq!(
+            tokenize(text, &LUA),
+            vec![
+                tok(0..8, TokenKind::Comment),
+                tok(9..14, TokenKind::Keyword),
+                tok(17..18, TokenKind::Operator),
+                tok(19..21, TokenKind::Number),
+            ]
+        );
     }
 
     #[test]
