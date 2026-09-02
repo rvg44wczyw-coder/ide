@@ -57,7 +57,7 @@ where
 /// via `Command::new` with no shell -- `args` (`docs/features/
 /// language-server-arguments.md`) is a real argv passed to it via
 /// `.args()`, never concatenated into a shell string.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LanguageConfig {
     pub name: String,
     /// No leading `.` — e.g. `"go"`, not `".go"`. The *primary* extension
@@ -86,6 +86,19 @@ pub struct LanguageConfig {
     /// `LANGUAGE_MARKERS` entries that need it.
     #[serde(default, deserialize_with = "deserialize_bounded_string_vec")]
     pub extra_extensions: Vec<String>,
+    /// Debug adapter program, analogous to `command` for the language
+    /// server (`docs/features/debugger.md` §2.2). `None`, or a
+    /// whitespace-only string, means "no debugger configured for this
+    /// language" -- `debug_adapter()` is the one call site that checks.
+    /// `#[serde(default)]` for the same backward-compatibility reason as
+    /// `args`: a `custom_languages` entry persisted before this field
+    /// existed still deserializes, with no debug adapter configured.
+    #[serde(default)]
+    pub debug_adapter_command: Option<String>,
+    /// Argv for `debug_adapter_command`, same bounded-deserialize
+    /// treatment as `args`.
+    #[serde(default, deserialize_with = "deserialize_bounded_string_vec")]
+    pub debug_adapter_args: Vec<String>,
 }
 
 impl LanguageConfig {
@@ -100,7 +113,20 @@ impl LanguageConfig {
             command: "rust-analyzer".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         }
+    }
+
+    /// `None` when no debug adapter is configured for this language
+    /// (`debug_adapter_command` is `None`, or trims to empty) -- the one
+    /// call site `ide-ui` uses to decide whether "Debug" is enabled for
+    /// the active file's language (`docs/features/debugger.md` §2.2).
+    pub fn debug_adapter(&self) -> Option<(&str, &[String])> {
+        let command = self.debug_adapter_command.as_deref()?.trim();
+        if command.is_empty() {
+            return None;
+        }
+        Some((command, self.debug_adapter_args.as_slice()))
     }
 }
 
@@ -329,6 +355,7 @@ pub fn detect_language_suggestions(project_root: &Path) -> Vec<LanguageSuggestio
                         .map(|s| s.replace("{project_root}", &root))
                         .collect(),
                     extra_extensions: m.extra_extensions.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
                 },
             })
         })
@@ -447,6 +474,7 @@ mod tests {
             command: "gopls".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -465,6 +493,62 @@ mod tests {
             serde_json::from_str(r#"{"name":"Go","extension":"go","command":"gopls"}"#).unwrap();
         assert!(config.args.is_empty());
         assert!(config.extra_extensions.is_empty());
+    }
+
+    #[test]
+    fn language_config_deserializes_with_no_debug_adapter_keys_present() {
+        // Old-shape JSON, persisted before F5a's fields existed at all.
+        let json = r#"{"name":"Go","extension":"go","command":"gopls"}"#;
+        let config: LanguageConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.debug_adapter_command, None);
+        assert!(config.debug_adapter_args.is_empty());
+        assert_eq!(config.debug_adapter(), None);
+    }
+
+    #[test]
+    fn language_config_round_trips_with_debug_adapter() {
+        let config = LanguageConfig {
+            name: "Rust".to_string(),
+            extension: "rs".to_string(),
+            command: "rust-analyzer".to_string(),
+            debug_adapter_command: Some("codelldb".to_string()),
+            debug_adapter_args: vec!["--port".to_string(), "0".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let reloaded: LanguageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded, config);
+    }
+
+    #[test]
+    fn debug_adapter_is_none_when_no_command_is_configured() {
+        let config = go_config();
+        assert_eq!(config.debug_adapter(), None);
+    }
+
+    #[test]
+    fn debug_adapter_is_none_when_command_is_only_whitespace() {
+        let config = LanguageConfig {
+            debug_adapter_command: Some("   ".to_string()),
+            ..go_config()
+        };
+        assert_eq!(config.debug_adapter(), None);
+    }
+
+    #[test]
+    fn debug_adapter_returns_trimmed_command_and_args() {
+        let config = LanguageConfig {
+            debug_adapter_command: Some("  codelldb  ".to_string()),
+            debug_adapter_args: vec!["--port".to_string(), "0".to_string()],
+            ..go_config()
+        };
+        assert_eq!(
+            config.debug_adapter(),
+            Some((
+                "codelldb",
+                ["--port".to_string(), "0".to_string()].as_slice()
+            ))
+        );
     }
 
     #[test]
@@ -571,6 +655,7 @@ mod tests {
             command: "gopls-a".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         };
         let go_b = LanguageConfig {
             name: "Go B".to_string(),
@@ -578,6 +663,7 @@ mod tests {
             command: "gopls-b".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         };
         let detected = detect_language(&tree, &[go_a.clone(), go_b]).unwrap();
         assert_eq!(detected, go_a);
@@ -841,6 +927,7 @@ mod tests {
             command: "typescript-language-server".to_string(),
             args: vec!["--stdio".to_string()],
             extra_extensions: Vec::new(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let reloaded: LanguageConfig = serde_json::from_str(&json).unwrap();
@@ -867,6 +954,7 @@ mod tests {
             command: "clangd".to_string(),
             args: Vec::new(),
             extra_extensions: vec!["c".to_string(), "h".to_string()],
+            ..Default::default()
         };
         let detected = detect_language(&tree, std::slice::from_ref(&cpp)).unwrap();
         assert_eq!(detected, cpp);
@@ -992,6 +1080,7 @@ mod tests {
             command: "sourcekit-lsp".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1002,6 +1091,7 @@ mod tests {
             command: "kotlin-language-server".to_string(),
             args: Vec::new(),
             extra_extensions: vec!["kts".to_string()],
+            ..Default::default()
         }
     }
 
@@ -1073,6 +1163,7 @@ mod tests {
             command: "evil-rust-analyzer".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(
             detect_active_languages(&tree, &[fake_rust]),
@@ -1093,6 +1184,7 @@ mod tests {
             command: "gopls-b".to_string(),
             args: Vec::new(),
             extra_extensions: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(
             detect_active_languages(&tree, &[go_config(), go_b]),
@@ -1114,6 +1206,7 @@ mod tests {
                 command: "some-lsp".to_string(),
                 args: Vec::new(),
                 extra_extensions: Vec::new(),
+                ..Default::default()
             });
         }
         let project = Project::open(dir.path()).unwrap();
@@ -1141,6 +1234,7 @@ mod tests {
             command: "clangd".to_string(),
             args: Vec::new(),
             extra_extensions: vec!["c".to_string(), "h".to_string()],
+            ..Default::default()
         };
         let active = vec![cpp];
         assert_eq!(
