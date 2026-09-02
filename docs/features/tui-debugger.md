@@ -95,6 +95,13 @@ pub struct App {
     /// "Configure Debug Adapter" popup state -- presence is visibility,
     /// same convention every other popup in this crate follows.
     pub(crate) debug_adapter_config_popup: Option<DebugAdapterConfigPopupState>,
+    /// The Debug tool window's transient browsing cursor (§2.6) --
+    /// implementation detail this section's own keyboard-navigation spec
+    /// requires but doesn't name a field for; resets to `default()` every
+    /// time `ToggleDebugPanel` opens the panel, the same "transient
+    /// overlay cursor" role `GitPanelState` already plays relative to
+    /// `App::git`.
+    pub(crate) debug_panel: DebugPanelState,
 }
 
 /// `docs/features/tui-debugger.md` §2.2 -- the two-field popup
@@ -112,6 +119,28 @@ pub(crate) struct DebugAdapterConfigPopupState {
 pub(crate) enum DebugConfigField {
     Command,
     Args,
+}
+
+/// Which of §2.6's three sections currently has keyboard focus --
+/// `Tab`/`Shift+Tab` cycles, mirroring `GitPanelFocus`'s own cycle
+/// convention.
+pub(crate) enum DebugPanelFocus {
+    Threads,
+    Stack,
+    Output,
+}
+
+#[derive(Default)]
+pub(crate) struct DebugPanelState {
+    pub(crate) focus: DebugPanelFocus,
+    pub(crate) thread_selected: usize,
+    pub(crate) stack_selected: usize,
+    /// Lines held back from the output log's tail -- `0` means "following
+    /// the latest output" (the default); `Up`/`PageUp` in the Output
+    /// section increase it (reveals older lines), `Down`/`PageDown`
+    /// decrease it back toward the tail. `PageUp`/`PageDown` are no-ops
+    /// unless the Output section has focus.
+    pub(crate) output_scroll: u16,
 }
 ```
 
@@ -272,9 +301,12 @@ editor only, not arbitrary panel chrome):
   `DebugPanel::select_thread`.
 - **Stack** (middle, for `self.debug.selected_thread`): `Up`/`Down` moves
   selection, `Enter` on a frame with `source: Some(path)` navigates there
-  via the existing `pending_cursor_offset`/`open_or_focus_tab` path (same
-  "jump to frame" mechanism `ide-ui`'s click-a-frame does); a frame with
-  `source: None` is shown but `Enter` no-ops on it.
+  via the existing `open_location` path (`ide-tui` has no `pending_cursor_
+  offset` field the way `ide-ui` does — `open_location` is this crate's own
+  "open a file and place the cursor at a position" entry point, already
+  used by Goto/Find Usages; same 1-based-to-0-based DAP line/column
+  conversion `ide-ui`'s `open_stack_frame` does before handing off); a
+  frame with `source: None` is shown but `Enter` no-ops on it.
 - **Output** (bottom): read-only scrolling log, `PageUp`/`PageDown` or the
   mouse wheel (already generic per-popup routing from
   `tui-mouse-support.md` §3.3 — no new wheel-handling code needed, the
@@ -475,7 +507,7 @@ enabled from the first frame — no need to repeat step 2.
 - `crates/tui/src/ui.rs` — `render_editor` computes the two new slices per
   frame (§2.4); new Debug tool window rendering (§2.6); new "Debug"/
   "Configure Debug Adapter" popup rendering (§2.5).
-- `crates/tui/src/commands.rs` — 9 new commands (§2.7).
+- `crates/tui/src/commands.rs` — 10 new commands (§2.7).
 - **Security-sensitive** (new declarations, `CLAUDE.md` gains both this and
   the pre-existing gap below): `crates/tui/src/debug_panel.rs` is
   security-sensitive by the exact reasoning `debugger.md` §6 already gave
