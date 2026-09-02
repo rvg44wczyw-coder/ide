@@ -98,8 +98,8 @@ on `event.kind`:
 No new public fields are added to `App`; the click/scroll handlers reuse
 existing state (`TreeState::move_selection`, `OpenBuffer.scroll`,
 `GitPanelState.diff_scroll`, each popup's own `selected: usize`) exactly as
-the keyboard handlers already do, with two exceptions — the editor's and
-the git diff view's caret-independent wheel scroll, §3.3.
+the keyboard handlers already do, with one exception — the editor's
+caret-independent wheel scroll, §3.3.
 
 ## 3. Behaviour
 
@@ -172,20 +172,26 @@ A click inside `hits.editor_text_area`:
    logic this feature adds.
 3. Resolves `(line, column)` to a byte offset via the existing
    `editor::offset_for_line_column`.
-4. Places the caret there using the exact idiom already used by every
-   other "jump to a location" call site in this crate (`open_location`,
-   `open_search_result`, `jump_to_match`):
+4. Places the caret there — **without** the `scroll_to_and_reveal` top-
+   align step `open_location`/`open_search_result`/`jump_to_match` use:
 
    ```rust
-   Self::scroll_to_and_reveal(buf, line);
    buf.desired_column = None;
    buf.buffer.text_buffer_mut()
        .set_selections(Selections::single(Selection::caret(offset)));
    ```
 
-   This collapses any existing selection to the clicked point (standard
-   click-to-place-caret behaviour) and clears the sticky column tracker,
-   matching how every existing jump already behaves.
+   This still collapses any existing selection to the clicked point and
+   clears the sticky column tracker, matching how every existing jump
+   already behaves for the caret/selection itself. It deliberately omits
+   the scroll adjustment those three call sites need: their target line
+   may not be visible yet (a cross-file jump), so they top-align
+   `buf.scroll` to it; a click's target line is, by construction, already
+   inside `text_area`'s currently-rendered `visible_start..visible_end`
+   range (step 1 above derived it from exactly that row), so it cannot
+   need scrolling — calling `scroll_to_and_reveal` here would instead
+   introduce a bug, jerking the view so the clicked line jumps to the very
+   top row.
 5. Sets `Focus::Editor`.
 
 No click-drag text selection is implemented (§4) — only a single-point
@@ -236,7 +242,7 @@ Routing depends on whether a popup is currently open:
     caret (confirmed: every existing write to `OpenBuffer.scroll` is
     inside caret-follow helpers — `scroll_to_keep_visible`,
     `scroll_to_and_reveal`, `reveal_and_sync_scroll` — there is no
-    "scroll without moving caret" command to reuse). This is the one
+    "scroll without moving caret" command to reuse). This is the **one**
     place this feature adds a genuinely new small primitive: directly
     adjust `buf.scroll` by ±1 per notch (`saturating_add`/
     `saturating_sub`), clamped to the buffer's line count, touching
@@ -245,11 +251,16 @@ Routing depends on whether a popup is currently open:
     "reuse existing state and actions, don't invent new ones" approach
     elsewhere — the state (`buf.scroll`) already exists, only this
     caret-independent access path is new.
-  - Over the git panel's diff view (`GitPanelFocus::Diff`): adjusts
-    `diff_scroll` by ±1 per notch directly (same rationale as the
-    editor — `diff_scroll` already exists but has no non-focus-changing
-    keyboard equivalent when the git panel isn't focused).
   - Outside every known rect: no-op.
+
+  Note the git panel's diff view is deliberately **not** listed here: the
+  git panel is itself one of the "a popup is open" states above
+  (`app.git_panel.is_some()`) — wheel scroll over it never reaches this
+  "no popup" branch at all. Its existing `KeyCode::Up`/`Down` handler
+  already adjusts `diff_scroll` directly when `GitPanelFocus::Diff`
+  (`app.rs`'s `handle_git_panel_key`), so the popup-branch's synthetic-key
+  mechanism covers it with zero new code, the same as every other popup —
+  it is not a second instance of the editor's new-primitive exception.
 
 ## 4. Constraints & invariants
 
@@ -344,3 +355,25 @@ User scrolls wheel down 3 notches while the Problems popup is open.
 ## 7. Diagram
 
 ![Mouse event routing](diagrams/tui-mouse-support-routing.png)
+
+## Revision notes
+
+Two implementation-discovered corrections, made by `rust-tui-dev` while
+implementing against the approved doc (self-review, same category as
+several `docs/roadmap.md` `T`-phase entries' own "self-review found and
+fixed N bugs" notes):
+
+1. **§3.2.3 editor click**: dropped the `scroll_to_and_reveal` call from
+   the click idiom. That helper top-aligns `buf.scroll` to its target
+   line, correct for `open_location`/`open_search_result`/`jump_to_match`
+   (whose target may be off-screen) but wrong for a click, whose target
+   line is by construction already visible — calling it would have
+   jerked the view so the clicked line jumped to the top row.
+2. **§3.3 git panel wheel scroll**: removed the "no popup is open" sub
+   -bullet describing a new `diff_scroll` primitive. The git panel is
+   itself one of the "a popup is open" states, so its wheel scroll never
+   reaches that branch; its existing `KeyCode::Up`/`Down` handler already
+   adjusts `diff_scroll` directly under `GitPanelFocus::Diff`, so the
+   popup branch's synthetic-key mechanism covers it for free. This also
+   corrected §2.3's exception count from two to one — only the editor's
+   `buf.scroll` needed new code.

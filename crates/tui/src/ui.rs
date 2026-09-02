@@ -48,7 +48,25 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// tui-scroll-follows-cursor.md` §2.1).
 pub const EDITOR_CHROME_ROWS: u16 = 4;
 
-pub fn render(frame: &mut Frame, app: &App) {
+/// Click/wheel hit-test targets from the most recently rendered frame
+/// (`docs/features/tui-mouse-support.md` §2.2) -- rebuilt from scratch by
+/// every [`render`] call, so a rect is `None`/absent whenever that panel
+/// wasn't drawn this frame. `App::handle_mouse` reads whatever the
+/// *previous* frame populated here (one-frame lag), the same latency this
+/// crate's existing scroll-follow/resize handling already accepts.
+#[derive(Default)]
+pub struct HitMap {
+    pub tree_area: Option<Rect>,
+    pub editor_text_area: Option<Rect>,
+    pub tab_strip: Vec<(Rect, usize)>,
+}
+
+/// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
+/// before mouse support; `hits` is a separate out-parameter (not a return
+/// value, since `Terminal::draw`'s render closure's return value isn't
+/// propagated to the caller), populated fresh every call.
+pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
+    *hits = HitMap::default();
     let size = frame.area();
     let rows = Layout::default()
         .direction(LayoutDirection::Vertical)
@@ -62,8 +80,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(body);
 
-    render_tree(frame, app, columns[0]);
-    render_editor(frame, app, columns[1]);
+    render_tree(frame, app, columns[0], hits);
+    render_editor(frame, app, columns[1], hits);
     render_status(frame, app, status_area);
 
     if app.palette.is_some() {
@@ -154,7 +172,7 @@ pub(crate) fn claude_terminal_grid_size(term_width: u16, term_height: u16) -> (u
     (grid_rows, inner_width)
 }
 
-fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
+fn render_tree(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let rows = app.tree_state.visible_rows(&app.tree);
     let selected_path = app.tree_state.selected_row(&rows).map(|r| r.path.clone());
 
@@ -192,10 +210,11 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title("Project")
         .border_style(focus_style(app, Focus::Tree));
+    hits.tree_area = Some(block.inner(area));
     frame.render_widget(List::new(items).block(block), area);
 }
 
-fn render_editor(frame: &mut Frame, app: &App, area: Rect) {
+fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let title = app
         .active_buffer()
         .map(|b| b.path.display().to_string())
@@ -218,7 +237,8 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect) {
     let strip_area = sections[0];
     let text_area = sections[1];
 
-    render_tab_strip(frame, app, strip_area);
+    render_tab_strip(frame, app, strip_area, hits);
+    hits.editor_text_area = Some(text_area);
 
     let Some(buf) = app.active_buffer() else {
         let paragraph = Paragraph::new("No file open -- select one from the tree");
@@ -332,11 +352,13 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect) {
+fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let mut spans = Vec::new();
+    let mut column = area.x;
     for (i, tab) in app.tabs.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
+            column += 2;
         }
         let name = tab
             .path
@@ -354,7 +376,19 @@ fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default()
         };
-        spans.push(Span::styled(format!("{name}{dirty}{external}"), style));
+        let text = format!("{name}{dirty}{external}");
+        let width = Span::raw(text.as_str()).width() as u16;
+        hits.tab_strip.push((
+            Rect {
+                x: column,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            i,
+        ));
+        column += width;
+        spans.push(Span::styled(text, style));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

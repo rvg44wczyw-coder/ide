@@ -87,6 +87,16 @@ impl TreeState {
     pub fn selected_row<'a>(&self, rows: &'a [TreeRow]) -> Option<&'a TreeRow> {
         rows.get(self.selected)
     }
+
+    /// Sets the selection directly to `index`, clamped to the currently
+    /// visible row count -- unlike `move_selection`'s relative delta, a
+    /// mouse click already knows exactly which row it landed on
+    /// (`docs/features/tui-mouse-support.md` §3.2.1). A no-op (selection
+    /// left at 0) on an empty tree, same as `move_selection`.
+    pub fn select(&mut self, root: &DirEntry, index: usize) {
+        let len = self.visible_rows(root).len();
+        self.selected = if len == 0 { 0 } else { index.min(len - 1) };
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +229,29 @@ mod tests {
         let rows: Vec<TreeRow> = vec![];
         let state = TreeState::new();
         assert!(state.selected_row(&rows).is_none());
+    }
+
+    #[test]
+    fn select_sets_the_selection_directly() {
+        let root = sample_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 1);
+        assert_eq!(state.selected, 1);
+    }
+
+    #[test]
+    fn select_clamps_past_the_last_row() {
+        let root = sample_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 99);
+        assert_eq!(state.selected, 1);
+    }
+
+    #[test]
+    fn select_on_an_empty_tree_is_a_no_op() {
+        let root = dir("root", "/root", vec![]);
+        let mut state = TreeState::new();
+        state.select(&root, 3);
+        assert_eq!(state.selected, 0);
     }
 }
