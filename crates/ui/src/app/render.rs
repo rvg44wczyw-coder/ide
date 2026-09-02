@@ -1004,6 +1004,17 @@ impl IdeApp {
             let blame_on = self.tabs[idx].blame.is_some();
             let blame_annotations = self.tabs[idx].blame.clone().unwrap_or_default();
             let breakpoint_marks = self.breakpoint_marks_for_active_tab();
+            // `docs/features/right-margin-guide.md` §2.3/§3: resolved once
+            // per frame from the active tab's language, the same
+            // `language_for_path` lookup `render_debug_launch_popup`'s
+            // `debug_adapter()` call already uses -- falls back to 120 with
+            // no path or no language match.
+            let right_margin_column = self.tabs[idx]
+                .buffer
+                .path()
+                .and_then(|path| ide_core::language_for_path(&self.active_languages, path))
+                .map(|c| c.right_margin_column())
+                .unwrap_or(120);
             let tab = &mut self.tabs[idx];
             let output = CodeEditor::new(
                 egui::Id::new(("code_editor", idx)),
@@ -1023,6 +1034,7 @@ impl IdeApp {
             .git_gutter_marks(&git_gutter_marks)
             .blame_annotations(blame_on, &blame_annotations)
             .breakpoints(&breakpoint_marks)
+            .right_margin_column(right_margin_column)
             .show(ui);
             self.tabs[idx].diagnostics = diagnostics;
             self.handle_git_gutter_click(&output);
@@ -3187,6 +3199,11 @@ impl IdeApp {
                             .desired_width(160.0),
                     )
                     .on_hover_text("Not for secrets — visible to other local processes (ps).");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_language_right_margin_column)
+                            .hint_text("Right margin column (blank = 120)")
+                            .desired_width(160.0),
+                    );
                     if ui.button("Add").clicked() {
                         self.add_custom_language();
                     }

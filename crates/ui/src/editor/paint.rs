@@ -116,6 +116,24 @@ pub fn paint_breakpoint_marker(
     }
 }
 
+/// The right-margin guide (`docs/features/right-margin-guide.md` §2.3): a
+/// static vertical line at a fixed column, no overflow highlighting. Drawn
+/// full-viewport-height, the same span `paint_gutter`'s own background rect
+/// already uses, so it runs the whole visible editor height rather than
+/// stopping at the buffer's last line.
+pub fn paint_right_margin_guide(
+    painter: &egui::Painter,
+    x: f32,
+    top: f32,
+    bottom: f32,
+    color: egui::Color32,
+) {
+    painter.line_segment(
+        [egui::pos2(x, top), egui::pos2(x, bottom)],
+        egui::Stroke::new(1.0, color),
+    );
+}
+
 /// Buffer-byte-range `Token`s decoded from `tokens`, converting `ide_lsp::
 /// SemanticToken`'s `Position`+UTF-16-`length` shape the same way
 /// `document_highlight_marks` converts `document_highlights` -- an entry
