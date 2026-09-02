@@ -87,6 +87,9 @@ surface:
 pub struct BranchesPopupState {
     pub open: bool,
     pub filter: String,
+    /// `true` while `/` has put the popup into filter-typing mode (added
+    /// during implementation -- see "Revision notes").
+    pub typing_filter: bool,
     pub selected: usize,
     pub new_branch_name: String,
     pub show_new_branch_input: bool,
@@ -354,6 +357,10 @@ the following is intercepting keys — checked first, before `Tab`/`Up`/
 - a discard confirm (`git.pending_discard.is_some()`),
 - a branch-delete confirm (`git.branches_popup.pending_delete.is_some()`),
 - new-branch-name typing (`git.branches_popup.show_new_branch_input`),
+- branch-filter typing (`git.branches_popup.typing_filter` — added during
+  implementation, see "Revision notes"; same reasoning as new-branch-name
+  typing, since typing a filter substring like "dev" would otherwise lose
+  its `d` to the branches popup's own delete command),
 - conflict resolution (`git.active_conflict.is_some() || git.
   binary_conflict.is_some()` — `T11`'s existing mechanism; without this,
   `b` could open the branches popup mid-resolution, a reachable state
@@ -384,12 +391,21 @@ full replacement for `T11`'s single-condition Esc check):
 2. `git.branches_popup.pending_delete.is_some()` → `git.cancel_delete_branch()`.
 3. `git.branches_popup.show_new_branch_input` → clear it and
    `branches_popup.new_branch_name` without closing the popup.
-4. `git.branches_popup.open` → `git.close_branches_popup()`.
-5. `git.active_conflict.is_some() || git.binary_conflict.is_some()`
+4. `git.branches_popup.typing_filter` → clear it (`typing_filter =
+   false`) without closing the popup and without discarding the typed
+   filter text (added during implementation, see "Revision notes").
+5. `git.branches_popup.open` → `git.close_branches_popup()`.
+6. `git.active_conflict.is_some() || git.binary_conflict.is_some()`
    (`T11`, unchanged) → `git.cancel_conflict()`.
-6. `state.view == Log && state.focus == Graph && git.log_filter.
+7. `state.view == Log && state.focus == Graph && git.log_filter.
    viewing_file_history.is_some()` → `git.back_to_log()`.
-7. Otherwise → close the whole overlay (`git_panel = None`), `T11`'s
+8. `state.view == Log && state.focus == Filter` → `state.focus = Graph`
+   without closing the panel and without discarding the typed-but-
+   unapplied filter fields (this item was missing from round-1's version
+   of this list — see "Revision notes" — which made this case fall
+   through to item 9 and close the whole panel, contradicting §3.5's own
+   "Esc leaves Filter focus, returning to Graph").
+9. Otherwise → close the whole overlay (`git_panel = None`), `T11`'s
    original behaviour.
 
 See `docs/features/diagrams/tui-git-staging-branches-and-log-filters-esc.png`
@@ -406,22 +422,30 @@ for the full decision flow.
   (repo-relative path, straight from `WorkingTreeStatus` — never
   reconstructed). `Enter` on `Unstaged` focus: `git.stage(...)` the
   highlighted row. `Enter` on `Message` focus: `git.commit()`, surfacing
-  an `Err` via `self.notify(...)` (`confirm_rename`'s existing error-
-  surfacing shape) — a successful commit clears `commit_message`/`amend`
-  as a side effect of the ported `commit()` body itself (§2.1), nothing
-  extra needed here.
+  an `Err` via `self.status = Some(e)` (see "Revision notes" — not
+  `self.notify(...)`: `status` is the convention this exact file's own
+  `T11` conflict-resolution code already uses for git-panel errors,
+  `notify` is a separate toast mechanism `T27`'s debug-adapter popup
+  uses) — a successful commit clears `commit_message`/`amend` as a side
+  effect of the ported `commit()` body itself (§2.1), nothing extra
+  needed here.
 - `x` on `Unstaged` focus: `git.request_discard(&status.unstaged[selected]
   .path)` — not offered on `Staged` (matches `git-commit-and-staging.md`
   §2.3: only unstaged rows get a Discard affordance). **While
   `pending_discard.is_some()`, every key is intercepted** the same way
   `T11`'s conflict-resolution mode already intercepts: `y`/`Enter` →
-  `git.confirm_discard()` (surfacing an `Err` via `notify`), `n`/`Esc` →
+  `git.confirm_discard()` (surfacing an `Err` via `self.status = Some(e)`,
+  same correction as `Enter` on `Message` focus above), `n`/`Esc` →
   `git.cancel_discard()` (§3.2 item 1 already covers the `Esc` case; `n`
   is the same action reachable without relying on Esc's global-precedence
   routing).
-- `a` — toggles `git.amend`, available regardless of which `ChangesFocus`
-  is active (matches the egui version's Amend checkbox being a persistent
-  toggle beside, not inside, the message field).
+- `a` — toggles `git.amend`, available while `ChangesFocus` is `Staged` or
+  `Unstaged` — **not** while it is `Message` (see "Revision notes"):
+  typing `a` into a commit message must type the letter, not toggle amend,
+  the same text-corrupting-shortcut bug class §3.2's `g`/`s`/`b` gating
+  already guards against. `Message` focus delegates entirely to a
+  dedicated text-entry sub-handler that recognizes no single-letter
+  command at all, so this is structural, not a per-key check.
 - Typing (`Message` focus only): printable `Char` keys append to
   `git.commit_message`, `Backspace` pops — the exact `handle_debug_launch_
   key`/`handle_debug_adapter_config_key` (`T27`) text-entry shape, reused
@@ -432,11 +456,25 @@ for the full decision flow.
 Entered via `b` (§3.2); `git.branches_popup.open` gates every key below
 before `handle_git_panel_key`'s per-view dispatch runs.
 
-- `Up`/`Down` move `branches_popup.selected`, clamped to `branches.len()`.
-- `Enter` — `git.checkout_branch(&self.project_root, &branches[selected]
-  .name)`, surfacing an `Err` via `notify` (popup stays open on error,
-  per the ported method's own behaviour).
-- `m` — `git.merge_branch(&self.project_root, &branches[selected].name)`.
+- `/` — enters a filter-typing sub-mode (`branches_popup.typing_filter`,
+  see "Revision notes" — added during implementation, not in the original
+  design): `Char`/`Backspace` edit `branches_popup.filter`, fuzzy-scored
+  against branch names via `ide_core::fuzzy_score` in `App::
+  filtered_branch_rows` (ported from `ide-ui`'s own equivalent, which the
+  original version of this doc ported the struct field for but never
+  wired up). `Up`/`Down`/`Enter` inside this sub-mode act on the
+  *filtered* rows, same as outside it; `Esc` leaves the sub-mode without
+  clearing the typed filter text.
+- `Up`/`Down` move `branches_popup.selected`, clamped to `App::
+  filtered_branch_rows().len()` — not `branches.len()`, so keyboard nav
+  never disagrees with what the popup renders once a filter is active.
+- `Enter` — `git.checkout_branch(&self.project_root, &name)` for the
+  selected filtered row, surfacing an `Err` via `self.status = Some(e)`
+  (see "Revision notes" — not `notify`, same correction as §3.3's `Enter`
+  on `Message` focus; popup stays open on error, per the ported method's
+  own behaviour).
+- `m` — `git.merge_branch(&self.project_root, &name)` for the selected
+  filtered row.
   On success with `git.merging` now `true` (a real, conflicting merge):
   **deliberate deviation from `ide-ui`** — this phase calls
   `git.close_branches_popup()` and sets `state.view = Log`, `state.focus =
@@ -495,7 +533,12 @@ its place").
 - `Enter` — `git.apply_log_filter()`. On `Err` (an unresolvable `branch`
   or unparsable date), `log_filter.error` is set by the ported method
   itself and rendered inline (§2.4) — no separate handling needed here.
-- `c` — `git.clear_log_filter()` (the "Clear Filter" action).
+- `Ctrl+C` — `git.clear_log_filter()` (the "Clear Filter" action). **Not**
+  bare `c` (see "Revision notes"): a bare `c` would corrupt any typed
+  field value containing that letter (e.g. an author "carol"), the same
+  bug class §3.2's `g`/`s`/`b` gating exists to prevent. `Ctrl+C` matches
+  this crate's established "a modifier chord is excluded from text-entry
+  everywhere" convention (e.g. `Ctrl+R` inside the Replace bar).
 - `Esc` — leaves `Filter` focus, returning to `Graph` (does **not** clear
   the typed-but-unapplied field text, matching every other text-entry
   popup in this crate that treats `Esc` as "stop editing," not "discard,"
@@ -632,3 +675,42 @@ itself (text-entry-vs-global-key conflicts, exactly what produced finding
 2), not the source-code interleaving, and that risk doesn't shrink by
 splitting since the same gating question would just recur across three
 separate reviews instead of being solved once here.
+
+Round 2 `rev` (code review, `changes_needed`) found this doc had drifted
+from what `rust-tui-dev` actually implemented, in four places — all
+caught and fixed *during implementation itself* (the same text-corrupting-
+shortcut bug class round 1 already found once, recurring three more
+times), but never written back into this doc until this round required it:
+
+1. §3.3's `a` (amend toggle) originally said "available regardless of
+   which `ChangesFocus` is active." Implemented instead so `a` only fires
+   outside `Message` focus — typing `a` into a commit message would
+   otherwise be swallowed as a toggle instead of typed. Fixed §3.3.
+2. §3.5's Clear Filter was originally bound to bare `c`. Implemented as
+   `Ctrl+C` instead — a bare `c` would corrupt a typed filter value (e.g.
+   an author "carol"). Fixed §3.5.
+3. §3.2's own Esc-precedence list (old item 6) only named `Graph` focus
+   for the file-history case, silently contradicting §3.5's separately-
+   stated "Esc leaves Filter focus, returning to Graph" — Filter focus
+   would otherwise fall through to "close the whole panel." Implemented
+   per §3.5. Fixed §3.2's numbered list (new item 8).
+4. `BranchesPopupState.filter` (§2.1) was ported from `ide-ui`'s struct
+   but this doc never specified any typing/filtering behaviour for it,
+   leaving it dead code — a real `ide-ui` feature (fuzzy-filter the branch
+   list as you type) this doc simply missed porting. Flagged to the user
+   mid-implementation; asked to implement it now rather than defer.
+   Fixed §3.2 (new `typing_filter` text-entry exception and Esc-precedence
+   item) and §3.4 (`/` entry point, `filtered_branch_rows` throughout).
+
+Also fixed: §3.3/§3.4's `Enter`-on-`Message`/discard-confirm/checkout
+error-surfacing text said `self.notify(...)`; the actual, and correct,
+convention in this exact file is `self.status = Some(e)` (`T11`'s own
+conflict-resolution code already uses it here; `notify` is a separate
+toast mechanism `T27`'s debug-adapter popup uses). Fixed both call sites.
+
+A fifth, non-doc finding from the same round — the discard-confirm
+overlay in `render_git_changes` (§2.4) didn't display which path was
+about to be discarded, a usability-safety gap for a destructive,
+irreversible action — was fixed in `ui.rs` directly rather than in this
+doc, since §2.4's own text never specified the confirm dialog's exact
+wording either way.
