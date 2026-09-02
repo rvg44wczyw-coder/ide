@@ -287,22 +287,37 @@ pub(crate) struct RenamePopup {
     pub(crate) input: String,
 }
 
-/// Which list/pane has keyboard focus inside the Git Panel overlay
-/// (`docs/features/tui-git-panel.md` §2.2/§3.2). Conflict resolution is a
-/// distinct mode layered on top of this, not a fourth variant -- see
-/// `handle_git_panel_key`'s doc comment.
+/// Which top-level view the Git Panel overlay shows (`docs/features/
+/// tui-git-staging-branches-and-log-filters.md` §2.2, T28) -- `Log` is
+/// `T11`'s original Graph/Conflicts/Diff/Filter view, `Changes` is the new
+/// staged/unstaged/commit-message view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum GitPanelView {
+    #[default]
+    Log,
+    Changes,
+}
+
+/// Which list/pane has keyboard focus inside the Git Panel overlay's `Log`
+/// view (`docs/features/tui-git-panel.md` §2.2/§3.2, `Filter` added by
+/// `tui-git-staging-branches-and-log-filters.md` §2.2). Conflict
+/// resolution is a distinct mode layered on top of this, not a fifth
+/// variant -- see `handle_git_panel_key`'s doc comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum GitPanelFocus {
     #[default]
     Graph,
     Conflicts,
     Diff,
+    Filter,
 }
 
 impl GitPanelFocus {
     /// `Tab`'s cycle order, skipping `Conflicts` when there are none to
-    /// browse.
-    fn next(self, conflicts_empty: bool) -> Self {
+    /// browse and skipping `Filter` while viewing file history (the
+    /// filter bar has nothing to apply to in that mode, `tui-git-staging-
+    /// branches-and-log-filters.md` §3.5).
+    fn next(self, conflicts_empty: bool, filter_hidden: bool) -> Self {
         match self {
             GitPanelFocus::Graph => {
                 if conflicts_empty {
@@ -312,22 +327,117 @@ impl GitPanelFocus {
                 }
             }
             GitPanelFocus::Conflicts => GitPanelFocus::Diff,
-            GitPanelFocus::Diff => GitPanelFocus::Graph,
+            GitPanelFocus::Diff => {
+                if filter_hidden {
+                    GitPanelFocus::Graph
+                } else {
+                    GitPanelFocus::Filter
+                }
+            }
+            GitPanelFocus::Filter => GitPanelFocus::Graph,
+        }
+    }
+}
+
+/// Which sub-widget has focus inside the Git Panel overlay's `Changes`
+/// view (`docs/features/tui-git-staging-branches-and-log-filters.md`
+/// §2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChangesFocus {
+    #[default]
+    Staged,
+    Unstaged,
+    Message,
+}
+
+impl ChangesFocus {
+    fn next(self) -> Self {
+        match self {
+            ChangesFocus::Staged => ChangesFocus::Unstaged,
+            ChangesFocus::Unstaged => ChangesFocus::Message,
+            ChangesFocus::Message => ChangesFocus::Staged,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            ChangesFocus::Staged => ChangesFocus::Message,
+            ChangesFocus::Unstaged => ChangesFocus::Staged,
+            ChangesFocus::Message => ChangesFocus::Unstaged,
+        }
+    }
+}
+
+/// Which `LogFilterState` text field is being edited while `GitPanelFocus
+/// ::Filter` has focus (`docs/features/
+/// tui-git-staging-branches-and-log-filters.md` §2.2/§3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FilterField {
+    #[default]
+    Branch,
+    Author,
+    Path,
+    Since,
+    Until,
+    Query,
+}
+
+impl FilterField {
+    fn next(self) -> Self {
+        match self {
+            FilterField::Branch => FilterField::Author,
+            FilterField::Author => FilterField::Path,
+            FilterField::Path => FilterField::Since,
+            FilterField::Since => FilterField::Until,
+            FilterField::Until => FilterField::Query,
+            FilterField::Query => FilterField::Branch,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            FilterField::Branch => FilterField::Query,
+            FilterField::Author => FilterField::Branch,
+            FilterField::Path => FilterField::Author,
+            FilterField::Since => FilterField::Path,
+            FilterField::Until => FilterField::Since,
+            FilterField::Query => FilterField::Until,
+        }
+    }
+
+    /// The `LogFilterState` field this variant addresses, as a mutable
+    /// `&mut String` -- one dispatch point for both typing and Backspace
+    /// rather than duplicating the match in both call sites.
+    fn text_mut(self, filter: &mut crate::git_panel::LogFilterState) -> &mut String {
+        match self {
+            FilterField::Branch => &mut filter.branch,
+            FilterField::Author => &mut filter.author,
+            FilterField::Path => &mut filter.path,
+            FilterField::Since => &mut filter.since,
+            FilterField::Until => &mut filter.until,
+            FilterField::Query => &mut filter.query,
         }
     }
 }
 
 /// The Git Panel overlay's cursor/scroll state (`docs/features/
-/// tui-git-panel.md` §2.2) -- presence is visibility. `App::git`'s own
-/// fields (graph, diff, conflicts, ...) persist across the overlay
-/// opening/closing, matching `ide-ui`'s toolbar-toggle persistence; only
-/// this transient UI state resets on every open (a fresh `default()`).
+/// tui-git-panel.md` §2.2, extended by `tui-git-staging-branches-and-
+/// log-filters.md` §2.2) -- presence is visibility. `App::git`'s own
+/// fields (graph, diff, conflicts, status, branches, log_filter, ...)
+/// persist across the overlay opening/closing, matching `ide-ui`'s
+/// toolbar-toggle persistence; only this transient UI state resets on
+/// every open (a fresh `default()`).
 #[derive(Default)]
 pub(crate) struct GitPanelState {
+    pub(crate) view: GitPanelView,
     pub(crate) focus: GitPanelFocus,
+    pub(crate) changes_focus: ChangesFocus,
+    pub(crate) filter_field: FilterField,
     pub(crate) graph_selected: usize,
     pub(crate) conflicts_selected: usize,
     pub(crate) diff_scroll: u16,
+    pub(crate) staged_selected: usize,
+    pub(crate) unstaged_selected: usize,
 }
 
 /// The Keymap popup's cursor/search/capture state (`docs/features/
@@ -2081,6 +2191,49 @@ impl App {
         scored.into_iter().map(|(_, p)| p.clone()).collect()
     }
 
+    /// The branches popup's currently filtered/sorted rows (fuzzy-filtered
+    /// by `git.branches_popup.filter`, score-descending), as owned
+    /// `(name, is_head)` pairs -- ported from `ide-ui`'s own
+    /// `filtered_branch_rows` (`docs/features/
+    /// tui-git-staging-branches-and-log-filters.md`, filed as a gap in the
+    /// original doc, added during implementation). Shared by rendering and
+    /// `handle_git_branches_key`/`handle_git_branches_filter_key` so
+    /// keyboard nav and what the popup draws can never disagree about row
+    /// order.
+    pub(crate) fn filtered_branch_rows(&self) -> Vec<(String, bool)> {
+        let filter = self.git.branches_popup.filter.trim();
+        let named: Vec<(String, bool)> = self
+            .git
+            .branches
+            .iter()
+            .map(|b| (b.name.clone(), b.is_head))
+            .collect();
+        if filter.is_empty() {
+            return named;
+        }
+        let mut scored: Vec<(i64, (String, bool))> = named
+            .into_iter()
+            .filter_map(|(name, is_head)| {
+                fuzzy_score(filter, &name).map(|m| (m.score, (name, is_head)))
+            })
+            .collect();
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored.into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// Keeps `branches_popup.selected` in bounds of the *filtered* row
+    /// count after a `filter` edit shrinks or grows the list -- typing a
+    /// character that eliminates the currently-selected row must not
+    /// leave `selected` pointing past the end.
+    fn clamp_branches_popup_selection(&mut self) {
+        let count = self.filtered_branch_rows().len();
+        self.git.branches_popup.selected = if count == 0 {
+            0
+        } else {
+            self.git.branches_popup.selected.min(count - 1)
+        };
+    }
+
     /// Handles every key while `recent_files.is_some()` (§3.1). Same shape
     /// as `handle_go_to_file_key`, except typing/`Backspace` also reset
     /// `selected` (the filtered list can shrink on any keystroke here,
@@ -2401,6 +2554,20 @@ impl App {
         self.last_git_diff_target = current;
     }
 
+    /// Called once per frame by `lib.rs`'s run loop alongside
+    /// `sync_git_working_tree_diff` (`docs/features/
+    /// tui-git-staging-branches-and-log-filters.md` §3.1) -- cheap to
+    /// no-op via `sync_status`'s own no-repo/transient-error handling, so
+    /// an open Git Panel's Staged/Unstaged lists stay live against
+    /// out-of-band git activity (e.g. a commit made from another
+    /// terminal) the same way the diff pane already does.
+    pub(crate) fn sync_git_status(&mut self) {
+        if self.git_panel.is_none() {
+            return;
+        }
+        self.git.sync_status();
+    }
+
     /// `ToggleGitPanel` command (palette-only, no default binding -- see
     /// `commands.rs`): opens/closes the Git Panel overlay. `self.git`'s own
     /// fields persist across the toggle -- only the transient cursor/scroll
@@ -2443,17 +2610,47 @@ impl App {
     }
 
     /// Handles every key while `git_panel.is_some()` (`docs/features/
-    /// tui-git-panel.md` §3.2). Resolving-mode interception (`o`/`t`/
-    /// `Enter`/`Esc` against `git.active_conflict`/`git.binary_conflict`)
-    /// is checked *first*, before the ordinary `Tab`/`Up`/`Down`/`Enter`
-    /// list-navigation match below -- getting this order backwards would
-    /// let those keys leak into list navigation while a conflict is being
-    /// resolved, or vice versa.
+    /// tui-git-staging-branches-and-log-filters.md` §3.2, extending `T11`'s
+    /// original single-mode dispatch). Checked in this order, first match
+    /// wins -- getting this order wrong lets one mode's keys leak into
+    /// another's, e.g. `g`/`s`/`b` reaching a commit-message field mid-edit
+    /// as a view switch instead of a typed character:
+    ///
+    /// 1. `pending_discard` -- confirm/cancel a pending discard.
+    /// 2. `branches_popup.pending_delete` -- confirm/cancel a branch delete.
+    /// 3. `branches_popup.show_new_branch_input` -- typing a new branch name.
+    /// 4. `branches_popup.open` -- the branches popup itself.
+    /// 5. `active_conflict`/`binary_conflict` -- `T11`'s conflict resolution,
+    ///    unchanged.
+    /// 6. `Esc` -- resolved against the doc's precedence chain directly
+    ///    (items 6/6a/7; items 1-5 of that chain are exactly the four
+    ///    early returns above, which already intercepted `Esc` themselves
+    ///    if applicable).
+    /// 7. `g`/`s`/`b` view-switch keys -- gated off while `Message`
+    ///    (`Changes` view) or `Filter` (`Log` view) focus is active, since
+    ///    both are free-text fields a real value is likely to contain
+    ///    these letters in (§3.2).
+    /// 8. Per-view dispatch: `handle_git_log_key` for `Log`,
+    ///    `handle_git_changes_key` for `Changes`.
     fn handle_git_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
-        let Some(state) = self.git_panel.as_mut() else {
+        if self.git_panel.is_none() {
             return LoopSignal::Continue;
-        };
-
+        }
+        if self.git.pending_discard.is_some() {
+            return self.handle_git_discard_confirm_key(key);
+        }
+        if self.git.branches_popup.pending_delete.is_some() {
+            return self.handle_git_branch_delete_confirm_key(key);
+        }
+        if self.git.branches_popup.show_new_branch_input {
+            return self.handle_git_new_branch_key(key);
+        }
+        if self.git.branches_popup.typing_filter {
+            return self.handle_git_branches_filter_key(key);
+        }
+        if self.git.branches_popup.open {
+            return self.handle_git_branches_key(key);
+        }
         if self.git.active_conflict.is_some() || self.git.binary_conflict.is_some() {
             match key.code {
                 KeyCode::Esc => self.git.cancel_conflict(),
@@ -2469,9 +2666,86 @@ impl App {
             return LoopSignal::Continue;
         }
 
+        let Some(state) = self.git_panel.as_ref() else {
+            return LoopSignal::Continue;
+        };
+        let in_log_view = state.view == GitPanelView::Log;
+        let log_focus = state.focus;
+        let changes_focus = state.changes_focus;
+
+        if key.code == KeyCode::Esc {
+            if in_log_view
+                && log_focus == GitPanelFocus::Graph
+                && self.git.log_filter.viewing_file_history.is_some()
+            {
+                self.git.back_to_log();
+            } else if in_log_view && log_focus == GitPanelFocus::Filter {
+                // Doc §3.5's own Esc rule ("leaves Filter focus, returning
+                // to Graph") -- a case §3.2's Esc-precedence list omits
+                // (its item 6 only names `Graph` focus), which would
+                // otherwise fall through to item 7 and close the whole
+                // overlay instead of just backing out of the filter bar.
+                self.git_panel.as_mut().expect("checked above").focus = GitPanelFocus::Graph;
+            } else {
+                self.git_panel = None;
+            }
+            return LoopSignal::Continue;
+        }
+
+        let in_text_entry = (!in_log_view && changes_focus == ChangesFocus::Message)
+            || (in_log_view && log_focus == GitPanelFocus::Filter);
+
+        if !in_text_entry {
+            match key.code {
+                KeyCode::Char('g') => {
+                    self.git_panel.as_mut().expect("checked above").view = GitPanelView::Log;
+                    return LoopSignal::Continue;
+                }
+                KeyCode::Char('s') => {
+                    self.git_panel.as_mut().expect("checked above").view = GitPanelView::Changes;
+                    return LoopSignal::Continue;
+                }
+                KeyCode::Char('b') => {
+                    self.git.open_branches_popup(&self.project_root);
+                    return LoopSignal::Continue;
+                }
+                _ => {}
+            }
+        }
+
+        if in_log_view {
+            self.handle_git_log_key(key)
+        } else {
+            self.handle_git_changes_key(key)
+        }
+    }
+
+    /// `Log` view dispatch (`T11`'s original Graph/Conflicts/Diff
+    /// behaviour, extended by `docs/features/
+    /// tui-git-staging-branches-and-log-filters.md` §3.2/§3.5 with a
+    /// `Filter` focus stop and an `f` entry point). `Esc` is handled by
+    /// the caller (`handle_git_panel_key`), never here.
+    fn handle_git_log_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.git_panel.as_mut() else {
+            return LoopSignal::Continue;
+        };
+
+        if state.focus == GitPanelFocus::Filter {
+            return self.handle_git_filter_key(key);
+        }
+
         match key.code {
-            KeyCode::Esc => self.git_panel = None,
-            KeyCode::Tab => state.focus = state.focus.next(self.git.conflicts.is_empty()),
+            KeyCode::Tab => {
+                let filter_hidden = self.git.log_filter.viewing_file_history.is_some();
+                state.focus = state
+                    .focus
+                    .next(self.git.conflicts.is_empty(), filter_hidden);
+            }
+            KeyCode::Char('f') => {
+                if self.git.log_filter.viewing_file_history.is_none() {
+                    state.focus = GitPanelFocus::Filter;
+                }
+            }
             KeyCode::Up => match state.focus {
                 GitPanelFocus::Graph => {
                     state.graph_selected = state.graph_selected.saturating_sub(1);
@@ -2482,6 +2756,7 @@ impl App {
                 GitPanelFocus::Diff => {
                     state.diff_scroll = state.diff_scroll.saturating_sub(1);
                 }
+                GitPanelFocus::Filter => unreachable!("handled above"),
             },
             KeyCode::Down => match state.focus {
                 GitPanelFocus::Graph => {
@@ -2497,6 +2772,7 @@ impl App {
                 GitPanelFocus::Diff => {
                     state.diff_scroll = state.diff_scroll.saturating_add(1);
                 }
+                GitPanelFocus::Filter => unreachable!("handled above"),
             },
             KeyCode::PageUp if state.focus == GitPanelFocus::Diff => {
                 state.diff_scroll = state.diff_scroll.saturating_sub(10);
@@ -2519,10 +2795,389 @@ impl App {
                     }
                 }
                 GitPanelFocus::Diff => {}
+                GitPanelFocus::Filter => unreachable!("handled above"),
             },
             _ => {}
         }
         LoopSignal::Continue
+    }
+
+    /// Log filter bar dispatch (`docs/features/
+    /// tui-git-staging-branches-and-log-filters.md` §3.5), reached only
+    /// while `state.focus == GitPanelFocus::Filter`. Clear Filter is bound
+    /// to `Ctrl+C`, not bare `c` -- a bare `c` would corrupt any typed
+    /// field value containing that letter (e.g. an author "carol"), the
+    /// same text-corrupting-shortcut bug class `g`/`s`/`b` had before
+    /// being gated off text-entry focus in §3.2.
+    fn handle_git_filter_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.git_panel.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Tab => state.filter_field = state.filter_field.next(),
+            KeyCode::BackTab => state.filter_field = state.filter_field.previous(),
+            KeyCode::Enter => self.git.apply_log_filter(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.git.clear_log_filter();
+            }
+            KeyCode::Backspace => {
+                let field = state.filter_field;
+                field.text_mut(&mut self.git.log_filter).pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let field = state.filter_field;
+                field.text_mut(&mut self.git.log_filter).push(c);
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// `Changes` view dispatch (`docs/features/
+    /// tui-git-staging-branches-and-log-filters.md` §3.3). `Message` focus
+    /// delegates entirely to `handle_git_commit_message_key`, which
+    /// recognizes only Tab/BackTab/Backspace/Enter/plain-character-typing
+    /// -- no single-letter command (`a` included) is reachable while it
+    /// owns the key, the same fix shape as `handle_git_filter_key`'s
+    /// `Ctrl+C` rebind: a text-entry field must never fall back to a
+    /// command binding for a character it doesn't recognize.
+    fn handle_git_changes_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.git_panel.as_mut() else {
+            return LoopSignal::Continue;
+        };
+
+        if state.changes_focus == ChangesFocus::Message {
+            return self.handle_git_commit_message_key(key);
+        }
+
+        match key.code {
+            KeyCode::Tab => state.changes_focus = state.changes_focus.next(),
+            KeyCode::BackTab => state.changes_focus = state.changes_focus.previous(),
+            KeyCode::Up => match state.changes_focus {
+                ChangesFocus::Staged => {
+                    state.staged_selected = state.staged_selected.saturating_sub(1);
+                }
+                ChangesFocus::Unstaged => {
+                    state.unstaged_selected = state.unstaged_selected.saturating_sub(1);
+                }
+                ChangesFocus::Message => unreachable!("handled above"),
+            },
+            KeyCode::Down => match state.changes_focus {
+                ChangesFocus::Staged => {
+                    if state.staged_selected + 1 < self.git.status.staged.len() {
+                        state.staged_selected += 1;
+                    }
+                }
+                ChangesFocus::Unstaged => {
+                    if state.unstaged_selected + 1 < self.git.status.unstaged.len() {
+                        state.unstaged_selected += 1;
+                    }
+                }
+                ChangesFocus::Message => unreachable!("handled above"),
+            },
+            KeyCode::Enter => match state.changes_focus {
+                ChangesFocus::Staged => {
+                    if let Some(entry) = self.git.status.staged.get(state.staged_selected).cloned()
+                    {
+                        if let Err(e) = self.git.unstage(&entry.path) {
+                            self.status = Some(e);
+                        }
+                    }
+                }
+                ChangesFocus::Unstaged => {
+                    if let Some(entry) = self
+                        .git
+                        .status
+                        .unstaged
+                        .get(state.unstaged_selected)
+                        .cloned()
+                    {
+                        if let Err(e) = self.git.stage(&entry.path) {
+                            self.status = Some(e);
+                        }
+                    }
+                }
+                ChangesFocus::Message => unreachable!("handled above"),
+            },
+            KeyCode::Char('x') if state.changes_focus == ChangesFocus::Unstaged => {
+                if let Some(entry) = self
+                    .git
+                    .status
+                    .unstaged
+                    .get(state.unstaged_selected)
+                    .cloned()
+                {
+                    self.git.request_discard(&entry.path);
+                }
+            }
+            // Only reachable outside `Message` focus -- see this method's
+            // doc comment on why that's load-bearing, not incidental.
+            KeyCode::Char('a') => self.git.amend = !self.git.amend,
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Commit-message text entry (`Changes` view, `Message` focus). Same
+    /// text-entry shape `handle_debug_launch_key`/
+    /// `handle_debug_adapter_config_key` (`T27`) already established:
+    /// `Tab`/`BackTab` still cycle focus (leaving the field), everything
+    /// else either edits `commit_message` or does nothing -- no letter is
+    /// ever treated as a command here.
+    fn handle_git_commit_message_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.git_panel.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Tab => state.changes_focus = state.changes_focus.next(),
+            KeyCode::BackTab => state.changes_focus = state.changes_focus.previous(),
+            KeyCode::Enter => {
+                if let Err(e) = self.git.commit() {
+                    self.status = Some(e);
+                }
+            }
+            KeyCode::Backspace => {
+                self.git.commit_message.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.git.commit_message.push(c);
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Discard-confirm interception (`docs/features/
+    /// tui-git-staging-branches-and-log-filters.md` §3.3) -- every key is
+    /// intercepted while `git.pending_discard.is_some()`, the same
+    /// modal-interception shape `T11`'s conflict resolution already uses.
+    fn handle_git_discard_confirm_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Err(e) = self.git.confirm_discard() {
+                    self.status = Some(e);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => self.git.cancel_discard(),
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Branches popup dispatch (`docs/features/
+    /// tui-git-staging-branches-and-log-filters.md` §3.4), reached only
+    /// while `git.branches_popup.open` and neither a delete-confirm nor
+    /// new-branch-name entry is in progress (both are their own, higher-
+    /// precedence interceptions -- see `handle_git_panel_key`).
+    fn handle_git_branches_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.git.close_branches_popup(),
+            KeyCode::Char('/') => self.git.branches_popup.typing_filter = true,
+            KeyCode::Up => {
+                self.git.branches_popup.selected =
+                    self.git.branches_popup.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let count = self.filtered_branch_rows().len();
+                if self.git.branches_popup.selected + 1 < count {
+                    self.git.branches_popup.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some((name, _)) = self
+                    .filtered_branch_rows()
+                    .get(self.git.branches_popup.selected)
+                    .cloned()
+                {
+                    let project_root = self.project_root.clone();
+                    if let Err(e) = self.git.checkout_branch(&project_root, &name) {
+                        self.status = Some(e);
+                    }
+                }
+            }
+            KeyCode::Char('m') => {
+                if let Some((name, _)) = self
+                    .filtered_branch_rows()
+                    .get(self.git.branches_popup.selected)
+                    .cloned()
+                {
+                    let project_root = self.project_root.clone();
+                    match self.git.merge_branch(&project_root, &name) {
+                        Ok(()) => {
+                            if self.git.merging {
+                                // Deliberate `ide-tui`-side deviation from
+                                // `ide-ui`'s "leave the popup open" -- see
+                                // `GitPanel::merge_branch`'s own doc
+                                // comment for why a modal popup can't
+                                // afford to strand the user here.
+                                self.git.close_branches_popup();
+                                if let Some(state) = self.git_panel.as_mut() {
+                                    state.view = GitPanelView::Log;
+                                    state.focus = GitPanelFocus::Conflicts;
+                                }
+                            }
+                        }
+                        Err(e) => self.status = Some(e),
+                    }
+                }
+            }
+            KeyCode::Char('n') => {
+                self.git.branches_popup.show_new_branch_input = true;
+                self.git.branches_popup.new_branch_name.clear();
+            }
+            KeyCode::Char('d') => {
+                if let Some((name, is_head)) = self
+                    .filtered_branch_rows()
+                    .get(self.git.branches_popup.selected)
+                    .cloned()
+                {
+                    if !is_head {
+                        self.git.request_delete_branch(&name);
+                        let project_root = self.project_root.clone();
+                        if let Err(e) = self.git.confirm_delete_branch(&project_root, false) {
+                            self.status = Some(e);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Branch-list fuzzy-filter typing, entered via `/` from the branches
+    /// popup's normal nav (`docs/features/
+    /// tui-git-staging-branches-and-log-filters.md` §3.4, added during
+    /// implementation -- see `filtered_branch_rows`'s doc comment). `Up`/
+    /// `Down` still navigate the *filtered* rows while typing, and
+    /// `Backspace`/`Char` edits that shrink or grow the filtered set
+    /// re-clamp `selected` so it never points past the end. `Enter` checks
+    /// out the currently selected filtered row, the same action normal-
+    /// mode `Enter` performs. `Esc` leaves typing mode without clearing
+    /// the typed filter text -- consistent with `handle_git_filter_key`'s
+    /// own Esc convention (stop editing, not discard).
+    fn handle_git_branches_filter_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.git.branches_popup.typing_filter = false,
+            KeyCode::Backspace => {
+                self.git.branches_popup.filter.pop();
+                self.clamp_branches_popup_selection();
+            }
+            KeyCode::Up => {
+                self.git.branches_popup.selected =
+                    self.git.branches_popup.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let count = self.filtered_branch_rows().len();
+                if self.git.branches_popup.selected + 1 < count {
+                    self.git.branches_popup.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some((name, _)) = self
+                    .filtered_branch_rows()
+                    .get(self.git.branches_popup.selected)
+                    .cloned()
+                {
+                    let project_root = self.project_root.clone();
+                    if let Err(e) = self.git.checkout_branch(&project_root, &name) {
+                        self.status = Some(e);
+                    }
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.git.branches_popup.filter.push(c);
+                self.clamp_branches_popup_selection();
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Branch-delete confirm interception, reached only while `git.
+    /// branches_popup.pending_delete.is_some()`. A second `d` on the same
+    /// still-pending branch retries with `force: true` -- the keyboard-
+    /// native rendering of `git-branches-and-blame.md` §2.2.2's inline
+    /// "Force Delete" affordance (§3.4).
+    fn handle_git_branch_delete_confirm_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.git.cancel_delete_branch(),
+            KeyCode::Char('d') => {
+                let project_root = self.project_root.clone();
+                if let Err(e) = self.git.confirm_delete_branch(&project_root, true) {
+                    self.status = Some(e);
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// New-branch-name text entry, reached only while `git.branches_popup.
+    /// show_new_branch_input`. Always create-and-checkout (`checkout:
+    /// true`) -- §3.4's documented v1 scope trim of `ide-ui`'s separate
+    /// "create without checkout" affordance.
+    fn handle_git_new_branch_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => {
+                self.git.branches_popup.show_new_branch_input = false;
+                self.git.branches_popup.new_branch_name.clear();
+            }
+            KeyCode::Enter => {
+                let name = self.git.branches_popup.new_branch_name.clone();
+                let project_root = self.project_root.clone();
+                if let Err(e) = self.git.create_branch(&project_root, &name, true) {
+                    self.status = Some(e);
+                }
+            }
+            KeyCode::Backspace => {
+                self.git.branches_popup.new_branch_name.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.git.branches_popup.new_branch_name.push(c);
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// `GitBranches` command (palette-only, no default binding -- see
+    /// `commands.rs`): opens the Git Panel if it wasn't already, then
+    /// opens the branches popup over whichever view was active.
+    fn trigger_git_branches(&mut self) {
+        if self.git_panel.is_none() {
+            self.toggle_git_panel();
+        }
+        self.git.open_branches_popup(&self.project_root);
+    }
+
+    /// `ShowFileHistory` command (palette-only -- see `commands.rs`):
+    /// silent no-op with no active tab or no open repository, the same
+    /// shape `T27`'s `trigger_debug` already establishes for a missing
+    /// precondition. `sync_git_working_tree_diff`'s existing canonicalize-
+    /// then-`strip_prefix` pattern is reused to turn the active tab's
+    /// absolute path into the repository-relative path `show_file_history`
+    /// requires (`docs/features/tui-git-staging-branches-and-log-filters
+    /// .md` §3.5's "caller responsible for stripping the project root").
+    fn trigger_show_file_history(&mut self) {
+        if !self.git.is_repo() {
+            return;
+        }
+        let Some(path) = self.active_buffer().map(|b| b.path.clone()) else {
+            return;
+        };
+        let Ok(relative) = path.strip_prefix(&self.project_root) else {
+            return;
+        };
+        let relative = relative.to_path_buf();
+        self.git.show_file_history(&relative);
+        if self.git_panel.is_none() {
+            self.toggle_git_panel();
+        }
+        if let Some(state) = self.git_panel.as_mut() {
+            state.view = GitPanelView::Log;
+            state.focus = GitPanelFocus::Graph;
+        }
     }
 
     /// Handles every key while `docker_panel.is_some()` (`docs/features/
@@ -3476,6 +4131,8 @@ impl App {
             Action::ShowIntentionActions => self.trigger_show_intention_actions(),
             Action::Rename => self.trigger_rename(),
             Action::ToggleGitPanel => self.toggle_git_panel(),
+            Action::GitBranches => self.trigger_git_branches(),
+            Action::ShowFileHistory => self.trigger_show_file_history(),
             Action::ToggleDockerPanel => self.toggle_docker_panel(),
             Action::ToggleK8sPanel => self.toggle_k8s_panel(),
             Action::JumpToMatchingBracket => self.trigger_jump_to_matching_bracket(),
@@ -8799,6 +9456,20 @@ mod tests {
         assert_eq!(app.git_panel.as_ref().unwrap().focus, GitPanelFocus::Diff);
 
         app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.git_panel.as_ref().unwrap().focus, GitPanelFocus::Filter);
+
+        // A further `Tab` while `Filter` has focus is captured by
+        // `handle_git_filter_key`'s own internal `FilterField` cycle
+        // (§3.5) rather than continuing `GitPanelFocus`'s cycle -- `Esc`
+        // is the only way back to `Graph` from here (§3.2/§3.5).
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.git_panel.as_ref().unwrap().focus, GitPanelFocus::Filter);
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().filter_field,
+            FilterField::Author
+        );
+
+        app.handle_key(plain_key(KeyCode::Esc));
         assert_eq!(app.git_panel.as_ref().unwrap().focus, GitPanelFocus::Graph);
     }
 
@@ -8939,6 +9610,503 @@ mod tests {
             fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "theirs\n"
         );
+    }
+
+    // ---- T28: view switching ----
+
+    #[test]
+    fn g_s_b_switch_views_and_open_the_branches_popup() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        assert_eq!(app.git_panel.as_ref().unwrap().view, GitPanelView::Log);
+
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        assert_eq!(app.git_panel.as_ref().unwrap().view, GitPanelView::Changes);
+
+        app.handle_key(plain_key(KeyCode::Char('g')));
+        assert_eq!(app.git_panel.as_ref().unwrap().view, GitPanelView::Log);
+
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        assert!(app.git.branches_popup.open);
+    }
+
+    #[test]
+    fn g_s_b_do_not_leak_into_a_commit_message_being_typed() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().changes_focus,
+            ChangesFocus::Message
+        );
+
+        for c in "Fix bug in gitignore".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+
+        assert_eq!(app.git.commit_message, "Fix bug in gitignore");
+        assert_eq!(app.git_panel.as_ref().unwrap().view, GitPanelView::Changes);
+        assert!(!app.git.branches_popup.open);
+    }
+
+    #[test]
+    fn g_s_b_do_not_leak_into_a_log_filter_field_being_typed() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('f')));
+        assert_eq!(app.git_panel.as_ref().unwrap().focus, GitPanelFocus::Filter);
+
+        for c in "gsb-author".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+
+        assert_eq!(app.git.log_filter.branch, "gsb-author");
+        assert_eq!(app.git_panel.as_ref().unwrap().view, GitPanelView::Log);
+        assert!(!app.git.branches_popup.open);
+    }
+
+    #[test]
+    fn esc_from_filter_focus_returns_to_graph_without_closing_the_panel() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('f')));
+        app.handle_key(plain_key(KeyCode::Char('x')));
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(app.git_panel.is_some());
+        assert_eq!(app.git_panel.as_ref().unwrap().focus, GitPanelFocus::Graph);
+        assert_eq!(
+            app.git.log_filter.branch, "x",
+            "Esc must not discard typed text"
+        );
+    }
+
+    // ---- T28: Changes view ----
+
+    #[test]
+    fn changes_view_tab_cycles_staged_unstaged_message() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().changes_focus,
+            ChangesFocus::Staged
+        );
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().changes_focus,
+            ChangesFocus::Unstaged
+        );
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().changes_focus,
+            ChangesFocus::Message
+        );
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().changes_focus,
+            ChangesFocus::Staged
+        );
+    }
+
+    #[test]
+    fn changes_view_enter_stages_and_unstages() {
+        let dir = sample_git_project();
+        fs::write(dir.path().join("a.txt"), "hello\nworld2").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.git.sync_status();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        assert_eq!(app.git.status.unstaged.len(), 1);
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(app.git.status.unstaged.is_empty());
+        assert_eq!(app.git.status.staged.len(), 1);
+
+        app.handle_key(plain_key(KeyCode::BackTab));
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.git.status.unstaged.len(), 1);
+        assert!(app.git.status.staged.is_empty());
+    }
+
+    #[test]
+    fn changes_view_x_requests_discard_and_y_confirms_it() {
+        let dir = sample_git_project();
+        fs::write(dir.path().join("a.txt"), "hello\nworld2").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.git.sync_status();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        app.handle_key(plain_key(KeyCode::Tab));
+
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        assert!(app.git.pending_discard.is_some());
+
+        app.handle_key(plain_key(KeyCode::Char('y')));
+        assert!(app.git.pending_discard.is_none());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "hello\nworld"
+        );
+    }
+
+    #[test]
+    fn changes_view_discard_confirm_n_cancels_without_touching_the_file() {
+        let dir = sample_git_project();
+        fs::write(dir.path().join("a.txt"), "hello\nworld2").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.git.sync_status();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Char('x')));
+
+        app.handle_key(plain_key(KeyCode::Char('n')));
+
+        assert!(app.git.pending_discard.is_none());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "hello\nworld2"
+        );
+    }
+
+    #[test]
+    fn changes_view_a_toggles_amend_but_not_while_typing_a_message() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        assert!(!app.git.amend);
+
+        app.handle_key(plain_key(KeyCode::Char('a')));
+        assert!(app.git.amend);
+        app.handle_key(plain_key(KeyCode::Char('a')));
+        assert!(!app.git.amend);
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().changes_focus,
+            ChangesFocus::Message
+        );
+        app.handle_key(plain_key(KeyCode::Char('a')));
+        assert_eq!(app.git.commit_message, "a");
+        assert!(!app.git.amend, "'a' while typing must not toggle amend");
+    }
+
+    #[test]
+    fn changes_view_enter_on_message_commits() {
+        let dir = sample_git_project();
+        fs::write(dir.path().join("a.txt"), "hello\nworld2").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.git.sync_status();
+        app.git.stage(std::path::Path::new("a.txt")).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab));
+
+        for c in "second".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.git.commit_message.is_empty());
+        assert_eq!(app.git.graph.len(), 2);
+    }
+
+    // ---- T28: branches popup ----
+
+    #[test]
+    fn branches_popup_enter_checks_out_the_selected_branch() {
+        let dir = sample_git_project();
+        run_git(dir.path(), &["branch", "feature"]);
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        let idx = app
+            .filtered_branch_rows()
+            .iter()
+            .position(|(name, _)| name == "feature")
+            .unwrap();
+        for _ in 0..idx {
+            app.handle_key(plain_key(KeyCode::Down));
+        }
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.git.current_branch.as_deref(), Some("feature"));
+        assert!(!app.git.branches_popup.open);
+    }
+
+    #[test]
+    fn branches_popup_n_then_typing_then_enter_creates_and_checks_out() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('b')));
+
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        assert!(app.git.branches_popup.show_new_branch_input);
+        for c in "feature".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.git.current_branch.as_deref(), Some("feature"));
+        assert!(!app.git.branches_popup.open);
+    }
+
+    #[test]
+    fn branches_popup_new_branch_esc_cancels_typing_without_creating() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        for c in "abandoned".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.git.branches_popup.show_new_branch_input);
+        assert!(
+            app.git.branches_popup.open,
+            "Esc only cancels typing, not the popup"
+        );
+        assert!(!app.git.branches.iter().any(|b| b.name == "abandoned"));
+    }
+
+    #[test]
+    fn branches_popup_d_then_d_force_deletes_an_unmerged_branch() {
+        let dir = sample_git_project();
+        run_git(dir.path(), &["checkout", "-qb", "feature"]);
+        git_commit(dir.path(), "a.txt", "hello\nfeature", "feature change");
+        run_git(dir.path(), &["checkout", "-q", "main"]);
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        let idx = app
+            .filtered_branch_rows()
+            .iter()
+            .position(|(name, _)| name == "feature")
+            .unwrap();
+        for _ in 0..idx {
+            app.handle_key(plain_key(KeyCode::Down));
+        }
+
+        app.handle_key(plain_key(KeyCode::Char('d')));
+        assert_eq!(
+            app.git.branches_popup.pending_delete.as_deref(),
+            Some("feature")
+        );
+
+        app.handle_key(plain_key(KeyCode::Char('d')));
+        assert!(app.git.branches_popup.pending_delete.is_none());
+        assert!(!app.git.branches.iter().any(|b| b.name == "feature"));
+    }
+
+    #[test]
+    fn branches_popup_delete_confirm_esc_cancels() {
+        // Must be an *unmerged* branch -- a fully-merged one deletes on
+        // the first `d` (the "safe attempt" succeeds immediately), never
+        // reaching a pending-confirm state for `Esc` to cancel.
+        let dir = sample_git_project();
+        run_git(dir.path(), &["checkout", "-qb", "feature"]);
+        git_commit(dir.path(), "a.txt", "hello\nfeature", "feature change");
+        run_git(dir.path(), &["checkout", "-q", "main"]);
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        let idx = app
+            .filtered_branch_rows()
+            .iter()
+            .position(|(name, _)| name == "feature")
+            .unwrap();
+        for _ in 0..idx {
+            app.handle_key(plain_key(KeyCode::Down));
+        }
+        app.handle_key(plain_key(KeyCode::Char('d')));
+        assert!(app.git.branches_popup.pending_delete.is_some());
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(app.git.branches_popup.pending_delete.is_none());
+        assert!(app.git.branches.iter().any(|b| b.name == "feature"));
+    }
+
+    #[test]
+    fn branches_popup_slash_filters_by_typed_text_and_letters_do_not_trigger_commands() {
+        let dir = sample_git_project();
+        run_git(dir.path(), &["branch", "develop"]);
+        run_git(dir.path(), &["branch", "release"]);
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        assert_eq!(app.filtered_branch_rows().len(), 3);
+
+        app.handle_key(plain_key(KeyCode::Char('/')));
+        for c in "dev".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+
+        // "dev" contains 'd', which is the delete command outside typing
+        // mode -- proving it reached `filter` instead is exactly what
+        // this test is for.
+        assert_eq!(app.git.branches_popup.filter, "dev");
+        let rows = app.filtered_branch_rows();
+        assert!(rows.iter().any(|(name, _)| name == "develop"));
+        assert!(!rows.iter().any(|(name, _)| name == "release"));
+        assert!(app.git.branches.iter().any(|b| b.name == "develop"));
+    }
+
+    #[test]
+    fn branches_popup_filter_esc_stops_typing_without_clearing_the_text() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        app.handle_key(plain_key(KeyCode::Char('/')));
+        app.handle_key(plain_key(KeyCode::Char('m')));
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.git.branches_popup.typing_filter);
+        assert_eq!(app.git.branches_popup.filter, "m");
+        assert!(app.git.branches_popup.open);
+    }
+
+    // ---- T28: log filter bar ----
+
+    #[test]
+    fn filter_bar_tab_cycles_fields_and_enter_applies() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "a.txt", "hello\nworld2", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('f')));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().filter_field,
+            FilterField::Branch
+        );
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().filter_field,
+            FilterField::Author
+        );
+        // "Test" -- `run_git`'s fixed `GIT_AUTHOR_NAME` -- must actually
+        // match, since `author` and `query` are ANDed together.
+        for c in "Test".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().filter_field,
+            FilterField::Query
+        );
+        for c in "second".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.git.log_filter.error.is_none());
+        assert_eq!(app.git.graph.len(), 1);
+    }
+
+    #[test]
+    fn filter_bar_ctrl_c_clears_but_bare_c_types_into_the_field() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('f')));
+
+        for c in "carol".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.git.log_filter.branch, "carol");
+
+        app.handle_key(ctrl('c'));
+        assert!(app.git.log_filter.branch.is_empty());
+    }
+
+    // ---- T28: ShowFileHistory / GitBranches commands ----
+
+    #[test]
+    fn trigger_show_file_history_is_a_noop_with_no_active_tab() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.trigger_show_file_history();
+        assert!(app.git_panel.is_none());
+    }
+
+    #[test]
+    fn trigger_show_file_history_opens_the_panel_on_the_files_history() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "a.txt", "hello\nworld2", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(dir.path().join("a.txt")).unwrap();
+
+        app.trigger_show_file_history();
+
+        assert!(app.git_panel.is_some());
+        assert_eq!(app.git_panel.as_ref().unwrap().view, GitPanelView::Log);
+        assert_eq!(
+            app.git.log_filter.viewing_file_history,
+            Some(std::path::PathBuf::from("a.txt"))
+        );
+        assert_eq!(app.git.graph.len(), 2);
+    }
+
+    #[test]
+    fn trigger_git_branches_opens_the_panel_and_the_popup() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.trigger_git_branches();
+
+        assert!(app.git_panel.is_some());
+        assert!(app.git.branches_popup.open);
+    }
+
+    #[test]
+    fn sync_git_status_is_a_noop_with_the_panel_closed() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        fs::write(dir.path().join("a.txt"), "hello\nworld2").unwrap();
+
+        app.sync_git_status();
+
+        assert!(app.git.status.unstaged.is_empty());
+    }
+
+    #[test]
+    fn sync_git_status_refreshes_the_open_panels_lists() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        fs::write(dir.path().join("a.txt"), "hello\nworld2").unwrap();
+
+        app.sync_git_status();
+
+        assert_eq!(app.git.status.unstaged.len(), 1);
     }
 
     #[test]

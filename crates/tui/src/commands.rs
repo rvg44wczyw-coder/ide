@@ -230,6 +230,8 @@ pub enum Action {
     PauseProgram,
     ToggleDebugPanel,
     ConfigureDebugAdapter,
+    GitBranches,
+    ShowFileHistory,
     Exit,
 }
 
@@ -834,6 +836,24 @@ pub fn commands() -> &'static [Command] {
             // analogue to translate a binding from.
             binding: None,
             action: Action::ConfigureDebugAdapter,
+        },
+        Command {
+            id: "GitBranches",
+            title: "Git Branches...",
+            // Palette-only (`docs/features/
+            // tui-git-staging-branches-and-log-filters.md` §2.3) -- the
+            // `b` binding inside the Git Panel overlay is a panel-internal
+            // micro-shortcut, not a global keymap entry, the same
+            // category as `handle_git_panel_key`'s own 'o'/'t'.
+            binding: None,
+            action: Action::GitBranches,
+        },
+        Command {
+            id: "ShowFileHistory",
+            title: "Show History for File",
+            // Palette-only, same reasoning as `GitBranches` above.
+            binding: None,
+            action: Action::ShowFileHistory,
         },
         Command {
             id: "Exit",

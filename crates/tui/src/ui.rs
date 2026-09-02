@@ -21,7 +21,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ClaudeView, DebugPanelFocus, Focus, GitPanelFocus};
+use crate::app::{
+    App, ChangesFocus, ClaudeView, DebugPanelFocus, FilterField, Focus, GitPanelFocus, GitPanelView,
+};
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
 use crate::docker_panel::DockerTab;
@@ -1747,10 +1749,26 @@ fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    match state.view {
+        GitPanelView::Log => render_git_log_view(frame, app, state, popup),
+        GitPanelView::Changes => render_git_changes(frame, app, state, popup),
+    }
+
+    if app.git.branches_popup.open {
+        render_git_branches_popup(frame, app, popup);
+    }
+}
+
+fn render_git_log_view(
+    frame: &mut Frame,
+    app: &App,
+    state: &crate::app::GitPanelState,
+    area: Rect,
+) {
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(popup);
+        .split(area);
 
     render_git_left_column(frame, app, state, columns[0]);
     if app.git.active_conflict.is_some() || app.git.binary_conflict.is_some() {
@@ -1758,6 +1776,222 @@ fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         render_git_diff(frame, app, state, columns[1]);
     }
+}
+
+/// Two `List`s (Staged, Unstaged) plus a boxed commit-message text area
+/// (`docs/features/tui-git-staging-branches-and-log-filters.md` §2.4,
+/// `git-commit-and-staging.md` §2.3's egui rendering content translated to
+/// plain list rows).
+fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanelState, area: Rect) {
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([
+            Constraint::Percentage(35),
+            Constraint::Percentage(35),
+            Constraint::Min(3),
+        ])
+        .split(area);
+
+    let status_row =
+        |title: &str, entries: &[ide_core::StatusEntry], focused: bool, selected: usize| {
+            let items: Vec<ListItem> = if entries.is_empty() {
+                vec![ListItem::new(Line::from("(none)"))]
+            } else {
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, entry)| {
+                        let style = if focused && i == selected {
+                            Style::default().add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default()
+                        };
+                        let badge = change_kind_badge(entry.kind);
+                        ListItem::new(Line::from(Span::styled(
+                            format!("{badge} {}", entry.path.display()),
+                            style,
+                        )))
+                    })
+                    .collect()
+            };
+            (title.to_string(), items)
+        };
+
+    let (staged_title, staged_items) = status_row(
+        "Staged",
+        &app.git.status.staged,
+        state.changes_focus == ChangesFocus::Staged,
+        state.staged_selected,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("{staged_title}  (Enter: unstage)"));
+    frame.render_widget(List::new(staged_items).block(block), rows[0]);
+
+    let (unstaged_title, unstaged_items) = status_row(
+        "Unstaged",
+        &app.git.status.unstaged,
+        state.changes_focus == ChangesFocus::Unstaged,
+        state.unstaged_selected,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("{unstaged_title}  (Enter: stage, x: discard)"));
+    frame.render_widget(List::new(unstaged_items).block(block), rows[1]);
+
+    if app.git.pending_discard.is_some() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Discard this change? (y/n)");
+        frame.render_widget(Paragraph::new(""), block.inner(rows[1]));
+        frame.render_widget(block, rows[1]);
+    }
+
+    let amend_marker = if app.git.amend { " [amend]" } else { "" };
+    let message_style = if state.changes_focus == ChangesFocus::Message {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Message{amend_marker}  (a: toggle amend, Enter: commit)"
+    ));
+    let inner = block.inner(rows[2]);
+    frame.render_widget(block, rows[2]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(app.git.commit_message.clone(), message_style))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn change_kind_badge(kind: ide_core::ChangeKind) -> &'static str {
+    match kind {
+        ide_core::ChangeKind::Added => "A",
+        ide_core::ChangeKind::Modified => "M",
+        ide_core::ChangeKind::Deleted => "D",
+        ide_core::ChangeKind::Conflicted => "U",
+        ide_core::ChangeKind::Untracked => "?",
+    }
+}
+
+/// The branches popup (`docs/features/
+/// tui-git-staging-branches-and-log-filters.md` §2.4/§3.4): centered over
+/// whichever view is active underneath, matching the existing conflict-
+/// resolution popup's own "draw over the current view" precedent.
+fn render_git_branches_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.clamp(30, 60).min(area.width);
+    let height = area.height.clamp(6, 16).min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let rows = app.filtered_branch_rows();
+    let selected = app.git.branches_popup.selected;
+    let mut items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (name, is_head))| {
+            let style = if i == selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let marker = if *is_head { "* " } else { "  " };
+            let mut label = format!("{marker}{name}");
+            if app.git.branches_popup.pending_delete.as_deref() == Some(name.as_str()) {
+                label.push_str("  (not fully merged -- press d again to force delete)");
+            }
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from("No branches match.")));
+    }
+
+    let title = if app.git.branches_popup.show_new_branch_input {
+        format!("New branch: {}", app.git.branches_popup.new_branch_name)
+    } else if app.git.branches_popup.typing_filter {
+        format!(
+            "Branches  /{}  (Enter: checkout, Esc: stop filtering)",
+            app.git.branches_popup.filter
+        )
+    } else if !app.git.branches_popup.filter.is_empty() {
+        format!(
+            "Branches  /{}  (Enter: checkout, m: merge, n: new, d: delete, /: filter)",
+            app.git.branches_popup.filter
+        )
+    } else {
+        "Branches  (Enter: checkout, m: merge, n: new, d: delete, /: filter, Esc: close)"
+            .to_string()
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// The `Log` view's top row (`docs/features/
+/// tui-git-staging-branches-and-log-filters.md` §2.4): the plain "On
+/// branch: ..." line, replaced by the six filter fields laid out inline
+/// (focused one reverse-styled) while `focus == Filter`, or by a
+/// "← Esc: Back to Log" line while viewing a file's history.
+fn render_git_branch_line_row(
+    frame: &mut Frame,
+    app: &App,
+    state: &crate::app::GitPanelState,
+    area: Rect,
+) {
+    if let Some(path) = app.git.log_filter.viewing_file_history.as_ref() {
+        frame.render_widget(
+            Paragraph::new(format!("History: {}  (← Esc: Back to Log)", path.display())),
+            area,
+        );
+        return;
+    }
+
+    if state.focus == GitPanelFocus::Filter {
+        let filter = &app.git.log_filter;
+        let field = |label: &'static str, value: &str, this: FilterField| {
+            let style = if state.filter_field == this {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            (label, value.to_string(), style)
+        };
+        let fields = [
+            field("Br", &filter.branch, FilterField::Branch),
+            field("Au", &filter.author, FilterField::Author),
+            field("Pa", &filter.path, FilterField::Path),
+            field("Since", &filter.since, FilterField::Since),
+            field("Until", &filter.until, FilterField::Until),
+            field("Q", &filter.query, FilterField::Query),
+        ];
+        let mut spans = Vec::new();
+        for (i, (label, value, style)) in fields.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(format!("{label}:{value}"), *style));
+        }
+        if let Some(error) = filter.error.as_ref() {
+            spans.push(Span::styled(
+                format!("  ({error})"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
+    let branch_line = match &app.git.current_branch {
+        Some(branch) => format!("On branch: {branch}"),
+        None => "On branch: (unknown)".to_string(),
+    };
+    frame.render_widget(Paragraph::new(branch_line), area);
 }
 
 fn render_git_left_column(
@@ -1783,11 +2017,7 @@ fn render_git_left_column(
             .split(area)
     };
 
-    let branch_line = match &app.git.current_branch {
-        Some(branch) => format!("On branch: {branch}"),
-        None => "On branch: (unknown)".to_string(),
-    };
-    frame.render_widget(Paragraph::new(branch_line), rows[0]);
+    render_git_branch_line_row(frame, app, state, rows[0]);
 
     let graph_area = if has_conflicts {
         let items: Vec<ListItem> = app
