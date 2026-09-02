@@ -588,6 +588,25 @@ mod tests {
     }
 
     #[test]
+    fn debug_adapter_args_beyond_the_cap_truncates_and_parsing_still_succeeds() {
+        let huge: Vec<String> = (0..(MAX_LANGUAGE_CONFIG_LIST_LEN + 500))
+            .map(|i| i.to_string())
+            .collect();
+        let json = serde_json::json!({
+            "name": "Rust",
+            "extension": "rs",
+            "command": "rust-analyzer",
+            "debug_adapter_command": "codelldb",
+            "debug_adapter_args": huge,
+        });
+        let config: LanguageConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.debug_adapter_args.len(),
+            MAX_LANGUAGE_CONFIG_LIST_LEN
+        );
+    }
+
+    #[test]
     fn args_rejects_a_non_array_value_instead_of_silently_defaulting() {
         let result: Result<LanguageConfig, _> = serde_json::from_str(
             r#"{"name":"Go","extension":"go","command":"gopls","args":"not-an-array"}"#,
