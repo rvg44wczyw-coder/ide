@@ -110,6 +110,7 @@ const MENU_GROUPS: &[MenuGroup] = &[
             Some("GitBranches"),
             Some("ToggleBlameAnnotations"),
             Some("GitWorktrees"),
+            Some("ShowFileHistory"),
         ],
     },
     MenuGroup {
