@@ -1,0 +1,55 @@
+@startuml tui-mouse-support-routing
+title TUI mouse event routing
+
+start
+:crossterm Event::Mouse(event);
+
+if (event.kind?) then (Down(Left))
+  if (popup open?) then (yes)
+    :ignore click\n(popups are keyboard-only);
+    stop
+  else (no)
+    if (hit hits.tree_area?) then (yes)
+      :select clicked row;
+      :handle_tree_enter\n(open file / toggle dir);
+      :Focus::Tree;
+    elseif (hit hits.tab_strip?) then (yes)
+      :focus clicked tab;
+      :Focus::Editor;
+    elseif (hit hits.editor_text_area?) then (yes)
+      :row -> visual.buffer_line;
+      :col -> char column\n(new reverse-map helper);
+      :offset_for_line_column;
+      :scroll_to_and_reveal +\nset_selections(caret(offset));
+      :Focus::Editor;
+    else (no hit)
+      :no-op;
+    endif
+    stop
+  endif
+
+elseif (ScrollUp / ScrollDown) then
+  if (popup open?) then (yes)
+    :1 notch = 1 synthetic\nKeyCode::Up/Down;
+    :feed through handle_key\n(existing popup priority chain);
+    :popup's own selected += / -=\n(no new per-popup code);
+    stop
+  else (no)
+    if (hit tree_area?) then (yes)
+      :synthetic KeyCode::Up/Down\n-> handle_tree_key;
+    elseif (hit editor_text_area?) then (yes)
+      :buf.scroll +=/-= 1\n(new: caret-independent);
+    elseif (over git diff view?) then (yes)
+      :diff_scroll +=/-= 1\n(new: caret-independent);
+    else (no hit)
+      :no-op;
+    endif
+    stop
+  endif
+
+else (Up / Drag / Moved / ScrollLeft / ScrollRight / Down(Right) / Down(Middle))
+  :ignored this phase;
+  stop
+endif
+
+@enduml
