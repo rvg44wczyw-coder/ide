@@ -3614,33 +3614,38 @@ impl IdeApp {
 
         let mut submitted = false;
         let mut clear_clicked = false;
-        ui.collapsing("Filter", |ui| {
-            egui::Grid::new("log_filter_grid")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    for (label, field) in [
-                        ("Branch", &mut self.git.log_filter.branch),
-                        ("Author", &mut self.git.log_filter.author),
-                        ("Path", &mut self.git.log_filter.path),
-                        ("Since (YYYY-MM-DD)", &mut self.git.log_filter.since),
-                        ("Until (YYYY-MM-DD)", &mut self.git.log_filter.until),
-                        ("Message contains", &mut self.git.log_filter.query),
-                    ] {
-                        ui.label(label);
-                        let response = ui.text_edit_singleline(field);
-                        submitted |=
-                            response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        ui.end_row();
-                    }
+        // `default_open(true)` -- this is the primary way to narrow a
+        // large log, not a rarely-used option; collapsed by default would
+        // hide the whole feature behind an undiscovered extra click.
+        egui::CollapsingHeader::new("Filter")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("log_filter_grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for (label, field) in [
+                            ("Branch", &mut self.git.log_filter.branch),
+                            ("Author", &mut self.git.log_filter.author),
+                            ("Path", &mut self.git.log_filter.path),
+                            ("Since (YYYY-MM-DD)", &mut self.git.log_filter.since),
+                            ("Until (YYYY-MM-DD)", &mut self.git.log_filter.until),
+                            ("Message contains", &mut self.git.log_filter.query),
+                        ] {
+                            ui.label(label);
+                            let response = ui.text_edit_singleline(field);
+                            submitted |= response.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            ui.end_row();
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    submitted |= ui.button("Apply").clicked();
+                    clear_clicked = ui.button("Clear Filter").clicked();
                 });
-            ui.horizontal(|ui| {
-                submitted |= ui.button("Apply").clicked();
-                clear_clicked = ui.button("Clear Filter").clicked();
+                if let Some(error) = &self.git.log_filter.error {
+                    ui.colored_label(tokens.color.warning, error);
+                }
             });
-            if let Some(error) = &self.git.log_filter.error {
-                ui.colored_label(tokens.color.warning, error);
-            }
-        });
         if clear_clicked {
             self.git.clear_log_filter();
         } else if submitted {

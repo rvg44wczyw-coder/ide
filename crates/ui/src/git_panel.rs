@@ -865,7 +865,7 @@ fn parse_date_bound(text: &str, end_of_day: bool) -> Result<Option<i64>, String>
     let year: i64 = y.parse().map_err(|_| invalid())?;
     let month: u32 = m.parse().map_err(|_| invalid())?;
     let day: u32 = d.parse().map_err(|_| invalid())?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return Err(invalid());
     }
     let seconds_at_midnight = days_from_civil(year, month, day) * 86_400;
@@ -874,6 +874,20 @@ fn parse_date_bound(text: &str, end_of_day: bool) -> Result<Option<i64>, String>
     } else {
         seconds_at_midnight
     }))
+}
+
+/// Days in `month` (`1..=12`) of proleptic-Gregorian `year`, leap years
+/// included -- `parse_date_bound`'s own validation, so a typo like
+/// `2026-02-30` is rejected as an error rather than silently rolling over
+/// into March (`days_from_civil` doesn't validate this itself; it's
+/// well-defined, just not the calendar date the user typed).
+fn days_in_month(year: i64, month: u32) -> u32 {
+    const DAYS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if month == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+        29
+    } else {
+        DAYS[(month - 1) as usize]
+    }
 }
 
 /// Howard Hinnant's `days_from_civil` (proleptic Gregorian, valid for any
@@ -1372,6 +1386,30 @@ mod tests {
         assert!(parse_date_bound("2026-01-32", false).is_err());
         assert!(parse_date_bound("not-a-date", false).is_err());
         assert!(parse_date_bound("2026-01", false).is_err());
+    }
+
+    #[test]
+    fn parse_date_bound_rejects_a_day_that_does_not_exist_in_that_month() {
+        // 2026 is not a leap year -- Feb has 28 days.
+        assert!(parse_date_bound("2026-02-30", false).is_err());
+        assert!(parse_date_bound("2026-02-29", false).is_err());
+        assert!(parse_date_bound("2026-04-31", false).is_err());
+        assert!(parse_date_bound("2026-01-00", false).is_err());
+    }
+
+    #[test]
+    fn parse_date_bound_accepts_feb_29_on_a_leap_year() {
+        assert!(parse_date_bound("2024-02-29", false).is_ok());
+    }
+
+    #[test]
+    fn days_in_month_handles_leap_year_rules() {
+        assert_eq!(days_in_month(2024, 2), 29); // divisible by 4
+        assert_eq!(days_in_month(2026, 2), 28); // not divisible by 4
+        assert_eq!(days_in_month(1900, 2), 28); // divisible by 100, not 400
+        assert_eq!(days_in_month(2000, 2), 29); // divisible by 400
+        assert_eq!(days_in_month(2026, 4), 30);
+        assert_eq!(days_in_month(2026, 1), 31);
     }
 
     #[test]
