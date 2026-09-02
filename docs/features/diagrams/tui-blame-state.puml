@@ -1,0 +1,28 @@
+@startuml tui-blame-state
+title TUI Blame (T29) -- toggle & popup lifecycle
+
+[*] --> Off
+
+state Off {
+}
+
+state On {
+  state "Lane rendered\n(labels or blanks)" as Lane
+  [*] --> Lane
+}
+
+Off --> On : ToggleBlameAnnotations\n(blame_for + annotations_from_blame)
+On --> Off : ToggleBlameAnnotations\n(blame = None, columns reclaimed)
+
+On --> On : Save (success) / Reload from disk\n[refresh_blame_if_on]
+
+state "Commit Details popup" as Popup {
+  state "Fetch GitPanel::commit_detail\n(sanitize + truncate, every render)" as Fetch
+  [*] --> Fetch
+}
+
+Lane --> Popup : click inside lane columns\non an annotated line\n(handle_mouse_click)
+Lane --> Popup : ShowBlameForCurrentLine\n(caret's line has an annotation)
+Popup --> On : Esc / any key
+
+@enduml
