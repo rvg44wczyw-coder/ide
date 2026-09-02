@@ -129,6 +129,11 @@ pub(crate) struct OpenBuffer {
     /// §3.3) when this tab's path changed or was removed on disk. Cleared
     /// by `ReloadFromDisk`, `DismissExternalChange`, or the tab closing.
     pub(crate) external_change: Option<ExternalChange>,
+    /// `None` = off (`docs/features/tui-blame.md` §2.3). Populated by
+    /// `toggle_blame_annotations`, refreshed by `refresh_blame_if_on`
+    /// after Save and after Reload-from-disk -- `ide-tui` has no Save As,
+    /// so unlike `ide-ui`'s three call sites this crate needs exactly two.
+    pub(crate) blame: Option<Vec<crate::blame_gutter::BlameAnnotation>>,
 }
 
 /// `docs/features/tui-file-watcher.md` §2.2, ported from `ide-ui`'s own
@@ -610,6 +615,17 @@ pub struct App {
     /// `sync_git_working_tree_diff`'s guard, mirrors `last_code_actions_
     /// target` (`docs/features/tui-git-panel.md` §3.1).
     last_git_diff_target: Option<PathBuf>,
+    /// The commit id whose detail the Commit Details popup is showing
+    /// (`docs/features/tui-blame.md` §2.3) -- presence is visibility,
+    /// same convention `git_panel` uses. `GitPanel::commit_detail` is
+    /// re-fetched fresh every render frame this is `Some`, not cached.
+    pub(crate) blame_popup: Option<String>,
+    /// Scroll offset for a `blame_popup` body too tall to fit -- mirrors
+    /// `GitPanelState.diff_scroll`'s shape exactly. Reset to `0` every
+    /// time `blame_popup` transitions to a different (or freshly `Some`)
+    /// commit id, so a second lookup never inherits the first one's
+    /// scroll position.
+    pub(crate) blame_popup_scroll: u16,
     /// Presence is visibility, same convention `git_panel` uses -- unlike
     /// `git`/`git_panel`'s split (an always-present service plus a
     /// separate open/focus wrapper), `DockerPanel`/`K8sPanel` carry their
@@ -729,6 +745,8 @@ impl App {
             git,
             git_panel: None,
             last_git_diff_target: None,
+            blame_popup: None,
+            blame_popup_scroll: 0,
             docker_panel: None,
             k8s_panel: None,
             language,
@@ -1257,6 +1275,7 @@ impl App {
                 self.tabs[idx].buffer = buffer;
                 self.tabs[idx].desired_column = None;
                 self.tabs[idx].external_change = None;
+                self.refresh_blame_if_on(idx);
             }
             Err(err) => self.notify(err.to_string()),
         }
@@ -2568,6 +2587,92 @@ impl App {
         self.git.sync_status();
     }
 
+    /// `ToggleBlameAnnotations` command target (`docs/features/
+    /// tui-blame.md` §3.1). No-op with no active tab. Toggling off drops
+    /// the cache back to `None`, immediately freeing the reserved columns
+    /// next frame. Toggling on calls `blame_for` + `annotations_from_blame`
+    /// against the tab's on-disk path -- blame reflects last-saved
+    /// content, not the live buffer, same as the working-tree diff.
+    fn toggle_blame_annotations(&mut self) {
+        let Some(idx) = self.active_tab else {
+            return;
+        };
+        if self.tabs[idx].blame.is_some() {
+            self.tabs[idx].blame = None;
+            return;
+        }
+        let path = self.tabs[idx].path.clone();
+        let lines = self.git.blame_for(&path);
+        self.tabs[idx].blame = Some(crate::blame_gutter::annotations_from_blame(&lines));
+    }
+
+    /// Called from `trigger_save_active` (on success) and
+    /// `reload_tab_from_disk` -- no-op if blame is off for that tab
+    /// (`docs/features/tui-blame.md` §2.3/§3.1).
+    fn refresh_blame_if_on(&mut self, idx: usize) {
+        if self.tabs[idx].blame.is_none() {
+            return;
+        }
+        let path = self.tabs[idx].path.clone();
+        let lines = self.git.blame_for(&path);
+        self.tabs[idx].blame = Some(crate::blame_gutter::annotations_from_blame(&lines));
+    }
+
+    /// `ShowBlameForCurrentLine` command target (`docs/features/
+    /// tui-blame.md` §3.4 -- a deliberate, documented non-parity addition:
+    /// `ide-ui` has no keyboard path to the blame popup at all, only a
+    /// gutter-label mouse click; this is the keyboard fallback for a
+    /// mouse-hostile terminal session). No-op if the active tab's blame
+    /// is off, or the caret's current buffer line has no covering
+    /// annotation (e.g. beyond `MAX_BLAME_LINES`).
+    fn show_blame_for_current_line(&mut self) {
+        let Some(buf) = self.active_buffer() else {
+            return;
+        };
+        let Some(annotations) = &buf.blame else {
+            return;
+        };
+        let offset = buf.buffer.text_buffer().selections().primary().head;
+        let (line, _) = cursor_line_column(buf.buffer.text_buffer(), offset);
+        let Some(annotation) = crate::blame_gutter::blame_annotation_at(annotations, line) else {
+            return;
+        };
+        self.blame_popup = Some(annotation.commit_id.clone());
+        self.blame_popup_scroll = 0;
+    }
+
+    /// Routes `Up`/`Down` to `blame_popup_scroll` while the Commit
+    /// Details popup is open; any other key closes it (`docs/features/
+    /// tui-blame.md` §2.4 -- "Esc, or any key... closes it").
+    fn handle_blame_popup_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Up => {
+                self.blame_popup_scroll = self.blame_popup_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.blame_popup_scroll = self.blame_popup_scroll.saturating_add(1);
+            }
+            _ => {
+                self.blame_popup = None;
+                self.blame_popup_scroll = 0;
+            }
+        }
+        LoopSignal::Continue
+    }
+
+    /// `0` when the active tab has no `blame` loaded, else
+    /// `blame_gutter::BLAME_LANE_WIDTH` -- the single source of the
+    /// reserved-column value, called from both `handle_mouse_click`'s
+    /// blame-aware split above and `ui.rs`'s `render_editor` (native-
+    /// cursor-position fix, `docs/features/tui-blame.md` §2.3) via the
+    /// same method call, not two independent computations.
+    pub(crate) fn blame_lane_width(&self) -> u16 {
+        match self.active_buffer() {
+            Some(buf) if buf.blame.is_some() => crate::blame_gutter::BLAME_LANE_WIDTH as u16,
+            _ => 0,
+        }
+    }
+
     /// `ToggleGitPanel` command (palette-only, no default binding -- see
     /// `commands.rs`): opens/closes the Git Panel overlay. `self.git`'s own
     /// fields persist across the toggle -- only the transient cursor/scroll
@@ -3863,6 +3968,9 @@ impl App {
         if self.pending_rename_preview.is_some() {
             return self.handle_rename_preview_key(key);
         }
+        if self.blame_popup.is_some() {
+            return self.handle_blame_popup_key(key);
+        }
         if self.git_panel.is_some() {
             return self.handle_git_panel_key(key);
         }
@@ -3925,6 +4033,7 @@ impl App {
             || self.code_actions.is_some()
             || self.rename_popup.is_some()
             || self.pending_rename_preview.is_some()
+            || self.blame_popup.is_some()
             || self.git_panel.is_some()
             || self.docker_panel.is_some()
             || self.k8s_panel.is_some()
@@ -3984,10 +4093,50 @@ impl App {
         }
         if let Some(area) = hits.editor_text_area {
             if area.contains(point.into()) {
-                self.click_editor_at(event.column - area.x, event.row - area.y);
+                let col = event.column - area.x;
+                let row = event.row - area.y;
+                let lane = self.blame_lane_width();
+                if (col as usize) < lane as usize {
+                    self.click_blame_lane(row);
+                } else {
+                    self.click_editor_at(col - lane, row);
+                }
                 self.focus = Focus::Editor;
             }
         }
+    }
+
+    /// Row is relative to the editor's text area's top-left corner, same
+    /// as `click_editor_at` (`docs/features/tui-blame.md` §2.3). Maps to
+    /// a buffer line the same way, including the identical "no-op past
+    /// the buffer's last visible row/line" bounds check -- a click below
+    /// a short file's last line must be exactly as inert here as it
+    /// already is for `click_editor_at`. A hit (a line covered by an
+    /// annotation) opens the Commit Details popup and resets its scroll;
+    /// a miss (reserved columns on a line with no annotation -- only
+    /// reachable past `MAX_BLAME_LINES`, since `blame_for` is synchronous
+    /// and has no loading state) does nothing.
+    fn click_blame_lane(&mut self, area_row: u16) {
+        let Some(buf) = self.active_buffer() else {
+            return;
+        };
+        let Some(annotations) = &buf.blame else {
+            return;
+        };
+        let text_buffer = buf.buffer.text_buffer();
+        let ranges = text_buffer.fold_ranges();
+        let line_count = text_buffer.lines().line_count();
+        let visual = VisualLines::build(line_count, &ranges, &buf.folded);
+        let clicked_row = buf.scroll as usize + area_row as usize;
+        if clicked_row >= visual.row_count() {
+            return;
+        }
+        let line = visual.buffer_line(clicked_row);
+        let Some(annotation) = crate::blame_gutter::blame_annotation_at(annotations, line) else {
+            return;
+        };
+        self.blame_popup = Some(annotation.commit_id.clone());
+        self.blame_popup_scroll = 0;
     }
 
     /// Places the caret at the character under `(area_col, area_row)`,
@@ -4133,6 +4282,8 @@ impl App {
             Action::ToggleGitPanel => self.toggle_git_panel(),
             Action::GitBranches => self.trigger_git_branches(),
             Action::ShowFileHistory => self.trigger_show_file_history(),
+            Action::ToggleBlameAnnotations => self.toggle_blame_annotations(),
+            Action::ShowBlameForCurrentLine => self.show_blame_for_current_line(),
             Action::ToggleDockerPanel => self.toggle_docker_panel(),
             Action::ToggleK8sPanel => self.toggle_k8s_panel(),
             Action::JumpToMatchingBracket => self.trigger_jump_to_matching_bracket(),
@@ -4256,6 +4407,7 @@ impl App {
             shrink_stack: Vec::new(),
             folded: std::collections::BTreeSet::new(),
             external_change: None,
+            blame: None,
         });
         self.active_tab = Some(self.tabs.len() - 1);
         self.record_recent_file(path.clone());
@@ -4534,6 +4686,9 @@ impl App {
         if let Err(err) = buf.buffer.save_with(charset) {
             self.status = Some(err.to_string());
             return;
+        }
+        if let Some(idx) = self.active_tab {
+            self.refresh_blame_if_on(idx);
         }
         let buf = self
             .active_buffer_mut()
@@ -10137,6 +10292,7 @@ mod tests {
             shrink_stack: Vec::new(),
             folded: std::collections::BTreeSet::new(),
             external_change: None,
+            blame: None,
         });
         app.active_tab = Some(0);
 
@@ -10165,6 +10321,7 @@ mod tests {
             shrink_stack: Vec::new(),
             folded: std::collections::BTreeSet::new(),
             external_change: None,
+            blame: None,
         });
         app.active_tab = Some(0);
         app.sync_git_working_tree_diff();
@@ -10197,6 +10354,7 @@ mod tests {
             shrink_stack: Vec::new(),
             folded: std::collections::BTreeSet::new(),
             external_change: None,
+            blame: None,
         });
         app.active_tab = Some(0);
         app.sync_git_working_tree_diff();
@@ -13661,6 +13819,245 @@ mod tests {
             &ui::HitMap::default(),
         );
         assert_eq!(app.focus, before_focus);
+    }
+
+    // ---- Blame (docs/features/tui-blame.md) ----
+
+    fn blame_annotation(
+        line: usize,
+        run_len: usize,
+        commit_id: &str,
+    ) -> crate::blame_gutter::BlameAnnotation {
+        crate::blame_gutter::BlameAnnotation {
+            line,
+            run_len,
+            commit_id: commit_id.to_string(),
+            short_id: commit_id[..commit_id.len().min(7)].to_string(),
+            author: "Test Author".to_string(),
+            timestamp: 0,
+            summary: "a commit".to_string(),
+        }
+    }
+
+    #[test]
+    fn toggle_blame_annotations_with_no_active_tab_is_a_noop() {
+        let (_dir, mut app) = two_file_project();
+        app.active_tab = None;
+        app.toggle_blame_annotations();
+        assert!(app.tabs.iter().all(|t| t.blame.is_none()));
+    }
+
+    #[test]
+    fn toggle_blame_annotations_turns_on_then_off() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        assert!(app.active_buffer().unwrap().blame.is_none());
+
+        app.toggle_blame_annotations();
+        assert!(
+            app.active_buffer().unwrap().blame.is_some(),
+            "toggling on with no repo behind the tab still sets Some(empty), not None"
+        );
+
+        app.toggle_blame_annotations();
+        assert!(app.active_buffer().unwrap().blame.is_none());
+    }
+
+    #[test]
+    fn blame_lane_width_is_zero_until_blame_is_toggled_on() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        assert_eq!(app.blame_lane_width(), 0);
+        app.toggle_blame_annotations();
+        assert_eq!(
+            app.blame_lane_width(),
+            crate::blame_gutter::BLAME_LANE_WIDTH as u16
+        );
+    }
+
+    #[test]
+    fn refresh_blame_if_on_is_a_noop_when_blame_is_off() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        let idx = app.active_tab.unwrap();
+        app.refresh_blame_if_on(idx);
+        assert!(app.tabs[idx].blame.is_none());
+    }
+
+    #[test]
+    fn refresh_blame_if_on_reloads_when_blame_is_on() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        let idx = app.active_tab.unwrap();
+        app.tabs[idx].blame = Some(vec![blame_annotation(0, 1, "aaaaaaa")]);
+        app.refresh_blame_if_on(idx);
+        // No repo behind this tab, so a fresh `blame_for` call comes back
+        // empty -- confirms it actually re-ran rather than leaving the
+        // stale annotation in place.
+        assert_eq!(app.tabs[idx].blame.as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn show_blame_for_current_line_with_no_active_tab_is_a_noop() {
+        let (_dir, mut app) = two_file_project();
+        app.active_tab = None;
+        app.show_blame_for_current_line();
+        assert!(app.blame_popup.is_none());
+    }
+
+    #[test]
+    fn show_blame_for_current_line_with_blame_off_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        app.show_blame_for_current_line();
+        assert!(app.blame_popup.is_none());
+    }
+
+    #[test]
+    fn show_blame_for_current_line_with_no_covering_annotation_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\nfn other() {}\n");
+        let idx = app.active_tab.unwrap();
+        app.tabs[idx].blame = Some(vec![blame_annotation(0, 1, "aaaaaaa")]);
+        app.handle_key(plain_key(KeyCode::Down)); // caret now on line 1, uncovered
+        app.show_blame_for_current_line();
+        assert!(app.blame_popup.is_none());
+    }
+
+    #[test]
+    fn show_blame_for_current_line_opens_the_popup_on_a_hit() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        let idx = app.active_tab.unwrap();
+        app.tabs[idx].blame = Some(vec![blame_annotation(0, 1, "aaaaaaa")]);
+        app.blame_popup_scroll = 5;
+        app.show_blame_for_current_line();
+        assert_eq!(app.blame_popup.as_deref(), Some("aaaaaaa"));
+        assert_eq!(app.blame_popup_scroll, 0);
+    }
+
+    #[test]
+    fn handle_blame_popup_key_up_and_down_adjust_scroll_without_closing() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        app.blame_popup = Some("aaaaaaa".to_string());
+        app.blame_popup_scroll = 2;
+
+        app.handle_blame_popup_key(plain_key(KeyCode::Down));
+        assert_eq!(app.blame_popup_scroll, 3);
+        assert!(app.blame_popup.is_some());
+
+        app.handle_blame_popup_key(plain_key(KeyCode::Up));
+        app.handle_blame_popup_key(plain_key(KeyCode::Up));
+        app.handle_blame_popup_key(plain_key(KeyCode::Up));
+        assert_eq!(
+            app.blame_popup_scroll, 0,
+            "must saturate at 0, never underflow"
+        );
+    }
+
+    #[test]
+    fn handle_blame_popup_key_any_other_key_closes_it() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        app.blame_popup = Some("aaaaaaa".to_string());
+        app.blame_popup_scroll = 4;
+
+        app.handle_blame_popup_key(plain_key(KeyCode::Esc));
+
+        assert!(app.blame_popup.is_none());
+        assert_eq!(app.blame_popup_scroll, 0);
+    }
+
+    #[test]
+    fn handle_key_routes_to_the_blame_popup_before_anything_else() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        app.blame_popup = Some("aaaaaaa".to_string());
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        assert!(
+            app.blame_popup.is_none(),
+            "any non-arrow key must close the popup rather than falling through to editor input"
+        );
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_blame_popup() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        assert!(!app.any_popup_open());
+        app.blame_popup = Some("aaaaaaa".to_string());
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn click_blame_lane_on_a_covered_line_opens_the_popup() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let idx = app.active_tab.unwrap();
+        app.tabs[idx].blame = Some(vec![
+            blame_annotation(0, 1, "aaaaaaa"),
+            blame_annotation(1, 1, "bbbbbbb"),
+        ]);
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            &hits,
+        );
+        assert_eq!(app.blame_popup.as_deref(), Some("bbbbbbb"));
+    }
+
+    #[test]
+    fn click_blame_lane_past_the_buffer_end_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("abc\n");
+        let idx = app.active_tab.unwrap();
+        app.tabs[idx].blame = Some(vec![blame_annotation(0, 1, "aaaaaaa")]);
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 4),
+            &hits,
+        );
+        assert!(app.blame_popup.is_none());
+    }
+
+    #[test]
+    fn click_past_the_blame_lane_still_places_the_caret() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let idx = app.active_tab.unwrap();
+        app.tabs[idx].blame = Some(vec![
+            blame_annotation(0, 1, "aaaaaaa"),
+            blame_annotation(1, 1, "bbbbbbb"),
+        ]);
+        let lane = app.blame_lane_width();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
+            &hits,
+        );
+        assert!(
+            app.blame_popup.is_none(),
+            "clicking past the lane must fall through to caret placement, not the popup"
+        );
+        let (line, column) = cursor_line_column(
+            app.active_buffer().unwrap().buffer.text_buffer(),
+            caret(&app),
+        );
+        assert_eq!((line, column), (1, 2));
     }
 
     #[test]

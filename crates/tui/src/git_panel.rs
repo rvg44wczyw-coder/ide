@@ -558,7 +558,68 @@ impl GitPanel {
         }
         Ok(())
     }
+
+    /// Canonicalizes `absolute_path`, strips the repo's workdir prefix,
+    /// and blames the resulting repo-relative path -- returns an empty
+    /// `Vec` (not an error) for no repo open, an untracked path, or any
+    /// canonicalization failure, mirroring `ide-ui`'s own `blame_for`
+    /// (`docs/features/tui-blame.md` §2.2).
+    pub fn blame_for(&self, absolute_path: &Path) -> Vec<ide_core::BlameLine> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        std::fs::canonicalize(absolute_path)
+            .ok()
+            .and_then(|canonical| {
+                canonical
+                    .strip_prefix(repo.workdir())
+                    .ok()
+                    .map(|p| p.to_path_buf())
+            })
+            .and_then(|rel| repo.blame_file(rel).ok())
+            .unwrap_or_default()
+    }
+
+    /// Sanitizes and length-caps every text field before returning --
+    /// ports the sanitize-then-truncate fix from `docs/security-findings/
+    /// git-branches-and-blame-ui-2026-09-01.md` (findings 1-2) at the
+    /// same layer `ide-ui`'s own `GitPanel::commit_detail` applies it at,
+    /// not in `ide_core` or the render call site (`docs/features/
+    /// tui-blame.md` §2.2). Strip-then-truncate in that order --
+    /// stripping after truncation could re-expose an unterminated
+    /// override cut mid-sequence.
+    pub fn commit_detail(&self, commit_id: &str) -> Result<ide_core::CommitDetail, String> {
+        let Some(repo) = &self.repo else {
+            return Err("no repository open".to_string());
+        };
+        let detail = repo.commit_detail(commit_id).map_err(|e| e.to_string())?;
+        Ok(ide_core::CommitDetail {
+            summary: crate::blame_gutter::truncate_display(
+                &crate::blame_gutter::strip_bidi_controls(&detail.summary),
+                MAX_COMMIT_DETAIL_SUMMARY_CHARS,
+            ),
+            body: crate::blame_gutter::truncate_display(
+                &crate::blame_gutter::strip_bidi_controls(&detail.body),
+                MAX_COMMIT_DETAIL_BODY_CHARS,
+            ),
+            author: crate::blame_gutter::truncate_display(
+                &crate::blame_gutter::strip_bidi_controls(&detail.author),
+                MAX_COMMIT_DETAIL_NAME_CHARS,
+            ),
+            email: crate::blame_gutter::truncate_display(
+                &crate::blame_gutter::strip_bidi_controls(&detail.email),
+                MAX_COMMIT_DETAIL_NAME_CHARS,
+            ),
+            ..detail
+        })
+    }
 }
+
+/// Same three values as `ide-ui`'s own `GitPanel::commit_detail` wrapper
+/// -- consistency, not derivation from anything crate-specific.
+const MAX_COMMIT_DETAIL_SUMMARY_CHARS: usize = 200;
+const MAX_COMMIT_DETAIL_BODY_CHARS: usize = 4000;
+const MAX_COMMIT_DETAIL_NAME_CHARS: usize = 200;
 
 fn non_empty(text: &str) -> Option<String> {
     let trimmed = text.trim();
@@ -1365,5 +1426,126 @@ mod tests {
         assert_eq!(lanes["c"], 0);
         assert_ne!(lanes["b1"], lanes["b2"]);
         assert!(lanes.contains_key("a"));
+    }
+
+    #[test]
+    fn blame_for_attributes_each_line() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\ntwo\n", "first");
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+
+        let lines = panel.blame_for(&dir.path().join("f.txt"));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].summary, "first");
+    }
+
+    #[test]
+    fn blame_for_an_untracked_path_is_empty() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\n", "init");
+        std::fs::write(dir.path().join("untracked.txt"), "x\n").unwrap();
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+
+        assert!(panel
+            .blame_for(&dir.path().join("untracked.txt"))
+            .is_empty());
+    }
+
+    #[test]
+    fn blame_for_with_no_repo_open_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "a\n").unwrap();
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+
+        assert!(panel.blame_for(&file).is_empty());
+    }
+
+    #[test]
+    fn commit_detail_returns_summary_and_body() {
+        let dir = init_repo();
+        let id = commit(dir.path(), "f.txt", "a\n", "Summary\n\nBody.");
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+
+        let detail = panel.commit_detail(&id).unwrap();
+
+        assert_eq!(detail.summary, "Summary");
+        assert_eq!(detail.body, "Body.");
+    }
+
+    #[test]
+    fn commit_detail_with_no_repo_open_errors() {
+        let panel = GitPanel::default();
+        assert!(panel.commit_detail("HEAD").is_err());
+    }
+
+    #[test]
+    fn commit_detail_strips_bidi_controls_from_author_and_email() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+        run(dir.path(), &["add", "."]);
+        let evil_author = "trusted-dev\u{202E} .exe.gnp.suoicilam";
+        let status = Command::new("git")
+            .args(["commit", "-q", "-m", "looks normal"])
+            .current_dir(dir.path())
+            .env("GIT_AUTHOR_NAME", evil_author)
+            .env("GIT_AUTHOR_EMAIL", "a\u{202E}b@example.com")
+            .env("GIT_COMMITTER_NAME", evil_author)
+            .env("GIT_COMMITTER_EMAIL", "a\u{202E}b@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let id = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+
+        let detail = panel.commit_detail(&id).unwrap();
+
+        assert!(!detail.author.contains('\u{202E}'));
+        assert!(!detail.email.contains('\u{202E}'));
+    }
+
+    #[test]
+    fn commit_detail_caps_an_unbounded_summary_and_body() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("f.txt"), "a\n").unwrap();
+        run(dir.path(), &["add", "."]);
+        let huge_summary = "S".repeat(10_000);
+        let huge_body = "B".repeat(50_000);
+        let message = format!("{huge_summary}\n\n{huge_body}");
+        run(dir.path(), &["commit", "-q", "-m", &message]);
+        let id = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+
+        let detail = panel.commit_detail(&id).unwrap();
+
+        assert!(detail.summary.chars().count() <= MAX_COMMIT_DETAIL_SUMMARY_CHARS);
+        assert!(detail.body.chars().count() <= MAX_COMMIT_DETAIL_BODY_CHARS);
     }
 }

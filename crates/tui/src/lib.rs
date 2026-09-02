@@ -30,6 +30,7 @@
 //! sequence this crate already sends such a terminal.
 
 mod app;
+mod blame_gutter;
 mod cargo_panel;
 mod claude_panel;
 mod claude_terminal;
