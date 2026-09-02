@@ -1,0 +1,54 @@
+@startuml debugger-handshake
+title F5a — DAP session handshake
+
+participant "ide-ui\n(DebugPanel)" as UI
+participant "ide-dap\n(DapClient)" as Client
+participant "Debug adapter\n(subprocess)" as Adapter
+
+UI -> Client : start(command, args, project_root)
+activate Client
+Client -> Adapter : spawn subprocess
+Client -> Adapter : initialize request
+Adapter --> Client : initialize response (capabilities)
+Client -> UI : DapEvent::CapabilitiesReceived
+note right of Client
+  queued requests flush here
+  (transport-level "ready" gate)
+end note
+
+UI -> Client : send(Launch { arguments })
+Client -> Adapter : launch request
+Adapter --> Client : initialized event
+Client -> UI : DapEvent::ReadyForBreakpoints
+note right of Client
+  distinct from CapabilitiesReceived --
+  DAP's own "safe to configure now" signal
+end note
+
+UI -> Client : send(SetBreakpoints { path, breakpoints })
+Client -> Adapter : setBreakpoints request
+Adapter --> Client : setBreakpoints response
+Client -> UI : DapEvent::BreakpointsConfirmed
+
+UI -> Client : send(ConfigurationDone)
+alt supports_configuration_done_request
+  Client -> Adapter : configurationDone request
+else not supported
+  note right of Client : silently dropped, not sent
+end
+Adapter --> Client : launch response
+
+Adapter --> Client : stopped event (breakpoint hit)
+Client -> UI : DapEvent::Stopped { thread_id, reason }
+UI -> Client : send(StackTrace { thread_id })
+Client -> Adapter : stackTrace request
+Adapter --> Client : stackTrace response
+Client -> UI : DapEvent::StackTrace { frames }
+
+UI -> Client : send(Disconnect)
+Client -> Adapter : disconnect request (terminateDebuggee: true)
+Adapter --> Client : disconnect response
+Client -> UI : DapEvent::Terminated
+deactivate Client
+
+@enduml
