@@ -7,7 +7,7 @@ use ide_dap::{
     Capabilities, DapClient, DapEvent, DapRequest, OutputCategory, SourceBreakpoint, StackFrame,
     ThreadInfo, VerifiedBreakpoint,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Same bound class as `ClaudeTerminal::TERMINAL_SCROLLBACK_LIMIT` --
@@ -36,7 +36,7 @@ pub struct DebugPanel {
     /// the event itself reports (the adapter's answer to one whole-file
     /// `SetBreakpoints` request).
     pub confirmed_breakpoints: HashMap<PathBuf, Vec<VerifiedBreakpoint>>,
-    pub output: Vec<(OutputCategory, String)>,
+    pub output: VecDeque<(OutputCategory, String)>,
     pub error: Option<String>,
     /// Draft text for the "Debug" popup's launch-arguments field (raw
     /// JSON) -- a text field, not a form, per doc §2.3's explicit
@@ -102,9 +102,9 @@ impl DebugPanel {
                 self.stack = frames;
             }
             DapEvent::Output { category, text } => {
-                self.output.push((category, text));
+                self.output.push_back((category, text));
                 if self.output.len() > MAX_DEBUG_OUTPUT_LINES {
-                    self.output.remove(0);
+                    self.output.pop_front();
                 }
             }
             DapEvent::Exited { .. } => {}
@@ -330,7 +330,7 @@ mod tests {
             });
         }
         assert_eq!(panel.output.len(), MAX_DEBUG_OUTPUT_LINES);
-        assert_eq!(panel.output.first().unwrap().1, "10");
+        assert_eq!(panel.output.front().unwrap().1, "10");
     }
 
     #[test]

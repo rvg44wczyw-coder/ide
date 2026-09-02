@@ -119,8 +119,13 @@ No Critical/High/Medium findings. One Low, informational-severity note:
    - **Suggested fix direction**: switch `output` to `VecDeque` and use
      `push_back`/`pop_front`, matching `ClaudeTerminal` exactly as the
      comment already claims.
+   - **Outcome: fixed.** `output` is now `VecDeque<(OutputCategory,
+     String)>`, evicted with `pop_front` — matches `ClaudeTerminal`
+     exactly, as the doc comment always claimed. fmt/clippy/build/test
+     re-verified green workspace-wide after the change.
 
 ## 3. Verdict
 
 Clean — no Critical/High/Medium security findings. One Low, informational
-DoS-class note above (not blocking).
+DoS-class note above; fixed rather than left open, per this project's
+standing "fix even low findings" policy.
