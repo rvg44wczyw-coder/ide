@@ -867,9 +867,12 @@ impl App {
                     self.debug_panel.stack_selected =
                         self.debug_panel.stack_selected.saturating_sub(1);
                 }
+                // `output_scroll` counts lines held back from the tail
+                // (0 = following the latest output) -- `Up` reveals older
+                // lines, so it *increases* the hold-back amount.
                 DebugPanelFocus::Output => {
                     self.debug_panel.output_scroll =
-                        self.debug_panel.output_scroll.saturating_sub(1);
+                        self.debug_panel.output_scroll.saturating_add(1);
                 }
             },
             KeyCode::Down => match self.debug_panel.focus {
@@ -883,16 +886,22 @@ impl App {
                         self.debug_panel.stack_selected += 1;
                     }
                 }
+                // `Down` moves back toward the latest output, the
+                // inverse of `Up` immediately above.
                 DebugPanelFocus::Output => {
                     self.debug_panel.output_scroll =
-                        self.debug_panel.output_scroll.saturating_add(1);
+                        self.debug_panel.output_scroll.saturating_sub(1);
                 }
             },
-            KeyCode::PageUp => {
-                self.debug_panel.output_scroll = self.debug_panel.output_scroll.saturating_sub(10);
-            }
-            KeyCode::PageDown => {
+            // Only meaningful for the Output section (`docs/features/
+            // tui-debugger.md` §2.6) -- gated on focus so paging doesn't
+            // silently scroll a pane that isn't even highlighted while
+            // Threads/Stack has focus.
+            KeyCode::PageUp if self.debug_panel.focus == DebugPanelFocus::Output => {
                 self.debug_panel.output_scroll = self.debug_panel.output_scroll.saturating_add(10);
+            }
+            KeyCode::PageDown if self.debug_panel.focus == DebugPanelFocus::Output => {
+                self.debug_panel.output_scroll = self.debug_panel.output_scroll.saturating_sub(10);
             }
             KeyCode::Enter => self.confirm_debug_panel_selection(),
             _ => {}
@@ -12854,6 +12863,37 @@ mod tests {
         assert_eq!(app.debug_panel.focus, DebugPanelFocus::Output);
         app.handle_key(plain_key(KeyCode::BackTab));
         assert_eq!(app.debug_panel.focus, DebugPanelFocus::Stack);
+    }
+
+    #[test]
+    fn handle_debug_panel_key_output_scroll_up_reveals_older_lines_down_returns_to_the_tail() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel_open = true;
+        app.debug_panel.focus = DebugPanelFocus::Output;
+
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.debug_panel.output_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.debug_panel.output_scroll, 11);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.debug_panel.output_scroll, 10);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.debug_panel.output_scroll, 0);
+    }
+
+    #[test]
+    fn handle_debug_panel_key_page_up_down_are_no_ops_outside_output_focus() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.debug_panel_open = true;
+        assert_eq!(app.debug_panel.focus, DebugPanelFocus::Threads);
+
+        app.handle_key(plain_key(KeyCode::PageUp));
+        app.handle_key(plain_key(KeyCode::PageDown));
+
+        assert_eq!(app.debug_panel.output_scroll, 0);
     }
 
     #[test]
