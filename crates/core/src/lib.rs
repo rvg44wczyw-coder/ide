@@ -51,8 +51,9 @@ pub use search_in_path::{
 };
 pub use syntax::{
     syntax_for_extension, syntax_for_path, tokenize, tokenize_range, LineState, SyntaxRules, Token,
-    TokenKind, C, CSS, DOCKERFILE, ENV, GO, INI, JAVA, JAVASCRIPT, JSON, MAKEFILE, MARKDOWN,
-    MAX_HIGHLIGHTED_FILE_BYTES, PYTHON, RUST, SHELL, SQL, SYSTEMD_UNIT, TOML, XML, YAML,
+    TokenKind, C, CSS, DART, DOCKERFILE, ELIXIR, ENV, GO, HASKELL, INI, JAVA, JAVASCRIPT, JSON,
+    KOTLIN, LUA, MAKEFILE, MARKDOWN, MAX_HIGHLIGHTED_FILE_BYTES, PHP, PYTHON, RUBY, RUST, SHELL,
+    SQL, SWIFT, SYSTEMD_UNIT, TOML, XML, YAML, ZIG,
 };
 pub use text::word_at;
 pub use text::{
