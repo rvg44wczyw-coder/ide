@@ -99,6 +99,14 @@ pub struct LanguageConfig {
     /// treatment as `args`.
     #[serde(default, deserialize_with = "deserialize_bounded_string_vec")]
     pub debug_adapter_args: Vec<String>,
+    /// Column for the right-margin guide (`docs/features/
+    /// right-margin-guide.md`). `None` means "use the global default
+    /// (120)" -- `right_margin_column()` is the one call site that checks.
+    /// `#[serde(default)]` for the same backward-compatibility reason as
+    /// `debug_adapter_command`: a `custom_languages` entry persisted
+    /// before this field existed still deserializes, defaulting to 120.
+    #[serde(default)]
+    pub right_margin_column: Option<u32>,
 }
 
 impl LanguageConfig {
@@ -127,6 +135,13 @@ impl LanguageConfig {
             return None;
         }
         Some((command, self.debug_adapter_args.as_slice()))
+    }
+
+    /// `right_margin_column`, or `120` if unset -- the one call site that
+    /// applies the default (mirrors `debug_adapter()`'s "one call site
+    /// decides" shape).
+    pub fn right_margin_column(&self) -> u32 {
+        self.right_margin_column.unwrap_or(120)
     }
 }
 
@@ -503,6 +518,46 @@ mod tests {
         assert_eq!(config.debug_adapter_command, None);
         assert!(config.debug_adapter_args.is_empty());
         assert_eq!(config.debug_adapter(), None);
+    }
+
+    #[test]
+    fn language_config_deserializes_with_no_right_margin_column_key_present() {
+        // Old-shape JSON, persisted before this field existed at all.
+        let json = r#"{"name":"Go","extension":"go","command":"gopls"}"#;
+        let config: LanguageConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.right_margin_column, None);
+        assert_eq!(config.right_margin_column(), 120);
+    }
+
+    #[test]
+    fn language_config_round_trips_with_right_margin_column() {
+        let config = LanguageConfig {
+            right_margin_column: Some(79),
+            ..go_config()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let reloaded: LanguageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded, config);
+    }
+
+    #[test]
+    fn right_margin_column_defaults_to_120_when_unset() {
+        assert_eq!(go_config().right_margin_column(), 120);
+    }
+
+    #[test]
+    fn right_margin_column_returns_the_configured_value() {
+        let config = LanguageConfig {
+            right_margin_column: Some(79),
+            ..go_config()
+        };
+        assert_eq!(config.right_margin_column(), 79);
+    }
+
+    #[test]
+    fn rust_config_leaves_right_margin_column_unset() {
+        assert_eq!(LanguageConfig::rust().right_margin_column, None);
+        assert_eq!(LanguageConfig::rust().right_margin_column(), 120);
     }
 
     #[test]
