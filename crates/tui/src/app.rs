@@ -9,7 +9,9 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ide_core::{
     all_occurrences, detect_language, editorconfig, fuzzy_score, newline_indent, next_occurrence,
     splits_a_pair, syntax_for_path, word_at, Buffer, BufferError, Change, Charset, DirEntry,
@@ -2794,6 +2796,173 @@ impl App {
         LoopSignal::Continue
     }
 
+    /// Mirrors `handle_key`'s own popup-priority chain above (every branch
+    /// before the `keymap.action_for`/`self.focus` dispatch) -- kept as a
+    /// single source of truth so mouse routing (`docs/features/
+    /// tui-mouse-support.md` §3.2/§3.3) never drifts from which state
+    /// `handle_key` itself currently treats as "a popup is open".
+    fn any_popup_open(&self) -> bool {
+        self.palette.is_some()
+            || self.find.is_some()
+            || self.goto.is_some()
+            || self.notifications_open
+            || self.problems.is_some()
+            || self.cargo_panel_open
+            || self.hover_open
+            || self.search_open
+            || self.go_to_file.is_some()
+            || self.go_to_symbol.is_some()
+            || self.recent_files.is_some()
+            || self.bookmarks_popup.is_some()
+            || self.todo_panel.is_some()
+            || self.code_actions.is_some()
+            || self.rename_popup.is_some()
+            || self.pending_rename_preview.is_some()
+            || self.git_panel.is_some()
+            || self.docker_panel.is_some()
+            || self.k8s_panel.is_some()
+            || self.keymap_popup.is_some()
+            || self.new_scratch_file.is_some()
+            || self.scratch_files.is_some()
+            || self.claude_panel_open
+    }
+
+    /// Entry point for every `Event::Mouse` (`docs/features/
+    /// tui-mouse-support.md` §2.3). `hits` is the *previous* frame's
+    /// `ui::HitMap` -- `main.rs`'s `run` loop reads it one frame behind
+    /// what's currently on screen, the same lag its scroll-follow/resize
+    /// handling already accepts.
+    pub fn handle_mouse(&mut self, event: MouseEvent, hits: &crate::ui::HitMap) {
+        // T26: raw PTY focus forwards every key except Shift+Esc to the
+        // terminal; mouse events are dropped entirely rather than
+        // forwarded (there is no PTY mouse-reporting story here) or used
+        // for chrome navigation while the PTY owns input.
+        if self.claude_panel_open && self.claude_terminal_focus {
+            return;
+        }
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(event, hits),
+            MouseEventKind::ScrollUp => self.handle_mouse_scroll(event, hits, KeyCode::Up),
+            MouseEventKind::ScrollDown => self.handle_mouse_scroll(event, hits, KeyCode::Down),
+            _ => {}
+        }
+    }
+
+    /// Position-based, independent of `self.focus` (§3.2). A popup owns
+    /// all input while open, so a click doesn't reach the base view at
+    /// all in that case, matching wheel scroll's own popup-priority rule.
+    fn handle_mouse_click(&mut self, event: MouseEvent, hits: &crate::ui::HitMap) {
+        if self.any_popup_open() {
+            return;
+        }
+        let point: (u16, u16) = (event.column, event.row);
+        if let Some(area) = hits.tree_area {
+            if area.contains(point.into()) {
+                let row = (event.row - area.y) as usize;
+                self.tree_state.select(&self.tree, row);
+                self.handle_tree_enter();
+                self.focus = Focus::Tree;
+                return;
+            }
+        }
+        for &(rect, index) in &hits.tab_strip {
+            if rect.contains(point.into()) {
+                self.active_tab = Some(index);
+                self.focus = Focus::Editor;
+                return;
+            }
+        }
+        if let Some(area) = hits.editor_text_area {
+            if area.contains(point.into()) {
+                self.click_editor_at(event.column - area.x, event.row - area.y);
+                self.focus = Focus::Editor;
+            }
+        }
+    }
+
+    /// Places the caret at the character under `(area_col, area_row)`,
+    /// both relative to the editor's text area's top-left corner
+    /// (`docs/features/tui-mouse-support.md` §3.2.3). No-op past the
+    /// buffer's last visible row/line -- clicking blank space below a
+    /// short file's content places no caret, rather than clamping into
+    /// the last line (which would silently jump the caret away from
+    /// where the user actually clicked).
+    fn click_editor_at(&mut self, area_col: u16, area_row: u16) {
+        let Some(buf) = self.active_buffer_mut() else {
+            return;
+        };
+        let text_buffer = buf.buffer.text_buffer();
+        let ranges = text_buffer.fold_ranges();
+        let line_count = text_buffer.lines().line_count();
+        let visual = VisualLines::build(line_count, &ranges, &buf.folded);
+        let clicked_row = buf.scroll as usize + area_row as usize;
+        if clicked_row >= visual.row_count() {
+            return;
+        }
+        let line = visual.buffer_line(clicked_row);
+        let line_text = text_buffer.line_text(line).unwrap_or("");
+        let column = crate::highlight::char_column_for_screen_column(
+            line_text,
+            area_col as usize,
+            buf.indent.width,
+        );
+        let offset = offset_for_line_column(text_buffer, line, column);
+        buf.desired_column = None;
+        buf.buffer
+            .text_buffer_mut()
+            .set_selections(Selections::single(Selection::caret(offset)));
+    }
+
+    /// One wheel notch = one synthetic `direction` press (§3.3): while a
+    /// popup is open it's fed through `handle_key`'s own popup-priority
+    /// chain (zero new per-popup code -- reuses every popup's existing
+    /// Up/Down clamp/dispatch, Git Panel's `GitPanelFocus` routing
+    /// included); otherwise it's position-based against the base view.
+    fn handle_mouse_scroll(
+        &mut self,
+        event: MouseEvent,
+        hits: &crate::ui::HitMap,
+        direction: KeyCode,
+    ) {
+        let synthetic = KeyEvent::new(direction, KeyModifiers::NONE);
+        if self.any_popup_open() {
+            self.handle_key(synthetic);
+            return;
+        }
+        let point: (u16, u16) = (event.column, event.row);
+        if hits.tree_area.is_some_and(|r| r.contains(point.into())) {
+            self.handle_tree_key(synthetic);
+            return;
+        }
+        if hits
+            .editor_text_area
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            self.scroll_editor_view(direction);
+        }
+    }
+
+    /// The one genuinely new primitive this feature adds (§3.3): the
+    /// editor has no existing keyboard action that moves `buf.scroll`
+    /// without also moving the caret, unlike every popup's `selected`
+    /// field or the git panel's `diff_scroll` (both already have a plain
+    /// Up/Down handler to reuse). Caret, selection and `desired_column`
+    /// are all left untouched.
+    fn scroll_editor_view(&mut self, direction: KeyCode) {
+        let Some(buf) = self.active_buffer_mut() else {
+            return;
+        };
+        let text_buffer = buf.buffer.text_buffer();
+        let ranges = text_buffer.fold_ranges();
+        let line_count = text_buffer.lines().line_count();
+        let total_rows = VisualLines::build(line_count, &ranges, &buf.folded).row_count();
+        let max_scroll = total_rows.saturating_sub(1).min(u16::MAX as usize) as u16;
+        buf.scroll = match direction {
+            KeyCode::Up => buf.scroll.saturating_sub(1),
+            _ => buf.scroll.saturating_add(1).min(max_scroll),
+        };
+    }
+
     fn run_action(&mut self, action: Action) -> LoopSignal {
         match action {
             Action::SaveActive => self.trigger_save_active(),
@@ -4581,7 +4750,9 @@ fn workspace_text_edits_to_transaction(
 mod tests {
     use super::*;
     use crate::commands::binding_for;
+    use crate::ui;
     use crossterm::event::KeyEventState;
+    use ratatui::layout::Rect;
     use std::fs;
 
     fn key(modifiers: KeyModifiers, code: KeyCode) -> KeyEvent {
@@ -11512,7 +11683,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        terminal
+            .draw(|f| crate::ui::render(f, &app, &mut crate::ui::HitMap::default()))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
 
         let row_text = |y: u16| -> String {
@@ -11567,7 +11740,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        terminal
+            .draw(|f| crate::ui::render(f, &app, &mut crate::ui::HitMap::default()))
+            .unwrap();
         let cursor = terminal.get_cursor_position().unwrap();
         let buf = terminal.backend().buffer().clone();
         let row_chars: Vec<String> = (0..buf.area.width)
@@ -11601,7 +11776,9 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| crate::ui::render(f, &app)).unwrap();
+        terminal
+            .draw(|f| crate::ui::render(f, &app, &mut crate::ui::HitMap::default()))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
         let rendered: String = (0..buf.area.height)
             .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
@@ -11611,5 +11788,353 @@ mod tests {
             rendered.contains("تعليق"),
             "the Arabic comment must still appear on screen"
         );
+    }
+
+    // ---- Mouse support (docs/features/tui-mouse-support.md) ----
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn two_file_project() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "A").unwrap();
+        fs::write(dir.path().join("b.txt"), "B").unwrap();
+        let app = App::new(dir.path().to_path_buf()).unwrap();
+        (dir, app)
+    }
+
+    #[test]
+    fn any_popup_open_reflects_open_state() {
+        let (_dir, mut app) = two_file_project();
+        assert!(!app.any_popup_open());
+        app.open_palette();
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_tree_row_selects_and_opens_it() {
+        let (_dir, mut app) = two_file_project();
+        let rows = app.tree_state.visible_rows(&app.tree);
+        assert!(rows.len() >= 2);
+        let target_name = rows[1].path.file_name().unwrap().to_owned();
+
+        let hits = ui::HitMap {
+            tree_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            editor_text_area: None,
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
+            &hits,
+        );
+
+        assert_eq!(app.focus, Focus::Tree);
+        let active_path = app.tabs[app.active_tab.unwrap()].path.clone();
+        assert_eq!(active_path.file_name().unwrap(), target_name);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_tab_strip_entry_switches_active_tab() {
+        let (dir, mut app) = two_file_project();
+        app.open_or_focus_tab(dir.path().join("a.txt")).unwrap();
+        app.open_or_focus_tab(dir.path().join("b.txt")).unwrap();
+        assert_eq!(app.active_tab, Some(1));
+
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![
+                (
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 5,
+                        height: 1,
+                    },
+                    0,
+                ),
+                (
+                    Rect {
+                        x: 5,
+                        y: 0,
+                        width: 5,
+                        height: 1,
+                    },
+                    1,
+                ),
+            ],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+        assert_eq!(app.active_tab, Some(0));
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_the_editor_places_the_caret() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
+            &hits,
+        );
+        assert_eq!(app.focus, Focus::Editor);
+        let (line, column) = cursor_line_column(
+            app.active_buffer().unwrap().buffer.text_buffer(),
+            caret(&app),
+        );
+        assert_eq!((line, column), (1, 2));
+    }
+
+    #[test]
+    fn click_past_the_end_of_a_line_clamps_to_line_end() {
+        let (_dir, mut app) = open_rust_tab("ab\n");
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        // Column 15 is well within the 20-wide hit-test area but past
+        // "ab"'s own 2 characters -- must clamp to line end, not no-op.
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 15, 0),
+            &hits,
+        );
+        let (line, column) = cursor_line_column(
+            app.active_buffer().unwrap().buffer.text_buffer(),
+            caret(&app),
+        );
+        assert_eq!((line, column), (0, 2));
+    }
+
+    #[test]
+    fn click_below_the_last_line_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("only one line");
+        let before = caret(&app);
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 10,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5),
+            &hits,
+        );
+        assert_eq!(caret(&app), before);
+    }
+
+    #[test]
+    fn handle_mouse_click_is_ignored_while_a_popup_is_open() {
+        let (_dir, mut app) = open_rust_tab("abc\n");
+        app.open_palette();
+        let hits = ui::HitMap {
+            tree_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            editor_text_area: None,
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            &hits,
+        );
+        assert!(app.palette.is_some(), "a click must not close the palette");
+        assert_eq!(
+            app.focus,
+            Focus::Editor,
+            "a click must not act on the tree behind an open popup"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_outside_every_known_rect_is_a_noop() {
+        let (_dir, mut app) = two_file_project();
+        let before_focus = app.focus;
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            &ui::HitMap::default(),
+        );
+        assert_eq!(app.focus, before_focus);
+    }
+
+    #[test]
+    fn handle_mouse_is_ignored_while_claude_terminal_raw_focus_is_active() {
+        let (_dir, mut app) = two_file_project();
+        app.claude_panel_open = true;
+        app.claude_terminal_focus = true;
+        let rows_before = app.tree_state.visible_rows(&app.tree);
+        let selected_before = app
+            .tree_state
+            .selected_row(&rows_before)
+            .unwrap()
+            .path
+            .clone();
+
+        let hits = ui::HitMap {
+            tree_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            editor_text_area: None,
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
+            &hits,
+        );
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 1), &hits);
+
+        let rows_after = app.tree_state.visible_rows(&app.tree);
+        assert_eq!(
+            app.tree_state.selected_row(&rows_after).unwrap().path,
+            selected_before,
+            "mouse input must be dropped entirely, not routed anywhere, during raw PTY focus"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_ignores_unhandled_event_kinds() {
+        let (_dir, mut app) = two_file_project();
+        let before = app.focus;
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Moved, 1, 1),
+            &ui::HitMap::default(),
+        );
+        assert_eq!(app.focus, before);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_tree_moves_the_selection() {
+        let (_dir, mut app) = two_file_project();
+        let rows = app.tree_state.visible_rows(&app.tree);
+        assert!(rows.len() >= 2);
+        let second_row_path = rows[1].path.clone();
+
+        let hits = ui::HitMap {
+            tree_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            editor_text_area: None,
+            tab_strip: vec![],
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
+
+        let rows_after = app.tree_state.visible_rows(&app.tree);
+        assert_eq!(
+            app.tree_state.selected_row(&rows_after).unwrap().path,
+            second_row_path
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_editor_scrolls_without_moving_the_caret() {
+        let (_dir, mut app) = open_rust_tab(&"line\n".repeat(50));
+        let before_caret = caret(&app);
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
+        assert_eq!(app.active_buffer().unwrap().scroll, 1);
+        assert_eq!(caret(&app), before_caret);
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 2, 2), &hits);
+        assert_eq!(app.active_buffer().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn wheel_scroll_up_over_the_editor_at_the_top_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("a\nb\nc\n");
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 1, 1), &hits);
+        assert_eq!(app.active_buffer().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn wheel_scroll_down_over_the_editor_clamps_at_the_last_line() {
+        let (_dir, mut app) = open_rust_tab("a\nb\nc\n");
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        for _ in 0..10 {
+            app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);
+        }
+        let max_scroll = app.active_buffer().unwrap().scroll;
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);
+        assert_eq!(app.active_buffer().unwrap().scroll, max_scroll);
+    }
+
+    #[test]
+    fn wheel_scroll_while_the_palette_is_open_moves_its_selection() {
+        let (_dir, mut app) = two_file_project();
+        app.open_palette();
+        let before = app.palette.as_ref().unwrap().selected;
+        app.handle_mouse(
+            mouse_event(MouseEventKind::ScrollDown, 5, 5),
+            &ui::HitMap::default(),
+        );
+        assert_eq!(app.palette.as_ref().unwrap().selected, before + 1);
     }
 }

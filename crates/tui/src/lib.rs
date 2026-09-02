@@ -59,7 +59,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crossterm::event::{
-    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
@@ -145,6 +146,7 @@ fn current_dir() -> PathBuf {
 fn setup_terminal() -> std::io::Result<()> {
     enable_raw_mode()?;
     std::io::stdout().execute(EnterAlternateScreen)?;
+    std::io::stdout().execute(EnableMouseCapture)?;
     if supports_keyboard_enhancement().unwrap_or(false) {
         std::io::stdout().execute(PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
@@ -155,13 +157,22 @@ fn setup_terminal() -> std::io::Result<()> {
 
 /// Best-effort: called from both the normal exit path and the panic hook,
 /// so it must never itself panic on a terminal already in a weird state.
+/// Mirrors `setup_terminal`'s ordering in reverse: mouse capture, enabled
+/// after entering the alternate screen there, is disabled before leaving
+/// it here (`docs/features/tui-mouse-support.md` §2.1).
 fn restore_terminal() {
     let _ = std::io::stdout().execute(PopKeyboardEnhancementFlags);
+    let _ = std::io::stdout().execute(DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = std::io::stdout().execute(LeaveAlternateScreen);
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::io::Result<()> {
+    // Populated by the previous iteration's `terminal.draw` call below;
+    // read here (one-frame lag) so a mouse event can be hit-tested against
+    // what was actually last drawn (`docs/features/tui-mouse-support.md`
+    // §2.2).
+    let mut hit_map = ui::HitMap::default();
     loop {
         // Queried every iteration (not just once at startup) so a resized
         // terminal is picked up before the next keystroke's scroll-follow
@@ -229,13 +240,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // and fixed for this same feature).
         app.poll_claude();
         if crossterm::event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = crossterm::event::read()? {
-                if app.handle_key(key) == LoopSignal::Exit {
-                    return Ok(());
+            match crossterm::event::read()? {
+                Event::Key(key) => {
+                    if app.handle_key(key) == LoopSignal::Exit {
+                        return Ok(());
+                    }
                 }
+                Event::Mouse(mouse) => app.handle_mouse(mouse, &hit_map),
+                _ => {}
             }
         }
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        terminal.draw(|frame| ui::render(frame, &app, &mut hit_map))?;
     }
 }
 

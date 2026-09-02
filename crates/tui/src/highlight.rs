@@ -415,6 +415,34 @@ pub(crate) fn expand_tabs(text: &str, start_col: usize, tab_width: usize) -> (St
     (out, col)
 }
 
+/// Inverse of `expand_tabs`'s column tracking: the `char` column in `text`
+/// whose rendered span covers `target_screen_col`, without materializing
+/// the expanded string -- used to translate a mouse click's screen column
+/// back to a `char` column (`docs/features/tui-mouse-support.md` §3.2.3).
+/// A target past the line's rendered end clamps to the line's own `char`
+/// count (placing the caret after the last character, same as clicking
+/// past the end of a line in any editor).
+pub(crate) fn char_column_for_screen_column(
+    text: &str,
+    target_screen_col: usize,
+    tab_width: usize,
+) -> usize {
+    let stop = tab_width.max(1);
+    let mut col = 0usize;
+    for (char_idx, ch) in text.chars().enumerate() {
+        let width = if ch == '\t' {
+            stop - col % stop
+        } else {
+            char_display_width(ch)
+        };
+        if target_screen_col < col + width {
+            return char_idx;
+        }
+        col += width;
+    }
+    text.chars().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +581,41 @@ mod tests {
     #[test]
     fn expand_tabs_non_tab_characters_pass_through_unchanged() {
         assert_eq!(expand_tabs("abc", 0, 4), ("abc".to_string(), 3));
+    }
+
+    #[test]
+    fn char_column_for_screen_column_plain_ascii_is_identity() {
+        assert_eq!(char_column_for_screen_column("abc", 0, 4), 0);
+        assert_eq!(char_column_for_screen_column("abc", 2, 4), 2);
+    }
+
+    #[test]
+    fn char_column_for_screen_column_past_the_end_clamps_to_char_count() {
+        assert_eq!(char_column_for_screen_column("abc", 99, 4), 3);
+    }
+
+    #[test]
+    fn char_column_for_screen_column_lands_inside_a_leading_tabs_span() {
+        // "\tx" expands to "    x" (4 spaces + x) at tab_width 4 -- any
+        // screen column 0..=3 must resolve back to char index 0 (the tab
+        // itself), and column 4 to char index 1 (the 'x').
+        for col in 0..=3 {
+            assert_eq!(char_column_for_screen_column("\tx", col, 4), 0);
+        }
+        assert_eq!(char_column_for_screen_column("\tx", 4, 4), 1);
+    }
+
+    #[test]
+    fn char_column_for_screen_column_after_a_mid_line_tab() {
+        // "ab\tcd" expands (tab_width 4) to "ab  cd": 'a'=0, 'b'=1,
+        // tab fills screen columns 2-3, 'c'=4, 'd'=5.
+        let text = "ab\tcd";
+        assert_eq!(char_column_for_screen_column(text, 0, 4), 0);
+        assert_eq!(char_column_for_screen_column(text, 1, 4), 1);
+        assert_eq!(char_column_for_screen_column(text, 2, 4), 2);
+        assert_eq!(char_column_for_screen_column(text, 3, 4), 2);
+        assert_eq!(char_column_for_screen_column(text, 4, 4), 3);
+        assert_eq!(char_column_for_screen_column(text, 5, 4), 4);
     }
 
     /// Regression test: ratatui's own `Buffer::set_stringn` drops literal
