@@ -396,15 +396,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_wait_for_the_next_message_is_never_time_bounded() {
+    async fn clean_eof_with_no_bytes_sent_is_never_time_bounded() {
         // No bytes at all yet -- this must resolve immediately via Eof
         // (clean stream close), not via the in-progress timeout, since no
-        // message has started. Proves the timeout doesn't fire on the
-        // ordinary "nothing has happened yet" idle case.
+        // message has started.
         let outcome =
             read_message_with_timeout(&mut BufReader::new(&b""[..]), Duration::from_millis(1))
                 .await;
         assert!(matches!(outcome, ReadOutcome::Eof));
+    }
+
+    #[tokio::test]
+    async fn idle_wait_for_the_next_message_to_start_is_never_time_bounded() {
+        // `tx` stays open but sends nothing -- a genuinely blocked read,
+        // not an immediate EOF. With a 1ms in-progress timeout, a read
+        // that *were* incorrectly time-bounded pre-first-byte would
+        // resolve (with an error) almost instantly; asserting the call
+        // is still pending after 50ms proves the timeout is only wired up
+        // once a message has actually started, exactly as
+        // `a_message_that_stalls_mid_body_times_out_instead_of_hanging_forever`
+        // (below) proves the opposite for a message already in flight.
+        let (_tx, rx) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(rx);
+
+        let read = read_message_with_timeout(&mut reader, Duration::from_millis(1));
+        tokio::select! {
+            _ = read => panic!("expected the idle pre-first-byte wait to remain pending"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
     }
 
     #[tokio::test]
