@@ -46,7 +46,22 @@ pub enum GitError {
     WorktreeHasUncommittedChanges(PathBuf),
     #[error("worktree '{0}' is locked")]
     WorktreeLocked(PathBuf),
+    #[error("no remote named '{0}'")]
+    RemoteNotFound(String),
+    #[error("HEAD is not on a branch")]
+    DetachedHead,
+    #[error("current branch has no remote-tracking branch on '{0}'")]
+    NoUpstream(String),
+    #[error("push rejected by remote: {0}")]
+    PushRejected(String),
 }
+
+/// Default remote name assumed when the caller has no more specific one
+/// on hand -- `"origin"`, what `clone_repo`'s own `RepoBuilder` configures
+/// for a freshly cloned repo, and libgit2's own default target for a bare
+/// `git fetch`/`git pull` with no remote argument
+/// (`docs/features/git-fetch-pull-push.md` §1 -- no remote picker in v1).
+pub const DEFAULT_REMOTE: &str = "origin";
 
 /// Per-file line cap for `diff_file`/`diff_commit` output (context +
 /// added + removed lines combined). Chosen generously above what a human
@@ -969,6 +984,22 @@ impl GitRepo {
             .get()
             .target()
             .ok_or_else(|| git2::Error::from_str("branch has no target"))?;
+        let current = self.current_branch().unwrap_or_else(|| "HEAD".to_string());
+        let message = format!("Merge branch '{name}' into {current}");
+        self.merge_oid(their_oid, &message)
+    }
+
+    /// The fast-forward/real-merge/conflict decision `merge_branch`
+    /// originally made inline, extracted so `pull` can reuse it against a
+    /// different `their_oid` source (a remote-tracking ref instead of a
+    /// local branch lookup) -- one merge implementation, two ways to
+    /// arrive at the commit to merge (`docs/features/
+    /// git-fetch-pull-push.md` §3.2).
+    fn merge_oid(
+        &self,
+        their_oid: git2::Oid,
+        commit_message: &str,
+    ) -> Result<MergeOutcome, GitError> {
         let their_commit = self.repo.find_annotated_commit(their_oid)?;
         let (analysis, _) = self.repo.merge_analysis(&[&their_commit])?;
 
@@ -1003,10 +1034,151 @@ impl GitRepo {
         if index.has_conflicts() {
             return Ok(MergeOutcome::Conflicts(self.conflicts()?));
         }
-        let current = self.current_branch().unwrap_or_else(|| "HEAD".to_string());
-        let message = format!("Merge branch '{name}' into {current}");
-        let commit_id = self.commit(&message, false)?;
+        let commit_id = self.commit(commit_message, false)?;
         Ok(MergeOutcome::Merged { commit_id })
+    }
+
+    /// Resolves `HEAD`'s branch shorthand, erroring with
+    /// `GitError::DetachedHead` if `HEAD` isn't on a branch at all
+    /// (detached, or -- via `self.repo.head()`'s own `?` -- unborn, no
+    /// commits yet). Shared by `pull`/`push`, both of which need "the
+    /// current branch's name" rather than `current_branch()`'s more
+    /// permissive "`HEAD`'s shorthand, detached or not"
+    /// (`docs/features/git-fetch-pull-push.md` §2.1).
+    fn current_branch_name(&self) -> Result<String, GitError> {
+        let head = self.repo.head()?;
+        if !head.is_branch() {
+            return Err(GitError::DetachedHead);
+        }
+        Ok(head.shorthand()?.to_string())
+    }
+
+    /// Fetches every ref `remote_name`'s configured refspecs cover
+    /// (passing an empty refspec array to libgit2, which falls back to
+    /// the remote's own base refspecs -- typically
+    /// `+refs/heads/*:refs/remotes/<remote_name>/*`), updating this
+    /// repo's remote-tracking refs. Never touches the working tree, the
+    /// index, or any local branch. Explicitly suppresses tags
+    /// (`AutotagOption::None`) -- `git2::FetchOptions::default()`'s own
+    /// `download_tags` is `Unspecified`, which falls back to libgit2's
+    /// auto-tag-following default and would otherwise still bring in
+    /// tags despite this module's "branch refs only" scope
+    /// (`docs/features/git-fetch-pull-push.md` §2.1/Revision notes #1).
+    pub fn fetch(
+        &self,
+        remote_name: &str,
+        mut on_progress: impl FnMut(TransferProgress),
+    ) -> Result<(), GitError> {
+        let mut remote = self
+            .repo
+            .find_remote(remote_name)
+            .map_err(|_| GitError::RemoteNotFound(remote_name.to_string()))?;
+
+        let mut callbacks = git2::RemoteCallbacks::new();
+        credential_callback(&mut callbacks);
+        callbacks.transfer_progress(|progress| {
+            on_progress(TransferProgress::from(progress));
+            true
+        });
+
+        let mut fetch_options = git2::FetchOptions::new();
+        fetch_options.remote_callbacks(callbacks);
+        fetch_options.download_tags(git2::AutotagOption::None);
+
+        remote.fetch(&[] as &[&str], Some(&mut fetch_options), None)?;
+        Ok(())
+    }
+
+    /// Fetches from `remote_name` (as `fetch` does), then merges the
+    /// resulting remote-tracking branch for the *current* local branch
+    /// into `HEAD`, reusing `merge_oid` (`docs/features/
+    /// git-fetch-pull-push.md` §2.1/§3.2). `DetachedHead` is checked
+    /// *before* fetching -- no network I/O happens if there's nothing to
+    /// pull into, matching `clone_repo`'s own "validate locally before
+    /// touching the network" precedent. The remote-tracking ref looked up
+    /// is `refs/remotes/<remote_name>/<branch_name>` -- the standard name
+    /// a default `git fetch` refspec produces; this does not consult
+    /// `branch.<name>.remote`/`.merge` config for a differently-configured
+    /// upstream (v1 scope cut, §3.2).
+    pub fn pull(
+        &self,
+        remote_name: &str,
+        on_progress: impl FnMut(TransferProgress),
+    ) -> Result<MergeOutcome, GitError> {
+        let branch_name = self.current_branch_name()?;
+
+        self.fetch(remote_name, on_progress)?;
+
+        let remote_ref = format!("refs/remotes/{remote_name}/{branch_name}");
+        let their_oid = self
+            .repo
+            .find_reference(&remote_ref)
+            .map_err(|_| GitError::NoUpstream(remote_name.to_string()))?
+            .target()
+            .ok_or_else(|| git2::Error::from_str("remote-tracking ref has no target"))?;
+
+        let message = format!(
+            "Merge remote-tracking branch '{remote_name}/{branch_name}' into {branch_name}"
+        );
+        self.merge_oid(their_oid, &message)
+    }
+
+    /// Pushes the current local branch's tip to `refs/heads/<branch>` on
+    /// `remote_name`, using a plain (non-force) refspec so a
+    /// non-fast-forward push is rejected by the remote exactly as a plain
+    /// `git push` (without `--force`) would be (`docs/features/
+    /// git-fetch-pull-push.md` §2.1/§3.3). `Remote::push()` can return
+    /// `Ok(())` even when the remote rejected the ref update -- the real
+    /// per-ref result comes through `push_update_reference`'s `Option<&
+    /// str>` status (`None` = accepted, `Some(msg)` = rejected), captured
+    /// here and checked after `push()` returns.
+    pub fn push(
+        &self,
+        remote_name: &str,
+        mut on_progress: impl FnMut(PushProgress),
+    ) -> Result<(), GitError> {
+        let branch_name = self.current_branch_name()?;
+        let mut remote = self
+            .repo
+            .find_remote(remote_name)
+            .map_err(|_| GitError::RemoteNotFound(remote_name.to_string()))?;
+
+        let rejection: RefCell<Option<String>> = RefCell::new(None);
+        {
+            // Scoped so `callbacks`/`push_options` -- and the borrow of
+            // `rejection` their closures hold -- are dropped before
+            // `rejection.into_inner()` below tries to move out of it;
+            // both types carry a `Drop` impl (freeing the underlying
+            // libgit2 struct), so NLL can't otherwise end the borrow
+            // early even though `push_options` is never used again after
+            // `remote.push`.
+            let mut callbacks = git2::RemoteCallbacks::new();
+            credential_callback(&mut callbacks);
+            callbacks.push_transfer_progress(|current, total, bytes| {
+                on_progress(PushProgress {
+                    current,
+                    total,
+                    bytes,
+                });
+            });
+            callbacks.push_update_reference(|_refname, status| {
+                if let Some(msg) = status {
+                    *rejection.borrow_mut() = Some(msg.to_string());
+                }
+                Ok(())
+            });
+
+            let mut push_options = git2::PushOptions::new();
+            push_options.remote_callbacks(callbacks);
+
+            let refspec = format!("refs/heads/{branch_name}:refs/heads/{branch_name}");
+            remote.push(&[refspec], Some(&mut push_options))?;
+        }
+
+        if let Some(msg) = rejection.into_inner() {
+            return Err(GitError::PushRejected(msg));
+        }
+        Ok(())
     }
 
     /// Full detail for one commit (by id or any revspec `revparse_single`
@@ -1346,6 +1518,24 @@ impl From<git2::Progress<'_>> for CloneProgress {
     }
 }
 
+/// Alias, not a rename -- `CloneProgress` is `git2::Progress`'s shape, not
+/// clone-specific, but `fetch`/`pull` naming their progress parameter
+/// after a type called `CloneProgress` would read as a copy-paste leftover
+/// (`docs/features/git-fetch-pull-push.md` §2.1). Zero cost: `clone_repo`
+/// keeps using `CloneProgress` unchanged.
+pub type TransferProgress = CloneProgress;
+
+/// `git2::RemoteCallbacks::push_transfer_progress`'s own three `usize`s
+/// (current object, total objects, bytes transferred) -- not the same
+/// shape as `git2::Progress`/`CloneProgress`, hence its own type rather
+/// than a reuse (`docs/features/git-fetch-pull-push.md` §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PushProgress {
+    pub current: usize,
+    pub total: usize,
+    pub bytes: usize,
+}
+
 /// Clones `url` into `dest`, calling `on_progress` zero or more times
 /// during the transfer. Blocking, synchronous, like every other
 /// `GitRepo`/`git`-module function -- `ide-ui` is responsible for calling
@@ -1381,6 +1571,33 @@ pub fn clone_repo(
     }
 
     let mut callbacks = git2::RemoteCallbacks::new();
+    credential_callback(&mut callbacks);
+    callbacks.transfer_progress(|progress| {
+        on_progress(CloneProgress::from(progress));
+        true
+    });
+
+    let mut fetch_options = git2::FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+
+    git2::build::RepoBuilder::new()
+        .fetch_options(fetch_options)
+        .clone(url, dest)?;
+
+    let project = crate::project::Project::open(dest)
+        .map_err(|_| GitError::ClonedContentInvalid(dest.to_path_buf()))?;
+    project.scan_tree();
+
+    GitRepo::open(dest)
+}
+
+/// Shared by `clone_repo`, `GitRepo::fetch`, and `GitRepo::push`
+/// (`docs/features/git-fetch-pull-push.md` §2.1) -- delegates entirely to
+/// whatever the OS/git installation already has configured (SSH agent,
+/// git credential helper), same as `clone_repo`'s original inline closure
+/// this was extracted from verbatim. Never prompts for, stores, or logs a
+/// credential itself.
+fn credential_callback(callbacks: &mut git2::RemoteCallbacks) {
     callbacks.credentials(|url, username, allowed_types| {
         if allowed_types.contains(git2::CredentialType::SSH_KEY) {
             let agent_user = username.unwrap_or("git");
@@ -1399,23 +1616,6 @@ pub fn clone_repo(
             "no usable credential for the types this server accepts",
         ))
     });
-    callbacks.transfer_progress(|progress| {
-        on_progress(CloneProgress::from(progress));
-        true
-    });
-
-    let mut fetch_options = git2::FetchOptions::new();
-    fetch_options.remote_callbacks(callbacks);
-
-    git2::build::RepoBuilder::new()
-        .fetch_options(fetch_options)
-        .clone(url, dest)?;
-
-    let project = crate::project::Project::open(dest)
-        .map_err(|_| GitError::ClonedContentInvalid(dest.to_path_buf()))?;
-    project.scan_tree();
-
-    GitRepo::open(dest)
 }
 
 /// git always uses `/`-separated repo-relative paths internally; accept a
@@ -4058,5 +4258,285 @@ mod tests {
         };
         assert_eq!(p, p);
         assert_eq!(CloneProgress::default(), CloneProgress::default());
+    }
+
+    // -- Git Fetch/Pull/Push (`docs/features/git-fetch-pull-push.md`) --
+    //
+    // `git2`/libgit2 treats a local filesystem path as a valid remote
+    // transport, same precedent `clone_repo`'s own tests above already
+    // established -- no real network access needed anywhere below
+    // (`git-fetch-pull-push.md` §6).
+
+    /// A bare clone of `source`, standing in for "the remote" -- pushing
+    /// into a checked-out (non-bare) repository's current branch is a
+    /// different, non-fast-forward-related restriction real git servers
+    /// apply that libgit2's local transport doesn't model the same way, so
+    /// every push test targets a bare repo instead, same as a real git
+    /// server would be.
+    fn init_bare_remote_from(source: &Path) -> tempfile::TempDir {
+        let bare_dir = tempfile::tempdir().unwrap();
+        git2::build::RepoBuilder::new()
+            .bare(true)
+            .clone(&source.to_string_lossy(), bare_dir.path())
+            .unwrap();
+        bare_dir
+    }
+
+    #[test]
+    fn fetch_updates_the_remote_tracking_ref_without_touching_the_working_tree() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+        let branch = source_repo.head().unwrap().shorthand().unwrap().to_string();
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        let second = commit_file(&source_repo, "b.txt", "b", "second");
+
+        git.fetch(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        let remote_ref = format!("refs/remotes/{DEFAULT_REMOTE}/{branch}");
+        let repo = Repository::open(&dest_path).unwrap();
+        assert_eq!(
+            repo.find_reference(&remote_ref).unwrap().target(),
+            Some(second)
+        );
+        // Working tree/index untouched -- `b.txt` only exists after fetch
+        // if a later `pull`/checkout brings it in, never from `fetch` alone.
+        assert!(!dest_path.join("b.txt").exists());
+    }
+
+    #[test]
+    fn fetch_does_not_bring_in_tags() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        // Tag created *after* the initial clone -- only `fetch`'s own
+        // `download_tags(AutotagOption::None)` is under test here, not
+        // whatever tags a full `clone_repo` happened to bring in already.
+        let second = commit_file(&source_repo, "b.txt", "b", "second");
+        source_repo
+            .tag_lightweight("v1", &source_repo.find_object(second, None).unwrap(), false)
+            .unwrap();
+
+        git.fetch(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        let repo = Repository::open(&dest_path).unwrap();
+        assert!(repo.find_reference("refs/tags/v1").is_err());
+    }
+
+    #[test]
+    fn fetch_against_a_nonexistent_remote_returns_remote_not_found() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a", "init");
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let err = git.fetch("does-not-exist", |_| {});
+
+        assert!(matches!(err, Err(GitError::RemoteNotFound(name)) if name == "does-not-exist"));
+    }
+
+    #[test]
+    fn pull_fast_forwards_and_updates_the_working_tree() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        commit_file(&source_repo, "b.txt", "b", "second");
+
+        let outcome = git.pull(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert!(dest_path.join("b.txt").exists());
+    }
+
+    #[test]
+    fn pull_is_up_to_date_when_nothing_changed() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        let outcome = git.pull(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        assert_eq!(outcome, MergeOutcome::UpToDate);
+    }
+
+    #[test]
+    fn pull_reports_conflicts_when_both_sides_changed_the_same_file() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "f.txt", "base\n", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        let dest_repo = Repository::open(&dest_path).unwrap();
+
+        commit_file(&source_repo, "f.txt", "from source\n", "source edits f");
+        commit_file(&dest_repo, "f.txt", "from dest\n", "dest edits f");
+
+        let outcome = git.pull(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        let paths = match outcome {
+            MergeOutcome::Conflicts(paths) => paths,
+            other => panic!("expected Conflicts, got {other:?}"),
+        };
+        assert_eq!(paths, vec![PathBuf::from("f.txt")]);
+    }
+
+    #[test]
+    fn pull_with_detached_head_fails_locally_before_any_fetch() {
+        let (source_dir, source_repo) = init_repo();
+        let head = commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        let dest_repo = Repository::open(&dest_path).unwrap();
+        dest_repo.set_head_detached(head).unwrap();
+
+        // A remote name that doesn't exist -- if `pull` checked
+        // `RemoteNotFound` before `DetachedHead`, this would come back
+        // `RemoteNotFound` instead, proving the check order the doc
+        // requires (§2.1/Revision notes #2): local preconditions before
+        // any network-shaped call.
+        let err = git.pull("does-not-exist", |_| {});
+
+        assert!(matches!(err, Err(GitError::DetachedHead)));
+    }
+
+    #[test]
+    fn pull_with_no_matching_remote_tracking_ref_returns_no_upstream() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        // A branch that only ever existed locally in `dest` -- `origin`
+        // exists (fetch succeeds) but `refs/remotes/origin/new-branch`
+        // never will.
+        git.create_branch("new-branch", None).unwrap();
+        let dest_repo = Repository::open(&dest_path).unwrap();
+        checkout_branch(&dest_repo, "new-branch");
+
+        let err = git.pull(DEFAULT_REMOTE, |_| {});
+
+        assert!(matches!(err, Err(GitError::NoUpstream(name)) if name == DEFAULT_REMOTE));
+    }
+
+    #[test]
+    fn push_succeeds_and_updates_the_remote_ref() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+        let branch = source_repo.head().unwrap().shorthand().unwrap().to_string();
+        let bare = init_bare_remote_from(source_dir.path());
+
+        let local_path = tempfile::tempdir().unwrap().path().join("local");
+        let git = clone_repo(&bare.path().to_string_lossy(), &local_path, |_| {}).unwrap();
+        let local_repo = Repository::open(&local_path).unwrap();
+        let second = commit_file(&local_repo, "b.txt", "b", "second");
+
+        let mut progress_calls = 0usize;
+        git.push(DEFAULT_REMOTE, |_| progress_calls += 1).unwrap();
+
+        let bare_repo = Repository::open_bare(bare.path()).unwrap();
+        let bare_ref = format!("refs/heads/{branch}");
+        assert_eq!(
+            bare_repo.find_reference(&bare_ref).unwrap().target(),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn push_rejected_on_a_destination_refname_conflict() {
+        // libgit2's local-transport push (`transports/local.c`, read
+        // directly from the vendored libgit2 C source rather than
+        // assumed) always force-updates the destination ref
+        // (`git_reference_create(..., force: true, ...)` unconditionally
+        // whenever the ref already exists) -- there is no server process
+        // enforcing non-fast-forward rejection for a `file://`-style
+        // local remote the way a real git server's `receive-pack` does.
+        // A local remote genuinely can't be made to reject a diverged
+        // push, so this test exercises the exact same `push_update_
+        // reference` rejection-detection wiring via a scenario local
+        // transport *does* reject instead: a ref-hierarchy collision
+        // (`refs/heads/foo` and `refs/heads/foo/bar` can't coexist,
+        // exactly like two files can't share one path with one also
+        // being a directory).
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+        let bare = init_bare_remote_from(source_dir.path());
+
+        let local_path = tempfile::tempdir().unwrap().path().join("local");
+        let git = clone_repo(&bare.path().to_string_lossy(), &local_path, |_| {}).unwrap();
+        let local_repo = Repository::open(&local_path).unwrap();
+        let main_name = local_repo.head().unwrap().shorthand().unwrap().to_string();
+
+        git.create_branch("foo", None).unwrap();
+        checkout_branch(&local_repo, "foo");
+        git.push(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        // Free up local `refs/heads/foo` so `foo/bar` can be created
+        // locally (the same file/directory collision would otherwise
+        // block it here too) -- the bare remote keeps its own `foo`.
+        checkout_branch(&local_repo, &main_name);
+        local_repo
+            .find_branch("foo", BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+        git.create_branch("foo/bar", None).unwrap();
+        checkout_branch(&local_repo, "foo/bar");
+
+        let err = git.push(DEFAULT_REMOTE, |_| {});
+
+        assert!(matches!(err, Err(GitError::PushRejected(_))));
+    }
+
+    #[test]
+    fn push_against_a_nonexistent_remote_returns_remote_not_found() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a", "init");
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let err = git.push("does-not-exist", |_| {});
+
+        assert!(matches!(err, Err(GitError::RemoteNotFound(name)) if name == "does-not-exist"));
+    }
+
+    #[test]
+    fn push_with_detached_head_fails_locally_before_any_push_attempt() {
+        let (source_dir, source_repo) = init_repo();
+        let head = commit_file(&source_repo, "a.txt", "a", "init");
+        let bare = init_bare_remote_from(source_dir.path());
+
+        let local_path = tempfile::tempdir().unwrap().path().join("local");
+        let git = clone_repo(&bare.path().to_string_lossy(), &local_path, |_| {}).unwrap();
+        let local_repo = Repository::open(&local_path).unwrap();
+        local_repo.set_head_detached(head).unwrap();
+
+        let err = git.push("does-not-exist", |_| {});
+
+        assert!(matches!(err, Err(GitError::DetachedHead)));
+    }
+
+    #[test]
+    fn push_progress_has_expected_shape() {
+        // Same rationale as `clone_progress_from_git2_progress_field_names_
+        // match_expectations` above -- `push_transfer_progress`'s callback
+        // hands back three plain `usize`s libgit2 constructs internally,
+        // nothing this module can synthesize a real one from; this checks
+        // `PushProgress`'s own shape/derives instead.
+        let p = PushProgress {
+            current: 1,
+            total: 2,
+            bytes: 3,
+        };
+        assert_eq!(p, p);
+        assert_eq!(PushProgress::default(), PushProgress::default());
     }
 }
