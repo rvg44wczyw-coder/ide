@@ -447,6 +447,29 @@ two-step check (verified against the vendored `git2` 0.21.0 source,
 memory) is why `push` can't just propagate `Remote::push()`'s own
 `Result` the way `fetch`/`clone_repo` propagate theirs.
 
+**Caveat discovered during implementation, verified against libgit2's own
+vendored C source (`libgit2-sys`'s `src/libgit2/transports/local.c`):**
+libgit2's *local* (filesystem-path) transport has no non-fast-forward
+enforcement at all — `local_push_update_remote_ref` always calls
+`git_reference_create` with `force: true` whenever the destination ref
+already exists, unconditionally, regardless of whether the incoming
+commit is a descendant of the current tip. `push_update_reference` only
+reports a rejection for a *local* remote when `git_reference_create`
+itself fails for an unrelated reason (an invalid refname, a ref-hierarchy
+collision like `refs/heads/foo` vs. `refs/heads/foo/bar`) — never for
+divergence. §4's "a rejected non-fast-forward push leaves the remote
+unchanged" invariant is therefore only meaningfully enforced against a
+*network* remote (a real git server's `receive-pack` does implement the
+check and reports it back the same way) — a `file://`-style local remote
+silently accepts a diverging push instead of rejecting it. This is a
+genuine, if narrow, gap for the (rare) case of a local-path remote
+configured as `origin`; fixing it would mean this module doing its own
+ahead-of-push fast-forward check against the remote's current tip before
+calling `Remote::push()` at all, which is out of v1 scope — flagged here
+rather than silently discovered later, since a `hacker` pass would
+otherwise reasonably expect this from the same test setup its own
+live-testing approach (§6) would reach for.
+
 Pushing a branch with no upstream configured (a local branch never
 pushed before) is in scope, since `push` doesn't consult `branch.<name>.
 remote`/`.merge` at all — it always targets `refs/heads/<branch>` on the
@@ -594,7 +617,14 @@ malicious local server that advertises an enormous or malformed ref
 list (resource exhaustion / parser-hang attempt), and a `push` against a
 local server that sends back a crafted `push_update_reference` rejection
 message (confirm it's surfaced as plain text, never interpreted/executed
-as anything).
+as anything). Per §3.3's caveat, don't spend time trying to reproduce a
+*divergence*-triggered `PushRejected` against a local/loopback smart-HTTP
+server purely for its own sake — that path is real and already covered by
+`rust-core-dev`'s own tests via a different (ref-collision) trigger; the
+loopback smart-HTTP setup is worth using instead for a genuinely
+adversarial *server-controlled* rejection message (arbitrary bytes,
+oversized, non-UTF-8) to confirm `PushRejected`'s payload handling doesn't
+assume anything about what a server sends back.
 
 ## 7. Diagram
 
@@ -647,3 +677,18 @@ findings the rev pass surfaced):**
    completion as what actually closes that gap — the user preferred this
    stated explicitly rather than left implicit in §2.2/§2.3's UI-wiring
    description.
+
+**Discovered during `rust-core-dev`'s implementation, not anticipated by
+the original draft:**
+
+8. §3.3 gained a caveat, verified against libgit2's own vendored C source
+   (`libgit2-sys`'s `transports/local.c`): local (filesystem-path)
+   transport pushes are *never* rejected for divergence — libgit2 always
+   force-updates the destination ref for a local remote, unconditionally.
+   §4's "rejected push leaves the remote unchanged" invariant only holds
+   against a real network remote; a `file://`-style local one silently
+   accepts a diverging push instead. `rust-core-dev`'s own
+   `push_rejected_on_a_destination_refname_conflict` test exercises the
+   same rejection-detection *wiring* via a ref-hierarchy collision instead
+   of divergence, since divergence-based rejection is untestable against
+   a local remote at all. §6's `hacker`-guidance was adjusted accordingly.
