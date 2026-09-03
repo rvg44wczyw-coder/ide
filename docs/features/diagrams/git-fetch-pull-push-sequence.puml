@@ -1,0 +1,46 @@
+@startuml
+title Pull (Update Project) sequence
+
+actor User
+participant "Frontend\n(ide-ui / ide-tui)" as UI
+participant "RemoteOpState" as State
+participant "background thread" as Thread
+participant "GitRepo (own handle)" as Repo
+participant "Remote server" as Server
+
+User -> UI: Update Project (⌘T)
+UI -> State: start(Pull, project_root)
+State -> Thread: spawn
+activate Thread
+Thread -> Repo: GitRepo::open(project_root)
+Thread -> Repo: pull(remote_name, on_progress)
+Repo -> Server: fetch (transfer_progress callbacks)
+Server --> Repo: objects
+Repo --> Thread: on_progress(CloneProgress) x N
+Thread --> State: RemoteOpEvent::Progress (via channel)
+
+alt fast-forward or up to date
+    Repo -> Repo: merge_oid: fast-forward / no-op
+    Repo --> Thread: MergeOutcome::FastForward / UpToDate
+else real merge, no conflicts
+    Repo -> Repo: merge_oid: merge + auto-commit
+    Repo --> Thread: MergeOutcome::Merged
+else conflicts
+    Repo -> Repo: merge_oid: merge, index has conflicts
+    Repo --> Thread: MergeOutcome::Conflicts(paths)
+end
+
+Thread --> State: RemoteOpEvent::Done(Ok(Merged(outcome))) (via channel)
+deactivate Thread
+
+loop every frame
+    UI -> State: poll()
+end
+State --> UI: Some(Done(...))
+
+alt Conflicts
+    UI -> UI: apply_merge_outcome: merging=true, prefill message,\nopen conflict-resolution UI
+else clean
+    UI -> UI: apply_merge_outcome: refresh(), notify result
+end
+@enduml
