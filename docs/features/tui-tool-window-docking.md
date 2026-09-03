@@ -408,9 +408,12 @@ acceptable; the requirement is "hidden dock takes zero space, the
 sibling area gets all of it," not a specific `ratatui` call shape.)
 
 `render_left_dock`/`render_bottom_dock` (new) each render a one-row tab
-strip above their content — reusing the exact "`* ` prefix on the focused
-tab's title" convention `render_debug_panel`'s `section_title` closure
-already establishes (`ui.rs:1325-1326`) — then dispatch to the active
+strip above their content — marking the focused tab with `[brackets]`
+around its title, a convention distinct from both the editor tab strip's
+reverse-video highlight (`render_tab_strip`) and `render_debug_panel`'s
+`section_title` closure's `* ` prefix (`ui.rs:1325-1326`), chosen because
+this strip packs multiple short labels onto one line where a color-only
+cue would be lost on a monochrome terminal — then dispatch to the active
 tab's existing render function:
 
 - `LeftDockTab::Files` → the existing `render_tree` body (called with the
@@ -471,23 +474,36 @@ existing per-panel key handler to delegate to:
 - `BottomDockTab::Problems` → the existing Problems key handler, adapted to
   `dock.problems_selected`.
 - `BottomDockTab::GitLog` → **new** `handle_git_log_dock_key(&mut self, key:
-  KeyEvent) -> bool`, since delegating to the existing `handle_git_panel_key`
+  KeyEvent)`, since delegating to the existing `handle_git_panel_key`
   is explicitly ruled out (§2.1's "deliberate trim" — that function's
   precedence chain assumes `git_panel.is_some()` and reaches
   branches/worktrees/staging/conflicts/`Filter`, none of which the dock tab
   exposes) and no other existing handler covers commit-graph browsing. Its
   entire body: `Up`/`Down` move `graph_selected` (saturating, clamped to the
   current commit list length — same idiom as every other list cursor in this
-  crate, e.g. `branches_popup.selected`); `Tab`/`BackTab` or `Enter` swap
+  crate, e.g. `branches_popup.selected`); `[`/`]` swap
   `self.git_log_dock.focus` between `GitPanelFocus::Graph` and `::Diff`;
-  `Up`/`Down` while `focus == Diff` scroll `diff_scroll` instead (saturating,
-  no clamp needed at the top since `0` is already the floor — `ratatui`'s
-  scroll widgets clamp an over-large value themselves at render time, same
-  as every other scrollable panel already in this crate). No other key does
-  anything in this handler; unhandled keys fall through unconsumed (`false`)
-  so `Tab`/`BackTab`'s dock-tab-cycling check in `handle_bottom_dock_key`
-  still gets a chance — same "handler returns whether it consumed the key"
-  convention `handle_docker_panel_key` etc. already use.
+  `Enter` while `focus == Graph` also jumps straight to `::Diff` (selecting
+  the highlighted commit first); `Up`/`Down` while `focus == Diff` scroll
+  `diff_scroll` instead (saturating, no clamp needed at the top since `0` is
+  already the floor — `ratatui`'s scroll widgets clamp an over-large value
+  themselves at render time, same as every other scrollable panel already in
+  this crate). No other key does anything in this handler.
+
+  **Revision (post-implementation):** the original text of this bullet
+  bound the Graph/Diff toggle to `Tab`/`BackTab` and had this handler return
+  `bool` so `handle_bottom_dock_key`'s own `Tab`/`BackTab` dock-tab-cycling
+  could fall through to it when unconsumed. That never matches the actual
+  control flow above (§2.4's own `match self.focus { ... }` box): `handle_
+  bottom_dock_key` matches `Tab`/`BackTab` for dock-tab cycling *before*
+  delegating to any per-tab handler at all, unconditionally, for every tab
+  — there is no fallthrough path, bool-returning or otherwise, by which a
+  per-tab handler ever sees a `Tab`/`BackTab` key press. Binding GitLog's
+  own toggle to the same keys made it permanently unreachable. Rebound to
+  `[`/`]` instead, the same fix already applied to Docker's/K8s's internal
+  sub-view switches for the identical reason (this section, Docker/K8s
+  bullet above) — this brings GitLog in line with a pattern the other two
+  tabs already had to adopt, rather than inventing a third mechanism.
 
 `Ctrl+T` (`ToggleLeftDockFocus`) and `ToggleBottomDockFocus` (§2.1, no
 default binding) still intercept **before** this fallthrough is reached, in
@@ -546,12 +562,20 @@ simultaneously, and neither's state affects the other's (§4).
   "close" for a permanently-mounted tab's cursor, only "not currently the
   active tab," so leaving and returning to `BottomDockTab::GitLog` shows
   the same commit/scroll position as before).
-- **The full Git Panel and the `GitLog` dock tab are fully independent.**
-  Opening the full modal Git Panel (`ToggleGitPanel`) does not affect
-  `bottom_dock`'s state or the `GitLog` tab's cursor, and vice versa —
-  a commit selected in one has no effect on the other's `graph_selected`.
-  This is a deliberate consequence of §2.1's scope trim, not an oversight;
-  a future phase could unify them, but doing so now would mean solving
+- **The full Git Panel and the `GitLog` dock tab have independent cursor
+  state, but share the underlying commit/diff cache.** Each has its own
+  `graph_selected`/`diff_scroll` (`GitPanelState` vs. `GitLogDockState`),
+  so scrolling or navigating in one never moves the other's cursor. They
+  are *not*, however, fully independent: both read and write
+  `self.git.selected_commit`/`graph`/diff content, the same shared cache
+  `toggle_git_panel` already left untouched across opens/closes before
+  this doc's feature existed — so selecting a commit in one does change
+  what the other shows as "the selected commit" if opened next (its own
+  cursor position stays put, but the underlying selection/diff it would
+  jump to on `Enter`, or already display in `Diff` focus, is shared). This
+  is a deliberate consequence of §2.1's scope trim, not an oversight — a
+  future phase could give each surface its own independent copy of that
+  cache, or unify the two entirely, but doing so now would mean solving
   the much larger "make the whole modal Git Panel state machine
   permanently mounted" problem this doc explicitly declines to take on.
 - **Resizing never lets a dock shrink the editor to zero or negative
@@ -727,3 +751,67 @@ Round 2 (one Low finding): §2.4's opening paragraph referred to "three new
 checks... inserted before" the `match self.focus` fallthrough, but no three
 checks were ever enumerated there — the fallthrough itself just gains a
 `BottomDock` arm. Reworded to say that directly.
+
+Round 4 (post-implementation corrections, found only once the approved
+design was actually built and exercised by tests — not from a `rev` pass):
+
+4. **`GitLog`'s `Tab`/`BackTab` Graph/Diff toggle was permanently
+   unreachable.** §2.4 bound it to the same `Tab`/`BackTab` keys
+   `handle_bottom_dock_key` already consumes, unconditionally, to cycle
+   dock tabs *before* delegating to any per-tab handler — there was never a
+   fallthrough path by which a per-tab handler could see those keys, so the
+   `bool`-returning "falls through unconsumed" design this section
+   originally described didn't match the control flow implemented
+   elsewhere in the same doc. Rebound to `[`/`]`, matching the fix already
+   applied to Docker's/K8s's own internal sub-view switches for the
+   identical reason. §2.4's `GitLog` bullet updated in place with the
+   correction inline.
+5. **Docker's/K8s's confirm popups (plus K8s's scale-input prompt and
+   context/namespace picker) could never be cancelled with `Esc`.** Once
+   these panels stopped being modals in the `handle_key` precedence chain
+   (§2.4), a plain `Esc` — already bound globally to `CollapseSelections`,
+   `commands.rs` — won every race against ever reaching their own
+   confirm-mode `Esc` handling, since the global keymap lookup runs before
+   the `self.focus` fallthrough these panels are now reached through.
+   Fixed by adding two narrow checks back into `handle_key` (and mirrored
+   in `any_popup_open`), ahead of the keymap lookup: while the Docker tab
+   is showing and its `confirm` is `Some`, or the Kubernetes tab is showing
+   and its `confirm`/`scale_input`/`picker` is `Some`, route directly to
+   that panel's key handler, the same priority every other true modal in
+   the chain already gets. This restores exactly the nested-modal behavior
+   those panels had before this feature, without reintroducing modality
+   for the tabs themselves.
+
+Neither correction changes any interface signature from earlier rounds —
+both are implementation-detail fixes to keep the doc accurate against what
+was actually necessary to build a working feature, surfaced here per
+`CLAUDE.md`'s "fix all findings" convention rather than left silently
+diverging.
+
+### Round 5 (post-`rev`, two doc/comment corrections)
+
+`rev` (non-blocking `[quality]`/`[docs]` findings) caught two places where
+this doc, or a code comment written against it, claimed something the
+actual implementation doesn't do:
+
+1. **The tab-strip convention.** §2.3 originally said
+   `render_left_dock`/`render_bottom_dock` reuse `render_debug_panel`'s
+   `* `-prefix convention; the actual implementation uses `[brackets]`
+   instead, and the matching `ui.rs` doc comment incorrectly claimed this
+   was reusing "the bracketed-active-tab convention this file's tab strip
+   already establishes for editor tabs" — no such convention existed
+   before this diff (the editor tab strip uses reverse-video highlighting,
+   not brackets). Both the doc and the code comment now describe brackets
+   as the actual, deliberately new convention, with the rationale (packing
+   multiple short labels onto one line, where a color-only cue would be
+   lost on a monochrome terminal).
+2. **Git Panel / GitLog dock independence.** The original §3 bullet
+   claimed the two are "fully independent." Verified against the code:
+   only each surface's own cursor bookkeeping (`graph_selected`/
+   `diff_scroll`) is independent — both still read and write the same
+   shared `self.git.selected_commit`/`graph`/diff cache, a pre-existing
+   sharing pattern this feature adds a second consumer to rather than
+   introduces. The bullet now describes this accurately instead of
+   overclaiming isolation that doesn't exist.
+
+Neither correction changes behavior — both are doc/comment-accuracy fixes.
