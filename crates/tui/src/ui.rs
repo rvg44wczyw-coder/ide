@@ -125,6 +125,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.blame_popup.is_some() {
         render_blame_popup(frame, app, size);
     }
+    if app.git_gutter_popup_line.is_some() {
+        render_git_gutter_popup(frame, app, size);
+    }
     if app.git_panel.is_some() {
         render_git_panel(frame, app, size);
     }
@@ -347,6 +350,21 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     Style::default().fg(Color::DarkGray),
                 ));
             }
+            if app.git_gutter_lane_width() > 0 {
+                let mark = app.git_gutter.iter().find(|m| m.line == line);
+                let (glyph, color) = match mark.map(|m| m.kind) {
+                    Some(crate::git_gutter::GutterMarkKind::Added) => ("+", Color::Green),
+                    Some(crate::git_gutter::GutterMarkKind::Modified) => ("~", Color::Blue),
+                    Some(crate::git_gutter::GutterMarkKind::Deleted) => ("-", Color::Red),
+                    None => (" ", Color::DarkGray),
+                };
+                let mut spans = vec![Span::styled(
+                    format!("{glyph} "),
+                    Style::default().fg(color),
+                )];
+                spans.extend(styled.spans);
+                styled = Line::from(spans);
+            }
             if let Some(annotations) = &buf.blame {
                 let prefix = blame_lane_prefix(annotations, line, blame_now);
                 let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::DarkGray))];
@@ -402,7 +420,7 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                 let (_, screen_column) =
                     crate::highlight::expand_tabs(&line_text[..byte_col], 0, buf.indent.width);
                 frame.set_cursor_position((
-                    text_area.x + screen_column as u16 + app.blame_lane_width(),
+                    text_area.x + screen_column as u16 + app.editor_lane_width(),
                     text_area.y + screen_line as u16,
                 ));
             }
@@ -1996,6 +2014,29 @@ fn render_blame_popup(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((app.blame_popup_scroll, 0));
     frame.render_widget(paragraph, popup);
+}
+
+/// Small fixed-size popup (same shape `render_git_branches_popup` uses,
+/// not the growing shape `render_blame_popup` needs -- this popup's
+/// content is two fixed action lines, never variable-length prose)
+/// listing the git-gutter click popup's two actions (`docs/features/
+/// tui-git-gutter.md` §2.4).
+fn render_git_gutter_popup(frame: &mut Frame, _app: &App, area: Rect) {
+    let width = area.width.clamp(20, 40).min(area.width);
+    let height = 4u16.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Git Gutter  (r: Revert Hunk, d: Show Diff, Esc: close)");
+    let body = "r  Revert Hunk\nd  Show Diff";
+    frame.render_widget(Paragraph::new(body).block(block), popup);
 }
 
 fn render_git_branches_popup(frame: &mut Frame, app: &App, area: Rect) {

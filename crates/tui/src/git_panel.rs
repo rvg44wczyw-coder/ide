@@ -216,6 +216,31 @@ impl GitPanel {
             .map(|d| vec![d]);
     }
 
+    /// Same canonicalize + `strip_prefix` conversion `show_working_tree_
+    /// diff`/`blame_for` already use -- independent of whatever `self.diff`
+    /// currently shows. Empty with no repo, an untracked path, or no diff
+    /// (`docs/features/tui-git-gutter.md` §2.2).
+    pub fn hunks_for(&self, absolute_path: &Path) -> Vec<ide_core::DiffHunk> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        std::fs::canonicalize(absolute_path)
+            .ok()
+            .and_then(|canonical| {
+                canonical
+                    .strip_prefix(repo.workdir())
+                    .ok()
+                    .map(|p| p.to_path_buf())
+            })
+            .and_then(|rel| repo.diff_file(rel).ok().flatten())
+            .map(|d| d.hunks)
+            .unwrap_or_default()
+    }
+
+    pub fn gutter_marks_for(&self, absolute_path: &Path) -> Vec<crate::git_gutter::GutterMark> {
+        crate::git_gutter::marks_from_hunks(&self.hunks_for(absolute_path))
+    }
+
     /// Selects a conflicted path -- must come from `conflicts` (never any
     /// other source) -- and loads its sides. Sets `binary_conflict`
     /// instead of `active_conflict` if `conflict_sides()` errors
@@ -1463,6 +1488,56 @@ mod tests {
         panel.refresh(dir.path());
 
         assert!(panel.blame_for(&file).is_empty());
+    }
+
+    #[test]
+    fn gutter_marks_for_a_modified_line_reflects_the_working_tree() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        let marks = panel.gutter_marks_for(&dir.path().join("f.txt"));
+
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].line, 1);
+        assert_eq!(marks[0].kind, crate::git_gutter::GutterMarkKind::Modified);
+    }
+
+    #[test]
+    fn gutter_marks_for_an_unchanged_file_is_empty() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert!(panel.gutter_marks_for(&dir.path().join("f.txt")).is_empty());
+    }
+
+    #[test]
+    fn gutter_marks_for_with_no_repo_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "a\n").unwrap();
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert!(panel.gutter_marks_for(&file).is_empty());
+    }
+
+    #[test]
+    fn hunks_for_matches_gutter_marks_fors_own_source() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        let hunks = panel.hunks_for(&dir.path().join("f.txt"));
+
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(crate::git_gutter::marks_from_hunks(&hunks).len(), 1);
     }
 
     #[test]
