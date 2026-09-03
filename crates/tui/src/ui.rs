@@ -22,7 +22,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{
-    App, ChangesFocus, ClaudeView, DebugPanelFocus, FilterField, Focus, GitPanelFocus, GitPanelView,
+    App, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView, DebugPanelFocus, FilterField,
+    Focus, GitPanelFocus, GitPanelState, GitPanelView, LeftDockState, LeftDockTab,
 };
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
@@ -83,13 +84,44 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let body = rows[0];
     let status_area = rows[1];
 
-    let columns = Layout::default()
-        .direction(LayoutDirection::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(body);
+    let left_width = app.left_dock.is_some().then_some(app.left_dock_width_pct);
+    let columns = match left_width {
+        Some(pct) => Layout::default()
+            .direction(LayoutDirection::Horizontal)
+            .constraints([
+                Constraint::Percentage(pct),
+                Constraint::Percentage(100 - pct),
+            ])
+            .split(body),
+        None => Layout::default()
+            .constraints([Constraint::Percentage(0), Constraint::Percentage(100)])
+            .split(body),
+    };
+    if let Some(dock) = &app.left_dock {
+        render_left_dock(frame, app, dock, columns[0], hits);
+    }
 
-    render_tree(frame, app, columns[0], hits);
-    render_editor(frame, app, columns[1], hits);
+    let right_column = columns[1];
+    let bottom_height = app
+        .bottom_dock
+        .is_some()
+        .then_some(app.bottom_dock_height_pct);
+    let rows2 = match bottom_height {
+        Some(pct) => Layout::default()
+            .direction(LayoutDirection::Vertical)
+            .constraints([
+                Constraint::Percentage(100 - pct),
+                Constraint::Percentage(pct),
+            ])
+            .split(right_column),
+        None => Layout::default()
+            .constraints([Constraint::Percentage(100), Constraint::Percentage(0)])
+            .split(right_column),
+    };
+    render_editor(frame, app, rows2[0], hits);
+    if let Some(dock) = &app.bottom_dock {
+        render_bottom_dock(frame, app, dock, rows2[1], hits);
+    }
     render_status(frame, app, status_area);
 
     if app.palette.is_some() {
@@ -100,12 +132,6 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     if app.notifications_open {
         render_notifications_panel(frame, app, size);
-    }
-    if app.problems.is_some() {
-        render_problems_panel(frame, app, size);
-    }
-    if app.cargo_panel_open {
-        render_cargo_panel(frame, app, size);
     }
     if app.hover_open {
         render_hover_popup(frame, app, size);
@@ -131,12 +157,6 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.git_panel.is_some() {
         render_git_panel(frame, app, size);
     }
-    if app.docker_panel.is_some() {
-        render_docker_panel(frame, app, size);
-    }
-    if app.k8s_panel.is_some() {
-        render_k8s_panel(frame, app, size);
-    }
     if app.go_to_file.is_some() {
         render_go_to_file_popup(frame, app, size);
     }
@@ -148,9 +168,6 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     if app.bookmarks_popup.is_some() {
         render_bookmarks_popup(frame, app, size);
-    }
-    if app.todo_panel.is_some() {
-        render_todo_panel(frame, app, size);
     }
     if app.keymap_popup.is_some() {
         render_keymap_popup(frame, app, size);
@@ -232,9 +249,104 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Project")
-        .border_style(focus_style(app, Focus::Tree));
+        .border_style(focus_style(app, Focus::LeftDock));
     hits.tree_area = Some(block.inner(area));
     frame.render_widget(List::new(items).block(block), area);
+}
+
+/// New in `docs/features/tui-tool-window-docking.md` (T33): renders a
+/// one-row tab strip above `dock`'s content, then dispatches to whichever
+/// existing per-tab render function matches `dock.tab` -- reusing the
+/// bracketed-active-tab convention this file's tab strip already
+/// establishes for editor tabs, rather than inventing a second one.
+fn render_left_dock(
+    frame: &mut Frame,
+    app: &App,
+    dock: &LeftDockState,
+    area: Rect,
+    hits: &mut HitMap,
+) {
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let strip_label = |tab: LeftDockTab, title: &str| {
+        if dock.tab == tab {
+            format!("[{title}]")
+        } else {
+            title.to_string()
+        }
+    };
+    let strip = Line::from(Span::styled(
+        format!(
+            "{}  {}",
+            strip_label(LeftDockTab::Files, "Files"),
+            strip_label(LeftDockTab::Todos, "Todos"),
+        ),
+        focus_style(app, Focus::LeftDock),
+    ));
+    frame.render_widget(Paragraph::new(strip), rows[0]);
+
+    match dock.tab {
+        LeftDockTab::Files => render_tree(frame, app, rows[1], hits),
+        LeftDockTab::Todos => render_todo_panel(frame, app, rows[1], dock.todos_selected),
+    }
+}
+
+/// Mirrors `render_left_dock` for the bottom dock's five tabs (`docs/
+/// features/tui-tool-window-docking.md` §2.3, T33). None of the five
+/// migrated panels register mouse hit regions today, so `_hits` is unused
+/// here -- kept as a parameter anyway to match `render_left_dock`'s
+/// signature and `render`'s own call site.
+fn render_bottom_dock(
+    frame: &mut Frame,
+    app: &App,
+    dock: &BottomDockState,
+    area: Rect,
+    _hits: &mut HitMap,
+) {
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let strip_label = |tab: BottomDockTab, title: &str| {
+        if dock.tab == tab {
+            format!("[{title}]")
+        } else {
+            title.to_string()
+        }
+    };
+    let strip = Line::from(Span::styled(
+        format!(
+            "{}  {}  {}  {}  {}",
+            strip_label(BottomDockTab::Docker, "Docker"),
+            strip_label(BottomDockTab::Kubernetes, "Kubernetes"),
+            strip_label(BottomDockTab::Cargo, "Cargo"),
+            strip_label(BottomDockTab::Problems, "Problems"),
+            strip_label(BottomDockTab::GitLog, "Git Log"),
+        ),
+        focus_style(app, Focus::BottomDock),
+    ));
+    frame.render_widget(Paragraph::new(strip), rows[0]);
+
+    match dock.tab {
+        BottomDockTab::Docker => render_docker_panel(frame, app, rows[1]),
+        BottomDockTab::Kubernetes => render_k8s_panel(frame, app, rows[1]),
+        BottomDockTab::Cargo => render_cargo_panel(frame, app, rows[1]),
+        BottomDockTab::Problems => {
+            render_problems_panel(frame, app, rows[1], dock.problems_selected)
+        }
+        BottomDockTab::GitLog => {
+            let state = GitPanelState {
+                view: GitPanelView::Log,
+                focus: app.git_log_dock.focus,
+                graph_selected: app.git_log_dock.graph_selected,
+                diff_scroll: app.git_log_dock.diff_scroll,
+                ..GitPanelState::default()
+            };
+            render_git_log_view(frame, app, &state, rows[1]);
+        }
+    }
 }
 
 fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
@@ -796,21 +908,12 @@ fn render_bookmarks_popup(frame: &mut Frame, app: &App, area: Rect) {
 
 /// TODO panel's popup (`docs/features/tui-todo-panel.md` §2.3). Same
 /// shape as `render_problems_panel`.
-fn render_todo_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(state) = app.todo_panel.as_ref() else {
-        return;
-    };
-    let width = area.width.saturating_sub(4).max(20);
-    let height = area.height.saturating_sub(4).max(3);
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
-
-    frame.render_widget(Clear, popup);
-
+/// `LeftDockTab::Todos` (`docs/features/tui-tool-window-docking.md` §2.3,
+/// T33) -- `selected` is `LeftDockState::todos_selected`, now that Todos'
+/// cursor lives on the dock's own state instead of a standalone
+/// `TodoPanelState` popup. No more centered-popup math/`Clear`: this draws
+/// directly into `area`, the dock's own content rect below its tab strip.
+fn render_todo_panel(frame: &mut Frame, app: &App, area: Rect, selected: usize) {
     let items: Vec<ListItem> = if app.todo.searching {
         vec![ListItem::new(Line::from("Scanning..."))]
     } else if let Some(results) = &app.todo.results {
@@ -822,7 +925,7 @@ fn render_todo_panel(frame: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .enumerate()
                 .map(|(i, m)| {
-                    let style = if i == state.selected {
+                    let style = if i == selected {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else {
                         Style::default()
@@ -853,8 +956,8 @@ fn render_todo_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("TODO  (Enter: jump, Esc: close)");
-    frame.render_widget(List::new(items).block(block), popup);
+        .title("TODO  (Enter: jump)");
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 /// Keymap popup (`docs/features/tui-keymap.md` §2.5). Same shape as
@@ -1456,29 +1559,18 @@ fn render_notifications_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(List::new(items).block(block), popup);
 }
 
-fn render_problems_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(problems) = app.problems.as_ref() else {
-        return;
-    };
+/// `BottomDockTab::Problems` (`docs/features/tui-tool-window-docking.md`
+/// §2.3, T33) -- `selected` is `BottomDockState::problems_selected`. No
+/// more centered-popup math/`Clear`: draws directly into `area`.
+fn render_problems_panel(frame: &mut Frame, app: &App, area: Rect, selected: usize) {
     let rows = app.flattened_diagnostics();
-    let width = area.width.clamp(40, 90);
-    let height = (rows.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
-
-    frame.render_widget(Clear, popup);
-
     let items: Vec<ListItem> = if rows.is_empty() {
         vec![ListItem::new(Line::from("No problems."))]
     } else {
         rows.iter()
             .enumerate()
             .map(|(i, (path, diag))| {
-                let style = if i == problems.selected {
+                let style = if i == selected {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
@@ -1500,31 +1592,18 @@ fn render_problems_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Problems  (Enter: open, Esc: close)");
-    frame.render_widget(List::new(items).block(block), popup);
+        .title("Problems  (Enter: open)");
+    frame.render_widget(List::new(items).block(block), area);
 }
 
-/// Deliberately not sized to its content the way every other overlay here
-/// is -- build/test output can run to thousands of lines, so this popup
-/// takes most of the screen and shows only the tail that fits, rather than
-/// growing to `output.len()` the way `render_problems_panel`'s `height`
-/// does (`docs/features/tui-cargo-panel.md` §4: no scroll-back in v1).
+/// `BottomDockTab::Cargo` (`docs/features/tui-tool-window-docking.md` §2.3,
+/// T33) -- no more centered-popup math/`Clear`: draws directly into `area`.
+/// Deliberately not sized to its content the way `render_problems_panel` is
+/// -- build/test output can run to thousands of lines, so this tab shows
+/// only the tail that fits, rather than growing to `output.len()`
+/// (`docs/features/tui-cargo-panel.md` §4: no scroll-back in v1).
 fn render_cargo_panel(frame: &mut Frame, app: &App, area: Rect) {
-    if !app.cargo_panel_open {
-        return;
-    }
-    let width = area.width.saturating_sub(4).max(20);
-    let height = area.height.saturating_sub(4).max(3);
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
-
-    frame.render_widget(Clear, popup);
-
-    let visible_rows = height.saturating_sub(2) as usize;
+    let visible_rows = area.height.saturating_sub(2) as usize;
     let output = &app.cargo.output;
     let start = output.len().saturating_sub(visible_rows);
     let items: Vec<ListItem> = if output.is_empty() {
@@ -1539,12 +1618,11 @@ fn render_cargo_panel(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let title = match app.cargo.running {
-        Some(command) => format!("cargo {}  (running... Esc: close)", command.subcommand()),
-        None => "Cargo  (b: build, r: run, t: test, c: check, l: clippy, f: fmt, Esc: close)"
-            .to_string(),
+        Some(command) => format!("cargo {}  (running...)", command.subcommand()),
+        None => "Cargo  (b: build, r: run, t: test, c: check, l: clippy, f: fmt)".to_string(),
     };
     let block = Block::default().borders(Borders::ALL).title(title);
-    frame.render_widget(List::new(items).block(block), popup);
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 /// `F1`'s popup (`docs/features/tui-hover-and-inlay-hints.md` §3.1) --
@@ -2500,32 +2578,20 @@ fn selection_style(is_selected: bool) -> Style {
     }
 }
 
-/// The Docker Panel overlay (`docs/features/tui-docker-and-kubernetes.md`
-/// §2.2/§2.6/§3.1/§3.3) -- near-fullscreen, same sizing convention
-/// `render_cargo_panel`/`render_git_panel` use. Left column: the active
-/// tab's list (containers or images). Right column: the selected
-/// container's logs, once fetched, or the panel's current error. The
-/// yes/no lifecycle confirm renders as a small centered modal on top, the
-/// same shape `render_rename_popup` already establishes.
+/// `BottomDockTab::Docker` (`docs/features/tui-docker-and-kubernetes.md`
+/// §2.2/§2.6/§3.1/§3.3, adapted for the dock by `docs/features/
+/// tui-tool-window-docking.md` §2.3, T33) -- no more centered-popup math/
+/// `Clear`: draws directly into `area`, reading `app.docker` (always alive)
+/// instead of an `Option`. Left column: the active tab's list (containers
+/// or images). Right column: the selected container's logs, once fetched,
+/// or the panel's current error. The yes/no lifecycle confirm still renders
+/// as its own small centered modal on top of `area`.
 fn render_docker_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(panel) = app.docker_panel.as_ref() else {
-        return;
-    };
-    let width = area.width.saturating_sub(4).max(20);
-    let height = area.height.saturating_sub(4).max(3);
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
-
-    frame.render_widget(Clear, popup);
-
+    let panel = &app.docker;
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(popup);
+        .split(area);
 
     let tab_label = match panel.tab {
         DockerTab::Containers => "Containers",
@@ -2567,7 +2633,7 @@ fn render_docker_panel(frame: &mut Frame, app: &App, area: Rect) {
         ))));
     }
     let left_title = format!(
-        "Docker: {tab_label}  (Tab: switch, r: refresh, s/x/b/d: start/stop/restart/rm, Enter: logs, Esc: close)"
+        "Docker: {tab_label}  ([/]: switch, r: refresh, s/x/b/d: start/stop/restart/rm, Enter: logs)"
     );
     let left_block = Block::default().borders(Borders::ALL).title(left_title);
     frame.render_widget(List::new(items).block(left_block), columns[0]);
@@ -2628,33 +2694,22 @@ fn render_docker_confirm_popup(
     frame.render_widget(block, popup);
 }
 
-/// The Kubernetes Panel overlay (`docs/features/
-/// tui-docker-and-kubernetes.md` §2.3/§2.6/§3.1/§3.4/§3.5) -- same
-/// two-column shape as `render_docker_panel`. The right column shows
-/// whichever of logs/describe output has content, or the panel's current
-/// error. The typed-name confirm, the scale-replica-count prompt, and the
-/// context/namespace picker each render as their own small centered modal
-/// on top, checked in the same priority order `handle_k8s_panel_key`
-/// uses.
+/// `BottomDockTab::Kubernetes` (`docs/features/
+/// tui-docker-and-kubernetes.md` §2.3/§2.6/§3.1/§3.4/§3.5, adapted for the
+/// dock by `docs/features/tui-tool-window-docking.md` §2.3, T33) -- same
+/// two-column shape as `render_docker_panel`, reading `app.k8s` (always
+/// alive) instead of an `Option`, no more centered-popup math/`Clear`. The
+/// right column shows whichever of logs/describe output has content, or
+/// the panel's current error. The typed-name confirm, the scale-replica-
+/// count prompt, and the context/namespace picker each still render as
+/// their own small centered modal on top of `area`, checked in the same
+/// priority order `handle_k8s_panel_key` uses.
 fn render_k8s_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(panel) = app.k8s_panel.as_ref() else {
-        return;
-    };
-    let width = area.width.saturating_sub(4).max(20);
-    let height = area.height.saturating_sub(4).max(3);
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    };
-
-    frame.render_widget(Clear, popup);
-
+    let panel = &app.k8s;
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(popup);
+        .split(area);
 
     let tab_label = match panel.tab {
         K8sTab::Pods => "Pods",
@@ -2711,7 +2766,7 @@ fn render_k8s_panel(frame: &mut Frame, app: &App, area: Rect) {
     let context_label = panel.context.as_deref().unwrap_or("(default)");
     let namespace_label = panel.namespace.as_deref().unwrap_or("(default)");
     let left_title = format!(
-        "K8s [{context_label}/{namespace_label}]: {tab_label}  (Tab: switch, r: refresh, c: context, n: namespace, l: logs, d: delete, s: scale, Enter: describe, Esc: close)"
+        "K8s [{context_label}/{namespace_label}]: {tab_label}  ([/]: switch, r: refresh, c: context, n: namespace, l: logs, d: delete, s: scale, Enter: describe)"
     );
     let left_block = Block::default().borders(Borders::ALL).title(left_title);
     frame.render_widget(List::new(items).block(left_block), columns[0]);

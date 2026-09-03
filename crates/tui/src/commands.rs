@@ -167,7 +167,12 @@ pub enum Action {
     SaveActive,
     Undo,
     Redo,
-    ToggleTreeFocus,
+    ToggleLeftDockFocus,
+    ToggleBottomDockFocus,
+    ToggleLeftDock,
+    ToggleBottomDock,
+    GrowFocusedDock,
+    ShrinkFocusedDock,
     NextTab,
     PreviousTab,
     CloseTab,
@@ -274,7 +279,7 @@ pub fn commands() -> &'static [Command] {
             id: "ToggleProjectToolWindow",
             title: "Project",
             binding: Some((KeyModifiers::CONTROL, KeyCode::Char('t'))),
-            action: Action::ToggleTreeFocus,
+            action: Action::ToggleLeftDockFocus,
         },
         Command {
             id: "NextTab",
@@ -913,6 +918,45 @@ pub fn commands() -> &'static [Command] {
             action: Action::NavigateForward,
         },
         Command {
+            id: "ToggleLeftDock",
+            title: "Toggle Left Dock",
+            // Palette-only -- "hide/show a whole dock group" has no
+            // JetBrains tool-window-stretch precedent this project has
+            // verified with confidence; per CLAUDE.md's keyboard-shortcuts
+            // rule, an unverified binding is worse than none
+            // (`docs/features/tui-tool-window-docking.md` §2.2).
+            binding: None,
+            action: Action::ToggleLeftDock,
+        },
+        Command {
+            id: "ToggleBottomDock",
+            title: "Toggle Bottom Dock",
+            binding: None,
+            action: Action::ToggleBottomDock,
+        },
+        Command {
+            id: "GrowFocusedDock",
+            title: "Grow Focused Dock Panel",
+            binding: None,
+            action: Action::GrowFocusedDock,
+        },
+        Command {
+            id: "ShrinkFocusedDock",
+            title: "Shrink Focused Dock Panel",
+            binding: None,
+            action: Action::ShrinkFocusedDock,
+        },
+        Command {
+            id: "ToggleBottomDockFocus",
+            title: "Toggle Bottom Dock Focus",
+            // Palette-only -- no reference-IDE precedent for a *second*
+            // tool-window-focus toggle keybinding the way `Ctrl+T` is a
+            // verified existing binding for `ToggleLeftDockFocus`
+            // (`docs/features/tui-tool-window-docking.md` §2.1).
+            binding: None,
+            action: Action::ToggleBottomDockFocus,
+        },
+        Command {
             id: "Exit",
             title: "Exit",
             binding: None,
@@ -970,9 +1014,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_maps_to_toggle_tree_focus() {
+    fn ctrl_t_maps_to_toggle_left_dock_focus() {
         let action = binding_for(key(KeyModifiers::CONTROL, KeyCode::Char('t')));
-        assert_eq!(action, Some(Action::ToggleTreeFocus));
+        assert_eq!(action, Some(Action::ToggleLeftDockFocus));
     }
 
     #[test]

@@ -48,8 +48,9 @@ use crate::tree::TreeState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
-    Tree,
+    LeftDock,
     Editor,
+    BottomDock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,15 +178,6 @@ pub(crate) struct Notification {
     pub(crate) read: bool,
 }
 
-/// Selection state for the Problems panel (`docs/features/tui-problems.md`,
-/// `T9`) -- the diagnostics themselves live in `lsp.diagnostics`
-/// (per-file, LSP's own storage shape); this only tracks which flattened
-/// row is selected, since `flattened_diagnostics` recomputes that
-/// flattening fresh on every call rather than caching it.
-pub(crate) struct ProblemsState {
-    pub(crate) selected: usize,
-}
-
 /// Find in Path's typed query and list selection (`docs/features/
 /// tui-find-in-path.md` §2.2) -- separate from `search: SearchPanel`
 /// (the background search machinery, ported from `ide-ui`) the same way
@@ -267,14 +259,6 @@ pub(crate) struct RecentFilesState {
 /// establishes.
 #[derive(Default)]
 pub(crate) struct BookmarksPopupState {
-    pub(crate) selected: usize,
-}
-
-/// TODO panel's list selection (`docs/features/tui-todo-panel.md` §2.2) --
-/// the matches themselves live in `todo.results`, same convention
-/// `CodeActionsState`/`BookmarksPopupState` establish.
-#[derive(Default)]
-pub(crate) struct TodoPanelState {
     pub(crate) selected: usize,
 }
 
@@ -530,6 +514,100 @@ pub(crate) struct ScratchFilesState {
     pub(crate) selected: usize,
 }
 
+/// Which tab the left dock's tab strip is currently showing
+/// (`docs/features/tui-tool-window-docking.md` §2.1, T33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LeftDockTab {
+    #[default]
+    Files,
+    Todos,
+}
+
+impl LeftDockTab {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            LeftDockTab::Files => LeftDockTab::Todos,
+            LeftDockTab::Todos => LeftDockTab::Files,
+        }
+    }
+
+    pub(crate) fn previous(self) -> Self {
+        // Only two variants -- `next`'s own cycle is its own inverse.
+        self.next()
+    }
+}
+
+/// The left dock's visibility+tab+cursor state (`docs/features/
+/// tui-tool-window-docking.md` §2.1) -- `None` on `App::left_dock` means
+/// the dock is hidden entirely, same "presence is visibility" idiom
+/// `git_panel`/`code_actions` etc. already use, applied to a whole tab
+/// group. `todos_selected` absorbs the old standalone `TodoPanelState`'s
+/// one field now that Todos is a tab here rather than its own popup.
+#[derive(Default)]
+pub(crate) struct LeftDockState {
+    pub(crate) tab: LeftDockTab,
+    pub(crate) todos_selected: usize,
+}
+
+/// Which tab the bottom dock's tab strip is currently showing
+/// (`docs/features/tui-tool-window-docking.md` §2.1, T33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BottomDockTab {
+    #[default]
+    Docker,
+    Kubernetes,
+    Cargo,
+    Problems,
+    GitLog,
+}
+
+impl BottomDockTab {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            BottomDockTab::Docker => BottomDockTab::Kubernetes,
+            BottomDockTab::Kubernetes => BottomDockTab::Cargo,
+            BottomDockTab::Cargo => BottomDockTab::Problems,
+            BottomDockTab::Problems => BottomDockTab::GitLog,
+            BottomDockTab::GitLog => BottomDockTab::Docker,
+        }
+    }
+
+    pub(crate) fn previous(self) -> Self {
+        match self {
+            BottomDockTab::Docker => BottomDockTab::GitLog,
+            BottomDockTab::Kubernetes => BottomDockTab::Docker,
+            BottomDockTab::Cargo => BottomDockTab::Kubernetes,
+            BottomDockTab::Problems => BottomDockTab::Cargo,
+            BottomDockTab::GitLog => BottomDockTab::Problems,
+        }
+    }
+}
+
+/// The bottom dock's visibility+tab+cursor state, mirroring `LeftDockState`
+/// (`docs/features/tui-tool-window-docking.md` §2.1). `problems_selected`
+/// absorbs the old standalone `ProblemsState`'s one field. Docker/
+/// Kubernetes/Cargo carry their own selection/cursor fields inside their
+/// own always-alive panel structs (`App::docker`/`k8s`/`cargo`) -- only
+/// Problems' cursor was ever a separate, popup-only struct.
+#[derive(Default)]
+pub(crate) struct BottomDockState {
+    pub(crate) tab: BottomDockTab,
+    pub(crate) problems_selected: usize,
+}
+
+/// The Git Log dock tab's own small, always-alive cursor (`docs/features/
+/// tui-tool-window-docking.md` §2.1) -- deliberately separate from
+/// `GitPanelState`, which only exists while the full modal Git Panel is
+/// open. Restricted by construction to `GitPanelFocus::Graph`/`::Diff`
+/// (`handle_git_log_dock_key` never assigns `Conflicts`/`Filter` here) --
+/// the dock tab is browse-only, per that doc's "deliberate trim".
+#[derive(Default)]
+pub(crate) struct GitLogDockState {
+    pub(crate) focus: GitPanelFocus,
+    pub(crate) graph_selected: usize,
+    pub(crate) diff_scroll: u16,
+}
+
 pub struct App {
     pub(crate) project_root: PathBuf,
     pub(crate) tree: DirEntry,
@@ -562,9 +640,7 @@ pub struct App {
     expect_implementation_next: bool,
     pub(crate) notifications: Vec<Notification>,
     pub(crate) notifications_open: bool,
-    pub(crate) problems: Option<ProblemsState>,
     pub(crate) cargo: CargoPanel,
-    pub(crate) cargo_panel_open: bool,
     pub(crate) hover_open: bool,
     /// The `(path, position)` `sync_document_highlights` most recently
     /// fired a `DocumentHighlight` query for -- lets it tell "the caret
@@ -588,7 +664,6 @@ pub struct App {
     pub(crate) recent_files: Option<RecentFilesState>,
     pub(crate) bookmarks_popup: Option<BookmarksPopupState>,
     pub(crate) todo: TodoPanel,
-    pub(crate) todo_panel: Option<TodoPanelState>,
     /// `None` if the watcher failed to start (`docs/features/
     /// tui-file-watcher.md` §2.2) -- degrades to "no automatic refresh",
     /// never a failure to open the project.
@@ -652,14 +727,29 @@ pub struct App {
     /// The buffer line a sign-column click landed on, while its "Revert
     /// Hunk (r) / Show Diff (d)" popup is open. `None` when closed.
     pub(crate) git_gutter_popup_line: Option<usize>,
-    /// Presence is visibility, same convention `git_panel` uses -- unlike
-    /// `git`/`git_panel`'s split (an always-present service plus a
-    /// separate open/focus wrapper), `DockerPanel`/`K8sPanel` carry their
-    /// own state directly since neither panel does any ambient background
-    /// refresh while closed (`docs/features/tui-docker-and-kubernetes.md`
-    /// §2.4 -- a deliberate scope cut, not an oversight).
-    pub(crate) docker_panel: Option<DockerPanel>,
-    pub(crate) k8s_panel: Option<K8sPanel>,
+    /// Always alive since `docs/features/tui-tool-window-docking.md` §2.1
+    /// (T33) -- a dock tab can be switched away from and back to as
+    /// casually as `Tab`-cycling, so an in-flight `docker`/`kubectl` fetch
+    /// (or an already-fetched container/pod list) must survive that the
+    /// same way `App::cargo`'s background poll already does. Visibility is
+    /// now purely "is `bottom_dock` open, and is its `tab` currently
+    /// `Docker`/`Kubernetes`" -- no separate bool on the panel structs
+    /// themselves.
+    pub(crate) docker: DockerPanel,
+    pub(crate) k8s: K8sPanel,
+    /// `None` = dock hidden entirely (editor's column grows to fill the
+    /// freed space). `Some` = dock visible, holding which tab is active
+    /// and that tab's cursor (`docs/features/tui-tool-window-docking.md`
+    /// §2.1, T33).
+    pub(crate) left_dock: Option<LeftDockState>,
+    pub(crate) bottom_dock: Option<BottomDockState>,
+    /// Split ratios, persisted only for the process lifetime. Clamped to
+    /// `LEFT_DOCK_WIDTH_RANGE`/`BOTTOM_DOCK_HEIGHT_RANGE` on every change.
+    /// Meaningless while the corresponding dock is `None` -- kept anyway so
+    /// a re-toggled-open dock reappears at the size the user last left it.
+    pub(crate) left_dock_width_pct: u16,
+    pub(crate) bottom_dock_height_pct: u16,
+    pub(crate) git_log_dock: GitLogDockState,
     /// The one detected project language, retained instead of being a
     /// `let` local `App::new` discards after starting the LSP server
     /// (`docs/features/tui-debugger.md` §2.2) -- `None` for an
@@ -670,14 +760,24 @@ pub struct App {
     pub(crate) debug_adapters: DebugAdapterConfig,
     pub(crate) debug: DebugPanel,
     /// Debug tool window visibility -- same bare-bool convention as
-    /// `cargo_panel_open`/`claude_panel_open`. `self.debug`'s own fields
-    /// persist across a close/reopen; only this flag changes.
+    /// `claude_panel_open`. `self.debug`'s own fields persist across a
+    /// close/reopen; only this flag changes.
     pub(crate) debug_panel_open: bool,
     /// "Configure Debug Adapter" popup state -- presence is visibility.
     pub(crate) debug_adapter_config_popup: Option<DebugAdapterConfigPopupState>,
     pub(crate) debug_panel: DebugPanelState,
     status: Option<String>,
     editor_viewport_rows: u16,
+}
+
+/// `docs/features/tui-tool-window-docking.md` §2.1 (T33).
+const LEFT_DOCK_WIDTH_RANGE: std::ops::RangeInclusive<u16> = 15..=60;
+const BOTTOM_DOCK_HEIGHT_RANGE: std::ops::RangeInclusive<u16> = 15..=70;
+const DOCK_RESIZE_STEP_PCT: u16 = 5;
+
+fn clamp_pct(current: u16, delta: i16, range: std::ops::RangeInclusive<u16>) -> u16 {
+    let next = current as i32 + delta as i32;
+    next.clamp(*range.start() as i32, *range.end() as i32) as u16
 }
 
 impl App {
@@ -725,7 +825,7 @@ impl App {
             project_root: project.root().to_path_buf(),
             tree,
             tree_state: TreeState::new(),
-            focus: Focus::Tree,
+            focus: Focus::LeftDock,
             tabs: Vec::new(),
             active_tab: None,
             palette: None,
@@ -736,9 +836,7 @@ impl App {
             expect_implementation_next: false,
             notifications: startup_notifications,
             notifications_open: false,
-            problems: None,
             cargo: CargoPanel::default(),
-            cargo_panel_open: false,
             hover_open: false,
             last_highlighted_target: None,
             search: SearchPanel::default(),
@@ -752,7 +850,6 @@ impl App {
             recent_files: None,
             bookmarks_popup: None,
             todo: TodoPanel::default(),
-            todo_panel: None,
             watcher,
             keymap: crate::keymap::load(),
             keymap_path_override: None,
@@ -778,8 +875,13 @@ impl App {
             git_gutter: Vec::new(),
             git_gutter_path: None,
             git_gutter_popup_line: None,
-            docker_panel: None,
-            k8s_panel: None,
+            docker: DockerPanel::default(),
+            k8s: K8sPanel::default(),
+            left_dock: Some(LeftDockState::default()),
+            bottom_dock: None,
+            left_dock_width_pct: 30,
+            bottom_dock_height_pct: 30,
+            git_log_dock: GitLogDockState::default(),
             language,
             debug_adapters,
             debug: DebugPanel::default(),
@@ -831,26 +933,24 @@ impl App {
         self.cargo.poll();
     }
 
-    /// Called once per frame (`lib.rs`'s main loop), but only while the
-    /// respective panel is open -- unlike `poll_cargo`/`poll_search`/
-    /// `poll_todo`'s unconditional background polling, this is a
-    /// deliberate scope cut (`docs/features/tui-docker-and-kubernetes.md`
-    /// §2.4/§4): closing the panel mid-request just drops the in-flight
-    /// `Receiver`, which is fine here since a fresh list/logs fetch is
-    /// cheap to re-request the next time the panel reopens, unlike a
-    /// build the user explicitly started and may want to alt-tab away
-    /// from.
+    /// Called once per frame (`lib.rs`'s main loop), now unconditionally --
+    /// since `docs/features/tui-tool-window-docking.md` §2.1 (T33),
+    /// `self.docker` is always alive and a dock tab can be switched away
+    /// from and back to as casually as `Tab`-cycling, so an in-flight
+    /// `docker` fetch must keep being polled the same way `poll_cargo`/
+    /// `poll_search`/`poll_todo` already poll unconditionally -- leaving
+    /// this gated on visibility (the old `docker_panel.is_some()` scope cut
+    /// from `docs/features/tui-docker-and-kubernetes.md` §2.4/§4, made
+    /// obsolete by T33) would silently stop background output from ever
+    /// reaching `self.docker.logs`/`.containers` again once the bottom dock
+    /// is closed.
     pub fn poll_docker(&mut self) {
-        if let Some(panel) = self.docker_panel.as_mut() {
-            panel.poll();
-        }
+        self.docker.poll();
     }
 
     /// Same reasoning as `poll_docker`, for the Kubernetes panel.
     pub fn poll_k8s(&mut self) {
-        if let Some(panel) = self.k8s_panel.as_mut() {
-            panel.poll();
-        }
+        self.k8s.poll();
     }
 
     /// Same shape, for a Find in Path search running in the background
@@ -1504,25 +1604,28 @@ impl App {
         self.notifications.iter().filter(|n| !n.read).count()
     }
 
-    /// Closes every overlay panel (Goto picker, Notifications, Problems,
-    /// Cargo, Hover, Find in Path, Code Actions, Rename popup, Rename
-    /// preview) -- called before opening any one of them, so at most one is
-    /// ever open at a time (`docs/features/tui-problems.md` §4, extended by
-    /// `docs/features/tui-cargo-panel.md` §4, `docs/features/
+    /// Closes every true modal overlay (Goto picker, Notifications, Hover,
+    /// Find in Path, Code Actions, Rename popup, Rename preview, the full
+    /// Git Panel, ...) -- called before opening any one of them, so at most
+    /// one is ever open at a time (`docs/features/tui-problems.md` §4,
+    /// extended by `docs/features/tui-cargo-panel.md` §4, `docs/features/
     /// tui-hover-and-inlay-hints.md` §2.2, `docs/features/
     /// tui-find-in-path.md` §3.1, and `docs/features/
     /// tui-code-actions-and-rename.md` §2.3/§4). Does not touch
     /// `find`/`palette`, which sit at an outer interception tier in
-    /// `handle_key` and are never open at the same time as one of these
-    /// nine in the first place. Closing the Cargo panel or the Find in Path
-    /// panel this way never stops a running command/search -- only the
-    /// `_open` flag changes, `self.cargo`/`self.search` themselves are
-    /// untouched.
+    /// `handle_key` and are never open at the same time as one of these in
+    /// the first place. Does not touch `left_dock`/`bottom_dock` either --
+    /// since `docs/features/tui-tool-window-docking.md` (T33), Docker/K8s/
+    /// Cargo/Problems/Todos/Git Log are dock tabs, not exclusive modals:
+    /// they coexist with the editor and with each other, so opening one via
+    /// `show_left_dock_tab`/`show_bottom_dock_tab` only ever switches that
+    /// dock's own active tab, never forces every other dock tab closed the
+    /// way this function still does for genuine modals. Closing the Find in
+    /// Path panel this way never stops a running search -- only the `_open`
+    /// flag changes, `self.search` itself is untouched.
     fn close_all_overlays(&mut self) {
         self.goto = None;
         self.notifications_open = false;
-        self.problems = None;
-        self.cargo_panel_open = false;
         self.hover_open = false;
         self.search_open = false;
         self.go_to_file = None;
@@ -1531,11 +1634,8 @@ impl App {
         self.rename_popup = None;
         self.pending_rename_preview = None;
         self.git_panel = None;
-        self.docker_panel = None;
-        self.k8s_panel = None;
         self.recent_files = None;
         self.bookmarks_popup = None;
-        self.todo_panel = None;
         self.keymap_popup = None;
         self.new_scratch_file = None;
         self.scratch_files = None;
@@ -1544,6 +1644,96 @@ impl App {
         self.debug_panel_open = false;
         self.debug_adapter_config_popup = None;
         self.debug.show_launch_popup = false;
+    }
+
+    /// Shared "ensure `left_dock` is open, on `tab`, and focused" mechanics
+    /// for every `ToggleXPanel` command whose tab now lives in the left
+    /// dock (`docs/features/tui-tool-window-docking.md` §2.4, T33). Returns
+    /// `true` if this call is what made `tab` newly visible/focused (the
+    /// caller then runs any panel-specific "just opened" trigger, e.g. a
+    /// scan/refresh, the same way it used to gate that on `Option::is_none
+    /// ()`); returns `false` if the "press it again to close" exception
+    /// fired instead (already open, already on `tab`, already focused) --
+    /// preserves today's simple toggle behavior for a single-tab command.
+    fn show_left_dock_tab(&mut self, tab: LeftDockTab) -> bool {
+        let already_showing = matches!(&self.left_dock, Some(dock) if dock.tab == tab)
+            && self.focus == Focus::LeftDock;
+        if already_showing {
+            self.left_dock = None;
+            self.focus = Focus::Editor;
+            return false;
+        }
+        self.left_dock
+            .get_or_insert_with(LeftDockState::default)
+            .tab = tab;
+        self.focus = Focus::LeftDock;
+        true
+    }
+
+    /// Mirrors `show_left_dock_tab` for the bottom dock.
+    fn show_bottom_dock_tab(&mut self, tab: BottomDockTab) -> bool {
+        let already_showing = matches!(&self.bottom_dock, Some(dock) if dock.tab == tab)
+            && self.focus == Focus::BottomDock;
+        if already_showing {
+            self.bottom_dock = None;
+            self.focus = Focus::Editor;
+            return false;
+        }
+        self.bottom_dock
+            .get_or_insert_with(BottomDockState::default)
+            .tab = tab;
+        self.focus = Focus::BottomDock;
+        true
+    }
+
+    /// Derived visibility for the Cargo dock tab, replacing the old
+    /// standalone `cargo_panel_open: bool` now that Cargo is one of the
+    /// bottom dock's five tabs rather than its own full-screen popup
+    /// (`docs/features/tui-tool-window-docking.md` §1/§2.1, T33) --
+    /// `self.cargo` itself (the always-alive output/running-command data)
+    /// is unaffected by whether this is currently showing. `render_bottom_
+    /// dock` compares `dock.tab` directly rather than calling this, so
+    /// today the only caller is test code -- `#[cfg(test)]` avoids a
+    /// `dead_code` warning on the plain (non-test) build for that reason,
+    /// same as every other test-only helper in this module.
+    #[cfg(test)]
+    pub(crate) fn cargo_panel_open(&self) -> bool {
+        matches!(&self.bottom_dock, Some(dock) if dock.tab == BottomDockTab::Cargo)
+    }
+
+    /// Derived visibility for the Problems dock tab, mirroring
+    /// `cargo_panel_open` (`docs/features/tui-tool-window-docking.md`,
+    /// T33).
+    #[cfg(test)]
+    pub(crate) fn problems_open(&self) -> bool {
+        matches!(&self.bottom_dock, Some(dock) if dock.tab == BottomDockTab::Problems)
+    }
+
+    /// Derived visibility for the Docker dock tab. `self.docker` itself
+    /// (the always-alive container/image state) is unaffected by whether
+    /// this is currently showing. Unlike its siblings above, `handle_key`/
+    /// `any_popup_open` also call this in production: Docker's confirm
+    /// popup is a nested modal that must intercept keys before the global
+    /// keymap, but only while its tab is actually the one showing
+    /// (`docs/features/tui-tool-window-docking.md` §2.4, T33).
+    pub(crate) fn docker_panel_open(&self) -> bool {
+        matches!(&self.bottom_dock, Some(dock) if dock.tab == BottomDockTab::Docker)
+    }
+
+    /// Derived visibility for the Kubernetes dock tab, same production
+    /// use as `docker_panel_open` (its confirm/scale-input/picker nested
+    /// modals).
+    pub(crate) fn k8s_panel_open(&self) -> bool {
+        matches!(&self.bottom_dock, Some(dock) if dock.tab == BottomDockTab::Kubernetes)
+    }
+
+    /// Derived visibility for the Todos left-dock tab, mirroring
+    /// `cargo_panel_open` (`docs/features/tui-tool-window-docking.md`,
+    /// T33). `self.todo` itself is unaffected by whether this is currently
+    /// showing.
+    #[cfg(test)]
+    pub(crate) fn todo_panel_open(&self) -> bool {
+        matches!(&self.left_dock, Some(dock) if dock.tab == LeftDockTab::Todos)
     }
 
     /// `ToggleClaudePanel` command (palette-only, no default binding --
@@ -1742,6 +1932,32 @@ impl App {
         self.notifications_open = opening;
     }
 
+    /// `GrowFocusedDock`/`ShrinkFocusedDock` (`docs/features/
+    /// tui-tool-window-docking.md` §2.1/§3, T33) -- `delta` is
+    /// `+DOCK_RESIZE_STEP_PCT` to grow, `-DOCK_RESIZE_STEP_PCT` to shrink.
+    /// A no-op while `self.focus == Focus::Editor` (no focused dock to
+    /// resize) or while the corresponding dock is `None` (nothing visible
+    /// to resize). Hitting a clamp bound is a silent no-op past that point,
+    /// matching every other saturating/clamped cursor adjustment already in
+    /// this crate.
+    fn resize_focused_dock(&mut self, delta: i16) {
+        match self.focus {
+            Focus::Editor => {}
+            Focus::LeftDock => {
+                if self.left_dock.is_some() {
+                    self.left_dock_width_pct =
+                        clamp_pct(self.left_dock_width_pct, delta, LEFT_DOCK_WIDTH_RANGE);
+                }
+            }
+            Focus::BottomDock => {
+                if self.bottom_dock.is_some() {
+                    self.bottom_dock_height_pct =
+                        clamp_pct(self.bottom_dock_height_pct, delta, BOTTOM_DOCK_HEIGHT_RANGE);
+                }
+            }
+        }
+    }
+
     /// Handles every key while `notifications_open` -- intercepts all
     /// input the same way `handle_goto_key`/`handle_palette_key` do.
     /// `c`/`r` are plain, unmodified letters (this panel has no text
@@ -1796,45 +2012,43 @@ impl App {
             .unwrap_or(&[])
     }
 
-    /// `ToggleProblems` command (`Ctrl+P`, see `commands.rs`).
+    /// `ToggleProblems` command (`Ctrl+P`, see `commands.rs`) -- since
+    /// `docs/features/tui-tool-window-docking.md` (T33), ensures/shows the
+    /// bottom dock's Problems tab instead of opening a full-screen popup;
+    /// see `show_bottom_dock_tab`.
     fn toggle_problems(&mut self) {
-        let opening = self.problems.is_none();
         self.close_all_overlays();
-        if opening {
-            self.problems = Some(ProblemsState { selected: 0 });
-        }
+        self.show_bottom_dock_tab(BottomDockTab::Problems);
     }
 
-    /// Handles every key while `problems.is_some()` -- same interception
-    /// shape as `handle_goto_key`. `Enter` opens the selected diagnostic's
-    /// file and jumps to its range's start via `open_location`, reusing
-    /// exactly the Goto/Find Usages jump logic (a `Diagnostic` plus its
-    /// owning path is the same `path` + `range` shape a `Location` is).
+    /// Handles every key while `BottomDockTab::Problems` is the bottom
+    /// dock's active tab and it has focus (`handle_bottom_dock_key`'s
+    /// delegation) -- same interception shape as `handle_goto_key`. `Enter`
+    /// opens the selected diagnostic's file and jumps to its range's start
+    /// via `open_location`, reusing exactly the Goto/Find Usages jump logic
+    /// (a `Diagnostic` plus its owning path is the same `path` + `range`
+    /// shape a `Location` is).
     fn handle_problems_key(&mut self, key: KeyEvent) -> LoopSignal {
-        let Some(problems) = self.problems.as_ref() else {
-            return LoopSignal::Continue;
-        };
         let row_count = self.flattened_diagnostics().len();
         match key.code {
-            KeyCode::Esc => {
-                self.problems = None;
-            }
             KeyCode::Up => {
-                if let Some(problems) = self.problems.as_mut() {
-                    if problems.selected > 0 {
-                        problems.selected -= 1;
+                if let Some(dock) = self.bottom_dock.as_mut() {
+                    if dock.problems_selected > 0 {
+                        dock.problems_selected -= 1;
                     }
                 }
             }
             KeyCode::Down => {
-                if let Some(problems) = self.problems.as_mut() {
-                    if problems.selected + 1 < row_count {
-                        problems.selected += 1;
+                if let Some(dock) = self.bottom_dock.as_mut() {
+                    if dock.problems_selected + 1 < row_count {
+                        dock.problems_selected += 1;
                     }
                 }
             }
             KeyCode::Enter => {
-                let selected = problems.selected;
+                let Some(selected) = self.bottom_dock.as_ref().map(|d| d.problems_selected) else {
+                    return LoopSignal::Continue;
+                };
                 let location = self
                     .flattened_diagnostics()
                     .get(selected)
@@ -1842,7 +2056,6 @@ impl App {
                         path: (*path).clone(),
                         range: diag.range,
                     });
-                self.problems = None;
                 if let Some(location) = location {
                     self.open_location(location);
                 }
@@ -1853,24 +2066,25 @@ impl App {
     }
 
     /// `ToggleCargoPanel` command (palette-only, no default binding -- see
-    /// `commands.rs`): opens/closes the Cargo output panel. Never touches
-    /// `self.cargo` itself -- closing hides the panel, it never stops a
-    /// running command (`docs/features/tui-cargo-panel.md` §3).
+    /// `commands.rs`) -- since `docs/features/tui-tool-window-docking.md`
+    /// (T33), ensures/shows the bottom dock's Cargo tab instead of opening
+    /// a full-screen popup. Never touches `self.cargo` itself -- closing
+    /// hides the tab, it never stops a running command (`docs/features/
+    /// tui-cargo-panel.md` §3).
     fn toggle_cargo_panel(&mut self) {
-        let opening = !self.cargo_panel_open;
         self.close_all_overlays();
-        self.cargo_panel_open = opening;
+        self.show_bottom_dock_tab(BottomDockTab::Cargo);
     }
 
-    /// Handles every key while `cargo_panel_open` -- same interception
-    /// shape as `handle_notifications_key`: plain, unmodified letters,
-    /// since this panel has no text query to type into. Each of the six
-    /// letters starts the matching `cargo` subcommand in `project_root`;
-    /// `CargoPanel::run` itself is the sole guard against overlapping runs
-    /// (no-op while one is already in flight).
+    /// Handles every key while `BottomDockTab::Cargo` is the bottom dock's
+    /// active tab and it has focus -- same interception shape as
+    /// `handle_notifications_key`: plain, unmodified letters, since this
+    /// panel has no text query to type into. Each of the six letters starts
+    /// the matching `cargo` subcommand in `project_root`; `CargoPanel::run`
+    /// itself is the sole guard against overlapping runs (no-op while one
+    /// is already in flight).
     fn handle_cargo_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
         match key.code {
-            KeyCode::Esc => self.cargo_panel_open = false,
             KeyCode::Char('b') => self.cargo.run(&self.project_root, CargoCommand::Build),
             KeyCode::Char('r') => self.cargo.run(&self.project_root, CargoCommand::Run),
             KeyCode::Char('t') => self.cargo.run(&self.project_root, CargoCommand::Test),
@@ -2434,27 +2648,31 @@ impl App {
     }
 
     /// Palette-only entry point (`docs/features/tui-todo-panel.md` §1.2/
-    /// §2.2). Always re-scans on open (`todo.run` itself is the no-op-
-    /// while-already-running guard) -- no live refresh in v1 (§1.1's
-    /// scope cut), so this is the only trigger for a fresh scan.
+    /// §2.2) -- since `docs/features/tui-tool-window-docking.md` (T33),
+    /// ensures/shows the left dock's Todos tab instead of opening a
+    /// full-screen popup; see `show_left_dock_tab`. Still always re-scans
+    /// when this action is what makes the tab newly visible (`todo.run`
+    /// itself is the no-op-while-already-running guard) -- no live refresh
+    /// in v1 (§1.1's scope cut) -- but merely `Tab`-cycling back to an
+    /// already-visible Todos tab does not (`docs/features/
+    /// tui-tool-window-docking.md` §3's "switching away and back never
+    /// restarts... that work").
     fn toggle_todo_panel(&mut self) {
-        let opening = self.todo_panel.is_none();
         self.close_all_overlays();
-        if opening {
-            self.todo_panel = Some(TodoPanelState::default());
+        if self.show_left_dock_tab(LeftDockTab::Todos) {
             self.todo.run(self.tree.clone());
         }
     }
 
+    /// Handles every key while `LeftDockTab::Todos` is the left dock's
+    /// active tab and it has focus (`handle_left_dock_key`'s delegation).
     fn handle_todo_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
-        let Some(state) = self.todo_panel.as_mut() else {
-            return LoopSignal::Continue;
-        };
         match key.code {
-            KeyCode::Esc => self.todo_panel = None,
             KeyCode::Up => {
-                if state.selected > 0 {
-                    state.selected -= 1;
+                if let Some(dock) = self.left_dock.as_mut() {
+                    if dock.todos_selected > 0 {
+                        dock.todos_selected -= 1;
+                    }
                 }
             }
             KeyCode::Down => {
@@ -2464,9 +2682,10 @@ impl App {
                     .as_ref()
                     .map(|r| r.matches.len())
                     .unwrap_or(0);
-                let state = self.todo_panel.as_mut().unwrap();
-                if state.selected + 1 < len {
-                    state.selected += 1;
+                if let Some(dock) = self.left_dock.as_mut() {
+                    if dock.todos_selected + 1 < len {
+                        dock.todos_selected += 1;
+                    }
                 }
             }
             KeyCode::Enter => self.confirm_todo_jump(),
@@ -2478,21 +2697,23 @@ impl App {
     /// Reuses `open_search_result` verbatim -- a `TodoMatch`'s `inner:
     /// SearchMatch` carries the same `path`/`byte_offset` shape Find in
     /// Path's own jump already consumes (`docs/features/tui-todo-panel.md`
-    /// §2.2). No-op if nothing is selected.
+    /// §2.2). No-op if nothing is selected. Unlike the old full-screen
+    /// popup, jumping no longer closes the dock -- the editor and the left
+    /// dock are simultaneously visible now, so there is nothing left to
+    /// dismiss (`docs/features/tui-tool-window-docking.md` §3).
     fn confirm_todo_jump(&mut self) {
-        let Some(state) = self.todo_panel.as_ref() else {
+        let Some(selected) = self.left_dock.as_ref().map(|d| d.todos_selected) else {
             return;
         };
         let Some(results) = &self.todo.results else {
             return;
         };
-        let Some(m) = results.matches.get(state.selected) else {
+        let Some(m) = results.matches.get(selected) else {
             return;
         };
         let path = m.inner.path.clone();
         let byte_offset = m.inner.byte_offset;
         self.open_search_result(path, byte_offset);
-        self.todo_panel = None;
     }
 
     fn lsp_query_target(&self) -> Option<(PathBuf, Position)> {
@@ -2903,31 +3124,29 @@ impl App {
     }
 
     /// `ToggleDockerPanel` command (palette-only, no default binding --
-    /// see `commands.rs`): opens/closes the Docker Panel overlay
-    /// (`docs/features/tui-docker-and-kubernetes.md` §2.4). Opening starts
-    /// a fresh `DockerPanel::default()` and immediately kicks off
-    /// `refresh()` so the list is already loading by the time the panel
-    /// renders, rather than empty-until-the-user-presses-refresh.
+    /// see `commands.rs`) -- since `docs/features/
+    /// tui-tool-window-docking.md` (T33), ensures/shows the bottom dock's
+    /// Docker tab instead of opening a full-screen popup; `self.docker` is
+    /// now always alive (`docs/features/tui-docker-and-kubernetes.md`
+    /// §2.4's original panel-owns-its-own-lifecycle scope cut is
+    /// superseded by that doc's §2.1). Still kicks off `refresh()` exactly
+    /// when this action is what makes the tab newly visible, so the list is
+    /// already loading by the time it first renders -- merely `Tab`-
+    /// cycling back to an already-visible Docker tab does not (`docs/
+    /// features/tui-tool-window-docking.md` §3).
     fn toggle_docker_panel(&mut self) {
-        let opening = self.docker_panel.is_none();
         self.close_all_overlays();
-        if opening {
-            let mut panel = DockerPanel::default();
-            panel.refresh();
-            self.docker_panel = Some(panel);
+        if self.show_bottom_dock_tab(BottomDockTab::Docker) {
+            self.docker.refresh();
         }
     }
 
     /// `ToggleK8sPanel` command (palette-only, no default binding -- see
-    /// `commands.rs`): same immediate-refresh-on-open convention as
-    /// `toggle_docker_panel`.
+    /// `commands.rs`): same convention as `toggle_docker_panel`.
     fn toggle_k8s_panel(&mut self) {
-        let opening = self.k8s_panel.is_none();
         self.close_all_overlays();
-        if opening {
-            let mut panel = K8sPanel::default();
-            panel.refresh();
-            self.k8s_panel = Some(panel);
+        if self.show_bottom_dock_tab(BottomDockTab::Kubernetes) {
+            self.k8s.refresh();
         }
     }
 
@@ -3618,15 +3837,20 @@ impl App {
         }
     }
 
-    /// Handles every key while `docker_panel.is_some()` (`docs/features/
-    /// tui-docker-and-kubernetes.md` §3.3). The yes/no confirm popup
-    /// intercepts first -- nothing below it runs while a lifecycle action
-    /// is pending confirmation, same interception-order reasoning as
-    /// `handle_git_panel_key`'s conflict-resolution check.
+    /// Handles every key while `BottomDockTab::Docker` is the bottom
+    /// dock's active tab and it has focus (`handle_bottom_dock_key`'s
+    /// delegation) -- `docs/features/tui-docker-and-kubernetes.md` §3.3.
+    /// The yes/no confirm popup intercepts first -- nothing below it runs
+    /// while a lifecycle action is pending confirmation, same
+    /// interception-order reasoning as `handle_git_panel_key`'s conflict-
+    /// resolution check. `[`/`]` (not `Tab`/`BackTab`, claimed by
+    /// `handle_bottom_dock_key` itself for cycling *dock* tabs) switch this
+    /// panel's own Containers/Images sub-view -- a panel-internal
+    /// micro-shortcut, not a global keymap binding, same category as this
+    /// function's own lifecycle-mnemonic letters below (`docs/features/
+    /// tui-tool-window-docking.md` §2.4, T33).
     fn handle_docker_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
-        let Some(panel) = self.docker_panel.as_mut() else {
-            return LoopSignal::Continue;
-        };
+        let panel = &mut self.docker;
 
         if panel.confirm.is_some() {
             match key.code {
@@ -3643,12 +3867,12 @@ impl App {
         };
 
         match key.code {
-            KeyCode::Esc => self.docker_panel = None,
             // Does not auto-refresh -- §1's scope cut names exactly two
             // refresh triggers (panel open, an explicit `r`) to bound
-            // `docker` invocation frequency; a tab switch isn't a third
-            // one, so an unseen tab shows stale/empty data until `r`.
-            KeyCode::Tab => {
+            // `docker` invocation frequency; a sub-view switch isn't a
+            // third one, so an unseen sub-view shows stale/empty data
+            // until `r`.
+            KeyCode::Char('[') | KeyCode::Char(']') => {
                 panel.tab = match panel.tab {
                     DockerTab::Containers => DockerTab::Images,
                     DockerTab::Images => DockerTab::Containers,
@@ -3698,17 +3922,20 @@ impl App {
         LoopSignal::Continue
     }
 
-    /// Handles every key while `k8s_panel.is_some()` (`docs/features/
-    /// tui-docker-and-kubernetes.md` §3.4/§3.5). Checked in strict
-    /// priority order -- the typed-name confirm, then the scale-replica-
-    /// count prompt, then the context/namespace picker, then ordinary
-    /// list navigation -- since only one of these is ever active at a
-    /// time (§3.4's own state-machine description), the same reasoning
+    /// Handles every key while `BottomDockTab::Kubernetes` is the bottom
+    /// dock's active tab and it has focus -- `docs/features/
+    /// tui-docker-and-kubernetes.md` §3.4/§3.5. Checked in strict priority
+    /// order -- the typed-name confirm, then the scale-replica-count
+    /// prompt, then the context/namespace picker, then ordinary list
+    /// navigation -- since only one of these is ever active at a time
+    /// (§3.4's own state-machine description), the same reasoning
     /// `handle_git_panel_key`'s conflict-interception ordering documents.
+    /// `[`/`]` (not `Tab`/`BackTab`, claimed by `handle_bottom_dock_key`
+    /// itself) switch this panel's own Pods/Deployments/Services sub-view,
+    /// same reasoning `handle_docker_panel_key` documents (`docs/features/
+    /// tui-tool-window-docking.md` §2.4, T33).
     fn handle_k8s_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
-        let Some(panel) = self.k8s_panel.as_mut() else {
-            return LoopSignal::Continue;
-        };
+        let panel = &mut self.k8s;
 
         if panel.confirm.is_some() {
             match key.code {
@@ -3779,10 +4006,19 @@ impl App {
         };
 
         match key.code {
-            KeyCode::Esc => self.k8s_panel = None,
-            // Same reasoning as `handle_docker_panel_key`'s `Tab` arm --
-            // no auto-refresh, only `r` (or panel open) fetches.
-            KeyCode::Tab => {
+            // Same reasoning as `handle_docker_panel_key`'s `[`/`]` arm --
+            // no auto-refresh, only `r` (or panel open) fetches. Unlike
+            // Docker's two-tab set (where either direction is the same
+            // move), K8s has three tabs, so `[`/`]` go opposite ways.
+            KeyCode::Char('[') => {
+                panel.tab = match panel.tab {
+                    K8sTab::Pods => K8sTab::Services,
+                    K8sTab::Deployments => K8sTab::Pods,
+                    K8sTab::Services => K8sTab::Deployments,
+                };
+                panel.selected = 0;
+            }
+            KeyCode::Char(']') => {
                 panel.tab = match panel.tab {
                     K8sTab::Pods => K8sTab::Deployments,
                     K8sTab::Deployments => K8sTab::Services,
@@ -4335,12 +4571,6 @@ impl App {
         if self.notifications_open {
             return self.handle_notifications_key(key);
         }
-        if self.problems.is_some() {
-            return self.handle_problems_key(key);
-        }
-        if self.cargo_panel_open {
-            return self.handle_cargo_panel_key(key);
-        }
         if self.hover_open {
             return self.handle_hover_key(key);
         }
@@ -4359,9 +4589,6 @@ impl App {
         if self.bookmarks_popup.is_some() {
             return self.handle_bookmarks_popup_key(key);
         }
-        if self.todo_panel.is_some() {
-            return self.handle_todo_panel_key(key);
-        }
         if self.code_actions.is_some() {
             return self.handle_code_actions_key(key);
         }
@@ -4379,12 +4606,6 @@ impl App {
         }
         if self.git_panel.is_some() {
             return self.handle_git_panel_key(key);
-        }
-        if self.docker_panel.is_some() {
-            return self.handle_docker_panel_key(key);
-        }
-        if self.k8s_panel.is_some() {
-            return self.handle_k8s_panel_key(key);
         }
         if self.keymap_popup.is_some() {
             return self.handle_keymap_popup_key(key);
@@ -4407,12 +4628,33 @@ impl App {
         if self.debug_panel_open {
             return self.handle_debug_panel_key(key);
         }
+        // Docker's/K8s's own confirm popups (plus K8s's scale-input prompt
+        // and context/namespace picker) are true nested modals *within* a
+        // non-modal dock tab -- unlike the tab itself, they must still
+        // fully intercept keys before the global keymap below, the same as
+        // every other modal above, or a plain `Esc` never reaches them at
+        // all (it's already bound to `CollapseSelections`, see
+        // `commands.rs`) and can never cancel one (`docs/features/
+        // tui-tool-window-docking.md` §2.4, T33 -- a gap the doc's own
+        // review round missed since it only worked through the ordering
+        // for the *tab-level* keys, not each tab's own nested sub-modals).
+        if self.docker_panel_open() && self.docker.confirm.is_some() {
+            return self.handle_docker_panel_key(key);
+        }
+        if self.k8s_panel_open()
+            && (self.k8s.confirm.is_some()
+                || self.k8s.scale_input.is_some()
+                || self.k8s.picker.is_some())
+        {
+            return self.handle_k8s_panel_key(key);
+        }
         if let Some(action) = self.keymap.action_for(key.modifiers, key.code) {
             return self.run_action(action);
         }
         match self.focus {
-            Focus::Tree => self.handle_tree_key(key),
+            Focus::LeftDock => self.handle_left_dock_key(key),
             Focus::Editor => self.handle_editor_key(key),
+            Focus::BottomDock => self.handle_bottom_dock_key(key),
         }
         LoopSignal::Continue
     }
@@ -4427,23 +4669,18 @@ impl App {
             || self.find.is_some()
             || self.goto.is_some()
             || self.notifications_open
-            || self.problems.is_some()
-            || self.cargo_panel_open
             || self.hover_open
             || self.search_open
             || self.go_to_file.is_some()
             || self.go_to_symbol.is_some()
             || self.recent_files.is_some()
             || self.bookmarks_popup.is_some()
-            || self.todo_panel.is_some()
             || self.code_actions.is_some()
             || self.rename_popup.is_some()
             || self.pending_rename_preview.is_some()
             || self.blame_popup.is_some()
             || self.git_gutter_popup_line.is_some()
             || self.git_panel.is_some()
-            || self.docker_panel.is_some()
-            || self.k8s_panel.is_some()
             || self.keymap_popup.is_some()
             || self.new_scratch_file.is_some()
             || self.scratch_files.is_some()
@@ -4451,6 +4688,11 @@ impl App {
             || self.debug.show_launch_popup
             || self.debug_adapter_config_popup.is_some()
             || self.debug_panel_open
+            || (self.docker_panel_open() && self.docker.confirm.is_some())
+            || (self.k8s_panel_open()
+                && (self.k8s.confirm.is_some()
+                    || self.k8s.scale_input.is_some()
+                    || self.k8s.picker.is_some()))
     }
 
     /// Entry point for every `Event::Mouse` (`docs/features/
@@ -4487,7 +4729,7 @@ impl App {
                 let row = (event.row - area.y) as usize;
                 self.tree_state.select(&self.tree, row);
                 self.handle_tree_enter();
-                self.focus = Focus::Tree;
+                self.focus = Focus::LeftDock;
                 return;
             }
         }
@@ -4651,12 +4893,43 @@ impl App {
                 }
                 self.sync_lsp_did_change();
             }
-            Action::ToggleTreeFocus => {
+            Action::ToggleLeftDockFocus => {
+                // Always targets `LeftDock` specifically, matching its
+                // literal "Project" command title -- never a cyclic "next
+                // focus" (`docs/features/tui-tool-window-docking.md` §2.1).
                 self.focus = match self.focus {
-                    Focus::Tree => Focus::Editor,
-                    Focus::Editor => Focus::Tree,
+                    Focus::LeftDock => Focus::Editor,
+                    Focus::Editor | Focus::BottomDock => Focus::LeftDock,
                 };
             }
+            Action::ToggleBottomDockFocus => {
+                self.focus = match self.focus {
+                    Focus::BottomDock => Focus::Editor,
+                    Focus::Editor | Focus::LeftDock => Focus::BottomDock,
+                };
+            }
+            Action::ToggleLeftDock => {
+                if self.left_dock.is_some() {
+                    self.left_dock = None;
+                    if self.focus == Focus::LeftDock {
+                        self.focus = Focus::Editor;
+                    }
+                } else {
+                    self.left_dock = Some(LeftDockState::default());
+                }
+            }
+            Action::ToggleBottomDock => {
+                if self.bottom_dock.is_some() {
+                    self.bottom_dock = None;
+                    if self.focus == Focus::BottomDock {
+                        self.focus = Focus::Editor;
+                    }
+                } else {
+                    self.bottom_dock = Some(BottomDockState::default());
+                }
+            }
+            Action::GrowFocusedDock => self.resize_focused_dock(DOCK_RESIZE_STEP_PCT as i16),
+            Action::ShrinkFocusedDock => self.resize_focused_dock(-(DOCK_RESIZE_STEP_PCT as i16)),
             Action::NextTab => self.cycle_tab(1),
             Action::PreviousTab => self.cycle_tab(-1),
             Action::CloseTab => self.close_active_tab(),
@@ -4759,6 +5032,116 @@ impl App {
             Action::Exit => return LoopSignal::Exit,
         }
         LoopSignal::Continue
+    }
+
+    /// `Focus::LeftDock`'s dispatch (`docs/features/
+    /// tui-tool-window-docking.md` §2.4, T33) -- `Tab`/`BackTab` cycle the
+    /// dock's own tab set first, same convention `handle_debug_panel_key`
+    /// already uses for its own sections; everything else delegates to
+    /// whichever existing per-tab key handler matches `left_dock.tab`.
+    fn handle_left_dock_key(&mut self, key: KeyEvent) {
+        let Some(dock) = self.left_dock.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Tab => dock.tab = dock.tab.next(),
+            KeyCode::BackTab => dock.tab = dock.tab.previous(),
+            _ => {
+                let tab = dock.tab;
+                match tab {
+                    LeftDockTab::Files => self.handle_tree_key(key),
+                    LeftDockTab::Todos => {
+                        self.handle_todo_panel_key(key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mirrors `handle_left_dock_key` for `Focus::BottomDock` (`docs/
+    /// features/tui-tool-window-docking.md` §2.4, T33).
+    fn handle_bottom_dock_key(&mut self, key: KeyEvent) {
+        let Some(dock) = self.bottom_dock.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Tab => dock.tab = dock.tab.next(),
+            KeyCode::BackTab => dock.tab = dock.tab.previous(),
+            _ => {
+                let tab = dock.tab;
+                match tab {
+                    BottomDockTab::Docker => {
+                        self.handle_docker_panel_key(key);
+                    }
+                    BottomDockTab::Kubernetes => {
+                        self.handle_k8s_panel_key(key);
+                    }
+                    BottomDockTab::Cargo => {
+                        self.handle_cargo_panel_key(key);
+                    }
+                    BottomDockTab::Problems => {
+                        self.handle_problems_key(key);
+                    }
+                    BottomDockTab::GitLog => {
+                        self.handle_git_log_dock_key(key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `BottomDockTab::GitLog`'s own key handler (`docs/features/
+    /// tui-tool-window-docking.md` §2.1/§2.4, T33) -- browse-only: select a
+    /// commit (`Graph` focus), view its diff (`Diff` focus), scroll.
+    /// Deliberately not a delegation to `handle_git_panel_key`: that
+    /// function's precedence chain assumes `git_panel.is_some()` and
+    /// reaches branches/worktrees/staging/conflicts/`Filter`, none of which
+    /// this dock tab exposes (`GitLogDockState`'s own doc comment).
+    ///
+    /// Graph/Diff focus toggles on `[`/`]`, not `Tab`/`BackTab` -- unlike
+    /// the full modal Git Panel, `handle_bottom_dock_key` already consumes
+    /// plain `Tab`/`BackTab` to cycle *dock* tabs before ever delegating
+    /// here, so binding this toggle to the same keys would make it
+    /// permanently unreachable. Same fix, same reasoning as Docker's/K8s's
+    /// own internal sub-view switch (`handle_docker_panel_key`/
+    /// `handle_k8s_panel_key`'s `[`/`]` arms).
+    fn handle_git_log_dock_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('[') | KeyCode::Char(']') => {
+                self.git_log_dock.focus = match self.git_log_dock.focus {
+                    GitPanelFocus::Diff => GitPanelFocus::Graph,
+                    _ => GitPanelFocus::Diff,
+                };
+            }
+            KeyCode::Up => match self.git_log_dock.focus {
+                GitPanelFocus::Diff => {
+                    self.git_log_dock.diff_scroll = self.git_log_dock.diff_scroll.saturating_sub(1);
+                }
+                _ => {
+                    self.git_log_dock.graph_selected =
+                        self.git_log_dock.graph_selected.saturating_sub(1);
+                }
+            },
+            KeyCode::Down => match self.git_log_dock.focus {
+                GitPanelFocus::Diff => {
+                    self.git_log_dock.diff_scroll = self.git_log_dock.diff_scroll.saturating_add(1);
+                }
+                _ => {
+                    if self.git_log_dock.graph_selected + 1 < self.git.graph.len() {
+                        self.git_log_dock.graph_selected += 1;
+                    }
+                }
+            },
+            KeyCode::Enter if self.git_log_dock.focus != GitPanelFocus::Diff => {
+                if let Some(commit) = self.git.graph.get(self.git_log_dock.graph_selected) {
+                    let id = commit.id.clone();
+                    self.git.select_commit(&id);
+                    self.git_log_dock.diff_scroll = 0;
+                    self.git_log_dock.focus = GitPanelFocus::Diff;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) {
@@ -6572,7 +6955,7 @@ mod tests {
     fn new_opens_the_project_and_scans_the_tree() {
         let dir = sample_project();
         let app = App::new(dir.path().to_path_buf()).unwrap();
-        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(app.focus, Focus::LeftDock);
         assert!(app.tabs.is_empty());
         assert!(app.active_tab.is_none());
         assert_eq!(
@@ -7196,11 +7579,11 @@ mod tests {
     fn ctrl_t_toggles_focus_between_tree_and_editor() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(app.focus, Focus::LeftDock);
         app.handle_key(ctrl('t'));
         assert_eq!(app.focus, Focus::Editor);
         app.handle_key(ctrl('t'));
-        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(app.focus, Focus::LeftDock);
     }
 
     #[test]
@@ -7290,7 +7673,7 @@ mod tests {
     #[test]
     fn ctrl_f_opens_find_with_an_empty_query_and_focuses_the_editor() {
         let (_dir, mut app) = app_with_find_fixture();
-        app.focus = Focus::Tree;
+        app.focus = Focus::LeftDock;
         app.handle_key(ctrl('f'));
         assert!(app.find.is_some());
         assert_eq!(app.find.as_ref().unwrap().query(), "");
@@ -8397,13 +8780,13 @@ mod tests {
     fn run_action_toggle_problems_opens_and_closes_the_panel() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        assert!(app.problems.is_none());
+        assert!(!app.problems_open());
 
         app.run_action(Action::ToggleProblems);
-        assert!(app.problems.is_some());
+        assert!(app.problems_open());
 
         app.run_action(Action::ToggleProblems);
-        assert!(app.problems.is_none());
+        assert!(!app.problems_open());
     }
 
     #[test]
@@ -8413,7 +8796,7 @@ mod tests {
 
         app.handle_key(ctrl('p'));
 
-        assert!(app.problems.is_some());
+        assert!(app.problems_open());
     }
 
     #[test]
@@ -8432,18 +8815,22 @@ mod tests {
 
         assert!(app.goto.is_none());
         assert!(!app.notifications_open);
-        assert!(app.problems.is_some());
+        assert!(app.problems_open());
     }
 
     #[test]
-    fn handle_problems_key_esc_closes_the_panel() {
+    fn handle_problems_key_esc_does_not_close_the_panel() {
+        // Since `docs/features/tui-tool-window-docking.md` (T33), dock
+        // tabs aren't exclusive modals -- the only way to close one is
+        // the same toggle command that opened it (`show_bottom_dock_tab`'s
+        // "press it again" exception). `Esc` is not wired to any of them.
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.problems = Some(ProblemsState { selected: 0 });
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
 
         app.handle_key(plain_key(KeyCode::Esc));
 
-        assert!(app.problems.is_none());
+        assert!(app.problems_open());
     }
 
     #[test]
@@ -8454,21 +8841,21 @@ mod tests {
         app.lsp
             .diagnostics
             .insert(a, vec![diagnostic(0, "first"), diagnostic(1, "second")]);
-        app.problems = Some(ProblemsState { selected: 0 });
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
 
         app.handle_key(plain_key(KeyCode::Up));
         assert_eq!(
-            app.problems.as_ref().unwrap().selected,
+            app.bottom_dock.as_ref().unwrap().problems_selected,
             0,
             "must clamp at 0"
         );
 
         app.handle_key(plain_key(KeyCode::Down));
-        assert_eq!(app.problems.as_ref().unwrap().selected, 1);
+        assert_eq!(app.bottom_dock.as_ref().unwrap().problems_selected, 1);
 
         app.handle_key(plain_key(KeyCode::Down));
         assert_eq!(
-            app.problems.as_ref().unwrap().selected,
+            app.bottom_dock.as_ref().unwrap().problems_selected,
             1,
             "must clamp at the last row"
         );
@@ -8482,11 +8869,11 @@ mod tests {
         app.lsp
             .diagnostics
             .insert(a.clone(), vec![diagnostic(1, "world is wrong")]);
-        app.problems = Some(ProblemsState { selected: 0 });
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
 
         app.handle_key(plain_key(KeyCode::Enter));
 
-        assert!(app.problems.is_none());
+        assert!(app.problems_open(), "the dock tab itself stays open");
         assert_eq!(app.active_buffer().unwrap().path, a);
         let offset = app
             .active_buffer()
@@ -8503,11 +8890,11 @@ mod tests {
     fn while_problems_are_open_other_keys_are_swallowed_not_forwarded() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.problems = Some(ProblemsState { selected: 0 });
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
 
         app.handle_key(plain_key(KeyCode::Char('x')));
 
-        assert!(app.problems.is_some());
+        assert!(app.problems_open());
         assert!(app.tabs.is_empty());
     }
 
@@ -8515,17 +8902,22 @@ mod tests {
     fn run_action_toggle_cargo_panel_opens_and_closes_the_panel() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        assert!(!app.cargo_panel_open);
+        assert!(!app.cargo_panel_open());
 
         app.run_action(Action::ToggleCargoPanel);
-        assert!(app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
 
         app.run_action(Action::ToggleCargoPanel);
-        assert!(!app.cargo_panel_open);
+        assert!(!app.cargo_panel_open());
     }
 
     #[test]
-    fn opening_cargo_panel_closes_goto_notifications_and_problems() {
+    fn opening_cargo_panel_closes_goto_notifications_and_switches_off_problems() {
+        // Goto/notifications are true modals, closed via
+        // `close_all_overlays`. Problems isn't closed the same way anymore
+        // -- it's switched away from because Cargo and Problems share the
+        // same bottom-dock slot (`docs/features/
+        // tui-tool-window-docking.md` §2.1, T33).
         let dir = sample_project();
         let a = dir.path().canonicalize().unwrap().join("a.txt");
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
@@ -8535,37 +8927,35 @@ mod tests {
             selected: 0,
         });
         app.notifications_open = true;
-        app.problems = Some(ProblemsState { selected: 0 });
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
 
         app.run_action(Action::ToggleCargoPanel);
 
         assert!(app.goto.is_none());
         assert!(!app.notifications_open);
-        assert!(app.problems.is_none());
-        assert!(app.cargo_panel_open);
+        assert!(!app.problems_open());
+        assert!(app.cargo_panel_open());
     }
 
     #[test]
-    fn opening_problems_closes_an_open_cargo_panel() {
-        // The reverse direction of the mutual-exclusion rule: every
-        // overlay's `open` path routes through `close_all_overlays`, so
-        // this must hold symmetrically, not just from the Cargo panel's
-        // own toggle.
+    fn opening_problems_switches_the_bottom_dock_off_an_open_cargo_panel() {
+        // The reverse direction: both tabs share the bottom dock's single
+        // slot, so showing one always switches away from the other.
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
 
         app.run_action(Action::ToggleProblems);
 
-        assert!(!app.cargo_panel_open);
-        assert!(app.problems.is_some());
+        assert!(!app.cargo_panel_open());
+        assert!(app.problems_open());
     }
 
     #[test]
-    fn handle_cargo_panel_key_esc_closes_the_panel_without_stopping_a_running_command() {
+    fn handle_cargo_panel_key_esc_does_not_close_the_panel_or_stop_a_running_command() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
         // Set directly rather than via a real `run` call -- this test is
         // only about `Esc` leaving `self.cargo` alone, not about spawning
         // a real subprocess.
@@ -8573,7 +8963,7 @@ mod tests {
 
         app.handle_key(plain_key(KeyCode::Esc));
 
-        assert!(!app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
         assert_eq!(app.cargo.running, Some(CargoCommand::Test));
     }
 
@@ -8590,7 +8980,7 @@ mod tests {
         for (letter, expected) in cases {
             let dir = sample_project();
             let mut app = App::new(dir.path().to_path_buf()).unwrap();
-            app.cargo_panel_open = true;
+            app.show_bottom_dock_tab(BottomDockTab::Cargo);
 
             app.handle_key(plain_key(KeyCode::Char(letter)));
 
@@ -8603,33 +8993,38 @@ mod tests {
     }
 
     #[test]
-    fn while_cargo_panel_is_open_ctrl_w_does_not_close_the_active_tab() {
-        // Same invariant `tui-find.md`/`tui-problems.md` already prove for
-        // their own overlays: an overlay-local key set fully intercepts
-        // input, so a global binding like `Ctrl+W` (`CloseTab`) never
-        // reaches `run_action` while the Cargo panel is open.
+    fn ctrl_w_still_closes_the_active_tab_while_the_cargo_panel_has_focus() {
+        // Unlike the true modals above (find/goto/notifications/...),
+        // dock tabs don't intercept every key -- keymap-bound global
+        // actions like `Ctrl+W` (`CloseTab`) still reach `run_action`
+        // before dock-focus routing ever sees them, exactly the way they
+        // already did for plain `Tree`/`Editor` focus (`docs/features/
+        // tui-tool-window-docking.md` §2.4, T33).
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.handle_key(plain_key(KeyCode::Down)); // a.txt
         app.handle_key(plain_key(KeyCode::Enter));
         assert_eq!(app.tabs.len(), 1);
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
 
         app.handle_key(ctrl('w'));
 
-        assert!(app.cargo_panel_open);
-        assert_eq!(app.tabs.len(), 1);
+        assert!(
+            app.cargo_panel_open(),
+            "closing an editor tab doesn't touch the dock"
+        );
+        assert_eq!(app.tabs.len(), 0);
     }
 
     #[test]
     fn while_cargo_panel_is_open_other_keys_are_swallowed_not_forwarded() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
 
         app.handle_key(plain_key(KeyCode::Char('x')));
 
-        assert!(app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
         assert!(app.tabs.is_empty());
     }
 
@@ -8696,7 +9091,12 @@ mod tests {
     }
 
     #[test]
-    fn opening_hover_closes_goto_notifications_problems_and_cargo_panel() {
+    fn opening_hover_closes_goto_and_notifications_but_leaves_dock_tabs_open() {
+        // `close_all_overlays` (routed through by `QuickDocumentation`)
+        // still closes true modals like goto/notifications, but no longer
+        // touches `left_dock`/`bottom_dock` -- dock tabs coexist with a
+        // modal popup instead of being force-closed by it (`docs/features/
+        // tui-tool-window-docking.md` §2.4, T33).
         let dir = sample_project();
         let a = dir.path().canonicalize().unwrap().join("a.txt");
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
@@ -8706,15 +9106,14 @@ mod tests {
             selected: 0,
         });
         app.notifications_open = true;
-        app.problems = Some(ProblemsState { selected: 0 });
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
 
         app.run_action(Action::QuickDocumentation);
 
         assert!(app.goto.is_none());
         assert!(!app.notifications_open);
-        assert!(app.problems.is_none());
-        assert!(!app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
         assert!(app.hover_open);
     }
 
@@ -8730,7 +9129,7 @@ mod tests {
         app.run_action(Action::ToggleCargoPanel);
 
         assert!(!app.hover_open);
-        assert!(app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
     }
 
     #[test]
@@ -8929,7 +9328,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_search_closes_goto_notifications_problems_cargo_and_hover() {
+    fn opening_search_closes_goto_notifications_and_hover_but_leaves_dock_tabs_open() {
         let dir = sample_project();
         let a = dir.path().canonicalize().unwrap().join("a.txt");
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
@@ -8939,16 +9338,15 @@ mod tests {
             selected: 0,
         });
         app.notifications_open = true;
-        app.problems = Some(ProblemsState { selected: 0 });
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
         app.hover_open = true;
 
         app.run_action(Action::FindInPath);
 
         assert!(app.goto.is_none());
         assert!(!app.notifications_open);
-        assert!(app.problems.is_none());
-        assert!(!app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
         assert!(!app.hover_open);
         assert!(app.search_open);
     }
@@ -8962,7 +9360,7 @@ mod tests {
         app.run_action(Action::ToggleCargoPanel);
 
         assert!(!app.search_open);
-        assert!(app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
     }
 
     #[test]
@@ -9319,7 +9717,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_code_actions_closes_goto_notifications_problems_cargo_hover_and_search() {
+    fn opening_code_actions_closes_goto_notifications_hover_and_search_but_leaves_dock_tabs_open() {
         let dir = sample_project();
         let a = dir.path().canonicalize().unwrap().join("a.txt");
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
@@ -9329,8 +9727,8 @@ mod tests {
             selected: 0,
         });
         app.notifications_open = true;
-        app.problems = Some(ProblemsState { selected: 0 });
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
         app.hover_open = true;
         app.search_open = true;
 
@@ -9338,8 +9736,7 @@ mod tests {
 
         assert!(app.goto.is_none());
         assert!(!app.notifications_open);
-        assert!(app.problems.is_none());
-        assert!(!app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
         assert!(!app.hover_open);
         assert!(!app.search_open);
         assert!(app.code_actions.is_some());
@@ -9354,7 +9751,7 @@ mod tests {
         app.run_action(Action::ToggleCargoPanel);
 
         assert!(app.code_actions.is_none());
-        assert!(app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
     }
 
     #[test]
@@ -9858,12 +10255,15 @@ mod tests {
     }
 
     #[test]
-    fn rename_ready_escalating_to_preview_closes_overlays_opened_during_the_async_wait() {
+    fn rename_ready_escalating_to_preview_leaves_a_dock_tab_open_during_the_async_wait() {
+        // `close_all_overlays` no longer touches dock tabs (`docs/features/
+        // tui-tool-window-docking.md` §2.4, T33) -- only true modals opened
+        // during the async wait would be closed here now.
         let dir = sample_project();
         let a = dir.path().canonicalize().unwrap().join("a.txt");
         let b = dir.path().canonicalize().unwrap().join("b.txt");
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
         app.lsp.rename_ready = true;
         app.lsp.rename_new_name = Some("count".to_string());
         app.lsp.rename_edit = Some(workspace_edit(vec![
@@ -9879,7 +10279,7 @@ mod tests {
 
         app.handle_rename_ready();
 
-        assert!(!app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
         assert!(app.pending_rename_preview.is_some());
     }
 
@@ -10032,15 +10432,17 @@ mod tests {
     }
 
     #[test]
-    fn toggle_git_panel_closes_other_overlays() {
+    fn toggle_git_panel_leaves_a_dock_tab_open() {
+        // `close_all_overlays` no longer touches dock tabs (`docs/features/
+        // tui-tool-window-docking.md` §2.4, T33).
         let dir = sample_git_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.problems = Some(ProblemsState { selected: 0 });
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
 
         app.toggle_git_panel();
 
         assert!(app.git_panel.is_some());
-        assert!(app.problems.is_none());
+        assert!(app.problems_open());
     }
 
     #[test]
@@ -11727,7 +12129,7 @@ mod tests {
     fn esc_outside_editor_focus_is_a_noop() {
         let (_dir, mut app) = open_rust_tab("count + count");
         set_selections_multi(&mut app, &[0..5, 8..13], 1);
-        app.focus = Focus::Tree;
+        app.focus = Focus::LeftDock;
         app.handle_key(plain_key(KeyCode::Esc));
         assert_eq!(all_ranges(&app), vec![0..5, 8..13]);
     }
@@ -12458,14 +12860,14 @@ mod tests {
     fn toggle_todo_panel_opens_and_triggers_a_scan_then_closes() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        assert!(app.todo_panel.is_none());
+        assert!(!app.todo_panel_open());
 
         app.run_action(Action::ToggleTodoPanel);
-        assert!(app.todo_panel.is_some());
+        assert!(app.todo_panel_open());
         assert!(app.todo.searching);
 
         app.run_action(Action::ToggleTodoPanel);
-        assert!(app.todo_panel.is_none());
+        assert!(!app.todo_panel_open());
     }
 
     #[test]
@@ -12477,19 +12879,22 @@ mod tests {
         assert!(app.recent_files.is_some());
 
         app.run_action(Action::ToggleTodoPanel);
-        assert!(app.todo_panel.is_some());
+        assert!(app.todo_panel_open());
         assert!(app.recent_files.is_none());
     }
 
     #[test]
-    fn todo_panel_esc_closes_without_jumping() {
+    fn todo_panel_esc_does_not_close_the_panel() {
+        // Since `docs/features/tui-tool-window-docking.md` (T33), dock
+        // tabs only close via their own toggle command -- `Esc` isn't
+        // wired to any of them.
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleTodoPanel);
 
         app.handle_key(plain_key(KeyCode::Esc));
 
-        assert!(app.todo_panel.is_none());
+        assert!(app.todo_panel_open());
     }
 
     #[test]
@@ -12510,7 +12915,9 @@ mod tests {
 
         app.handle_key(plain_key(KeyCode::Enter));
 
-        assert!(app.todo_panel.is_none());
+        // Unlike the old full-screen popup, jumping no longer closes the
+        // dock -- editor and left dock are simultaneously visible now.
+        assert!(app.todo_panel_open());
         let buf = app.active_buffer().unwrap();
         assert_eq!(
             buf.path,
@@ -12535,16 +12942,16 @@ mod tests {
         assert_eq!(app.todo.results.as_ref().unwrap().matches.len(), 2);
 
         app.handle_key(plain_key(KeyCode::Down));
-        assert_eq!(app.todo_panel.as_ref().unwrap().selected, 1);
+        assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 1);
         // Already at the last row -- stays clamped.
         app.handle_key(plain_key(KeyCode::Down));
-        assert_eq!(app.todo_panel.as_ref().unwrap().selected, 1);
+        assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 1);
 
         app.handle_key(plain_key(KeyCode::Up));
-        assert_eq!(app.todo_panel.as_ref().unwrap().selected, 0);
+        assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 0);
         // Already at the first row -- stays clamped.
         app.handle_key(plain_key(KeyCode::Up));
-        assert_eq!(app.todo_panel.as_ref().unwrap().selected, 0);
+        assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 0);
     }
 
     #[test]
@@ -12555,7 +12962,7 @@ mod tests {
 
         app.handle_key(plain_key(KeyCode::Enter));
 
-        assert!(app.todo_panel.is_some());
+        assert!(app.todo_panel_open());
     }
 
     /// Real notify backends deliver events asynchronously; poll
@@ -13179,16 +13586,18 @@ mod tests {
     }
 
     #[test]
-    fn opening_claude_panel_closes_other_overlays() {
+    fn opening_claude_panel_leaves_a_dock_tab_open() {
+        // `close_all_overlays` no longer touches dock tabs (`docs/features/
+        // tui-tool-window-docking.md` §2.4, T33).
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleCargoPanel);
-        assert!(app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
 
         app.run_action(Action::ToggleClaudePanel);
 
         assert!(app.claude_panel_open);
-        assert!(!app.cargo_panel_open);
+        assert!(app.cargo_panel_open());
     }
 
     #[test]
@@ -13511,75 +13920,77 @@ mod tests {
     fn run_action_toggle_docker_panel_opens_and_closes_the_panel() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        assert!(app.docker_panel.is_none());
+        assert!(!app.docker_panel_open());
 
         app.run_action(Action::ToggleDockerPanel);
-        assert!(app.docker_panel.is_some());
+        assert!(app.docker_panel_open());
 
         app.run_action(Action::ToggleDockerPanel);
-        assert!(app.docker_panel.is_none());
+        assert!(!app.docker_panel_open());
     }
 
     #[test]
-    fn toggle_docker_panel_closes_other_overlays() {
+    fn toggle_docker_panel_switches_a_dock_tab_open_elsewhere() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.cargo_panel_open = true;
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
 
         app.run_action(Action::ToggleDockerPanel);
 
-        assert!(!app.cargo_panel_open);
-        assert!(app.docker_panel.is_some());
+        assert!(!app.cargo_panel_open());
+        assert!(app.docker_panel_open());
     }
 
     #[test]
-    fn close_all_overlays_closes_the_docker_and_k8s_panels() {
+    fn close_all_overlays_leaves_the_docker_and_k8s_dock_tabs_open() {
+        // `close_all_overlays` no longer touches dock tabs (`docs/features/
+        // tui-tool-window-docking.md` §2.4, T33); `self.docker`/`self.k8s`
+        // are always alive regardless either way.
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
-        assert!(app.docker_panel.is_some());
+        assert!(app.docker_panel_open());
 
         app.close_all_overlays();
 
-        assert!(app.docker_panel.is_none());
+        assert!(app.docker_panel_open());
 
         app.run_action(Action::ToggleK8sPanel);
-        assert!(app.k8s_panel.is_some());
+        assert!(app.k8s_panel_open());
 
         app.close_all_overlays();
 
-        assert!(app.k8s_panel.is_none());
+        assert!(app.k8s_panel_open());
     }
 
     #[test]
-    fn handle_docker_panel_key_esc_closes_the_panel() {
+    fn handle_docker_panel_key_esc_does_not_close_the_panel() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
 
         app.handle_key(plain_key(KeyCode::Esc));
 
-        assert!(app.docker_panel.is_none());
+        assert!(app.docker_panel_open());
     }
 
     #[test]
-    fn handle_docker_panel_key_tab_switches_between_containers_and_images() {
+    fn handle_docker_panel_key_brackets_switch_between_containers_and_images() {
+        // `Tab`/`BackTab` now cycle the bottom dock's own tabs
+        // (`handle_bottom_dock_key`), so Docker's internal Containers/
+        // Images sub-view switch was rebound to `[`/`]` (`docs/features/
+        // tui-tool-window-docking.md` §2.1, T33).
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
-        let panel = app.docker_panel.as_mut().unwrap();
-        panel.selected = 3;
+        app.docker.selected = 3;
 
-        app.handle_key(plain_key(KeyCode::Tab));
-        let panel = app.docker_panel.as_ref().unwrap();
-        assert_eq!(panel.tab, DockerTab::Images);
-        assert_eq!(panel.selected, 0);
+        app.handle_key(plain_key(KeyCode::Char(']')));
+        assert_eq!(app.docker.tab, DockerTab::Images);
+        assert_eq!(app.docker.selected, 0);
 
-        app.handle_key(plain_key(KeyCode::Tab));
-        assert_eq!(
-            app.docker_panel.as_ref().unwrap().tab,
-            DockerTab::Containers
-        );
+        app.handle_key(plain_key(KeyCode::Char('[')));
+        assert_eq!(app.docker.tab, DockerTab::Containers);
     }
 
     #[test]
@@ -13587,17 +13998,16 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
-        app.docker_panel.as_mut().unwrap().containers =
-            vec![sample_container("a", "web"), sample_container("b", "db")];
+        app.docker.containers = vec![sample_container("a", "web"), sample_container("b", "db")];
 
         app.handle_key(plain_key(KeyCode::Up)); // clamps at 0
-        assert_eq!(app.docker_panel.as_ref().unwrap().selected, 0);
+        assert_eq!(app.docker.selected, 0);
 
         app.handle_key(plain_key(KeyCode::Down));
-        assert_eq!(app.docker_panel.as_ref().unwrap().selected, 1);
+        assert_eq!(app.docker.selected, 1);
 
         app.handle_key(plain_key(KeyCode::Down)); // clamps at len - 1
-        assert_eq!(app.docker_panel.as_ref().unwrap().selected, 1);
+        assert_eq!(app.docker.selected, 1);
     }
 
     #[test]
@@ -13611,14 +14021,12 @@ mod tests {
         ] {
             let mut app = App::new(dir.path().to_path_buf()).unwrap();
             app.run_action(Action::ToggleDockerPanel);
-            app.docker_panel.as_mut().unwrap().containers = vec![sample_container("abc123", "web")];
+            app.docker.containers = vec![sample_container("abc123", "web")];
 
             app.handle_key(plain_key(KeyCode::Char(letter)));
 
             let confirm = app
-                .docker_panel
-                .as_ref()
-                .unwrap()
+                .docker
                 .confirm
                 .as_ref()
                 .unwrap_or_else(|| panic!("'{letter}' should open a confirm popup"));
@@ -13634,9 +14042,8 @@ mod tests {
         for cancel_key in [KeyCode::Char('n'), KeyCode::Esc] {
             let mut app = App::new(dir.path().to_path_buf()).unwrap();
             app.run_action(Action::ToggleDockerPanel);
-            let panel = app.docker_panel.as_mut().unwrap();
-            panel.containers = vec![sample_container("abc123", "web")];
-            panel.confirm = Some(crate::docker_panel::DockerConfirm {
+            app.docker.containers = vec![sample_container("abc123", "web")];
+            app.docker.confirm = Some(crate::docker_panel::DockerConfirm {
                 action: DockerLifecycleAction::Stop,
                 container_id: "abc123".to_string(),
                 container_name: "web".to_string(),
@@ -13648,8 +14055,8 @@ mod tests {
             // popup is dismissed, `Esc` here does not also close the panel
             // (confirm-mode interception, same as `handle_git_panel_key`'s
             // conflict-resolution `Esc`).
-            assert!(app.docker_panel.is_some());
-            assert!(app.docker_panel.as_ref().unwrap().confirm.is_none());
+            assert!(app.docker_panel_open());
+            assert!(app.docker.confirm.is_none());
         }
     }
 
@@ -13657,12 +14064,13 @@ mod tests {
     fn handle_docker_panel_key_confirm_y_clears_the_popup_and_starts_the_action() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        // Direct assignment, not `ToggleDockerPanel` -- opening via the
-        // toggle also kicks off its own `refresh()`, which would still be
-        // in flight here and make `confirm_yes` defer instead of running
-        // (`DockerPanel::confirm_yes`'s own in-flight guard).
-        app.docker_panel = Some(DockerPanel::default());
-        app.docker_panel.as_mut().unwrap().confirm = Some(crate::docker_panel::DockerConfirm {
+        // `show_bottom_dock_tab` directly, not `ToggleDockerPanel` --
+        // opening via the toggle also kicks off its own `refresh()`, which
+        // would still be in flight here and make `confirm_yes` defer
+        // instead of running (`DockerPanel::confirm_yes`'s own in-flight
+        // guard).
+        app.show_bottom_dock_tab(BottomDockTab::Docker);
+        app.docker.confirm = Some(crate::docker_panel::DockerConfirm {
             action: DockerLifecycleAction::Stop,
             container_id: "abc123".to_string(),
             container_name: "web".to_string(),
@@ -13670,7 +14078,7 @@ mod tests {
 
         app.handle_key(plain_key(KeyCode::Char('y')));
 
-        assert!(app.docker_panel.as_ref().unwrap().confirm.is_none());
+        assert!(app.docker.confirm.is_none());
     }
 
     fn sample_pod(name: &str) -> crate::k8s_panel::K8sPod {
@@ -13694,53 +14102,60 @@ mod tests {
     fn run_action_toggle_k8s_panel_opens_and_closes_the_panel() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        assert!(app.k8s_panel.is_none());
+        assert!(!app.k8s_panel_open());
 
         app.run_action(Action::ToggleK8sPanel);
-        assert!(app.k8s_panel.is_some());
+        assert!(app.k8s_panel_open());
 
         app.run_action(Action::ToggleK8sPanel);
-        assert!(app.k8s_panel.is_none());
+        assert!(!app.k8s_panel_open());
     }
 
     #[test]
-    fn toggle_k8s_panel_closes_other_overlays() {
+    fn toggle_k8s_panel_switches_a_dock_tab_open_elsewhere() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
-        assert!(app.docker_panel.is_some());
+        assert!(app.docker_panel_open());
 
         app.run_action(Action::ToggleK8sPanel);
 
-        assert!(app.docker_panel.is_none());
-        assert!(app.k8s_panel.is_some());
+        assert!(!app.docker_panel_open());
+        assert!(app.k8s_panel_open());
     }
 
     #[test]
-    fn handle_k8s_panel_key_esc_closes_the_panel() {
+    fn handle_k8s_panel_key_esc_does_not_close_the_panel() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
 
         app.handle_key(plain_key(KeyCode::Esc));
 
-        assert!(app.k8s_panel.is_none());
+        assert!(app.k8s_panel_open());
     }
 
     #[test]
-    fn handle_k8s_panel_key_tab_cycles_pods_deployments_services() {
+    fn handle_k8s_panel_key_brackets_cycle_pods_deployments_services() {
+        // `Tab`/`BackTab` now cycle the bottom dock's own tabs
+        // (`handle_bottom_dock_key`), so K8s's internal Pods/Deployments/
+        // Services sub-view switch was rebound to `[`/`]` (`docs/features/
+        // tui-tool-window-docking.md` §2.1, T33) -- `]` forward, `[` back.
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
 
-        app.handle_key(plain_key(KeyCode::Tab));
-        assert_eq!(app.k8s_panel.as_ref().unwrap().tab, K8sTab::Deployments);
+        app.handle_key(plain_key(KeyCode::Char(']')));
+        assert_eq!(app.k8s.tab, K8sTab::Deployments);
 
-        app.handle_key(plain_key(KeyCode::Tab));
-        assert_eq!(app.k8s_panel.as_ref().unwrap().tab, K8sTab::Services);
+        app.handle_key(plain_key(KeyCode::Char(']')));
+        assert_eq!(app.k8s.tab, K8sTab::Services);
 
-        app.handle_key(plain_key(KeyCode::Tab));
-        assert_eq!(app.k8s_panel.as_ref().unwrap().tab, K8sTab::Pods);
+        app.handle_key(plain_key(KeyCode::Char('[')));
+        assert_eq!(app.k8s.tab, K8sTab::Deployments);
+
+        app.handle_key(plain_key(KeyCode::Char('[')));
+        assert_eq!(app.k8s.tab, K8sTab::Pods);
     }
 
     #[test]
@@ -13748,16 +14163,16 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
-        app.k8s_panel.as_mut().unwrap().pods = vec![sample_pod("a"), sample_pod("b")];
+        app.k8s.pods = vec![sample_pod("a"), sample_pod("b")];
 
         app.handle_key(plain_key(KeyCode::Up)); // clamps at 0
-        assert_eq!(app.k8s_panel.as_ref().unwrap().selected, 0);
+        assert_eq!(app.k8s.selected, 0);
 
         app.handle_key(plain_key(KeyCode::Down));
-        assert_eq!(app.k8s_panel.as_ref().unwrap().selected, 1);
+        assert_eq!(app.k8s.selected, 1);
 
         app.handle_key(plain_key(KeyCode::Down)); // clamps at len - 1
-        assert_eq!(app.k8s_panel.as_ref().unwrap().selected, 1);
+        assert_eq!(app.k8s.selected, 1);
     }
 
     #[test]
@@ -13765,11 +14180,11 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
-        app.k8s_panel.as_mut().unwrap().pods = vec![sample_pod("worker-7f9c")];
+        app.k8s.pods = vec![sample_pod("worker-7f9c")];
 
         app.handle_key(plain_key(KeyCode::Char('d')));
 
-        let confirm = app.k8s_panel.as_ref().unwrap().confirm.as_ref().unwrap();
+        let confirm = app.k8s.confirm.as_ref().unwrap();
         assert_eq!(confirm.target_name, "worker-7f9c");
         assert_eq!(confirm.typed, "");
     }
@@ -13778,8 +14193,8 @@ mod tests {
     fn handle_k8s_panel_key_typed_confirm_requires_an_exact_match() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.k8s_panel = Some(K8sPanel::default());
-        app.k8s_panel.as_mut().unwrap().pods = vec![sample_pod("worker-7f9c")];
+        app.show_bottom_dock_tab(BottomDockTab::Kubernetes);
+        app.k8s.pods = vec![sample_pod("worker-7f9c")];
         app.handle_key(plain_key(KeyCode::Char('d')));
 
         for c in "worker".chars() {
@@ -13789,22 +14204,13 @@ mod tests {
         // Partial match: popup stays open, nothing ran, and the wrong
         // input the user typed so far is still visible (§3.4) rather than
         // silently cleared.
-        let confirm = app.k8s_panel.as_ref().unwrap().confirm.as_ref().unwrap();
+        let confirm = app.k8s.confirm.as_ref().unwrap();
         assert_eq!(confirm.typed, "worker");
 
         for c in "-7f9c".chars() {
             app.handle_key(plain_key(KeyCode::Char(c)));
         }
-        assert_eq!(
-            app.k8s_panel
-                .as_ref()
-                .unwrap()
-                .confirm
-                .as_ref()
-                .unwrap()
-                .typed,
-            "worker-7f9c"
-        );
+        assert_eq!(app.k8s.confirm.as_ref().unwrap().typed, "worker-7f9c");
     }
 
     #[test]
@@ -13812,13 +14218,13 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
-        app.k8s_panel.as_mut().unwrap().pods = vec![sample_pod("worker-7f9c")];
+        app.k8s.pods = vec![sample_pod("worker-7f9c")];
         app.handle_key(plain_key(KeyCode::Char('d')));
 
         app.handle_key(plain_key(KeyCode::Esc));
 
-        assert!(app.k8s_panel.is_some());
-        assert!(app.k8s_panel.as_ref().unwrap().confirm.is_none());
+        assert!(app.k8s_panel_open());
+        assert!(app.k8s.confirm.is_none());
     }
 
     #[test]
@@ -13826,18 +14232,15 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
-        app.handle_key(plain_key(KeyCode::Tab)); // Deployments
-        app.k8s_panel.as_mut().unwrap().deployments = vec![sample_deployment("api-server")];
+        app.handle_key(plain_key(KeyCode::Char(']'))); // Deployments
+        app.k8s.deployments = vec![sample_deployment("api-server")];
 
         app.handle_key(plain_key(KeyCode::Char('s')));
-        assert_eq!(
-            app.k8s_panel.as_ref().unwrap().scale_input.as_deref(),
-            Some("")
-        );
+        assert_eq!(app.k8s.scale_input.as_deref(), Some(""));
 
         // Non-numeric input is a no-op, per §3.4 -- the prompt stays open.
         app.handle_key(plain_key(KeyCode::Char('x')));
-        assert!(app.k8s_panel.as_ref().unwrap().scale_input.is_some());
+        assert!(app.k8s.scale_input.is_some());
     }
 
     #[test]
@@ -13845,15 +14248,15 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
-        app.handle_key(plain_key(KeyCode::Tab)); // Deployments
-        app.k8s_panel.as_mut().unwrap().deployments = vec![sample_deployment("api-server")];
+        app.handle_key(plain_key(KeyCode::Char(']'))); // Deployments
+        app.k8s.deployments = vec![sample_deployment("api-server")];
         app.handle_key(plain_key(KeyCode::Char('s')));
 
         app.handle_key(plain_key(KeyCode::Char('5')));
         app.handle_key(plain_key(KeyCode::Enter));
 
-        assert!(app.k8s_panel.as_ref().unwrap().scale_input.is_none());
-        let confirm = app.k8s_panel.as_ref().unwrap().confirm.as_ref().unwrap();
+        assert!(app.k8s.scale_input.is_none());
+        let confirm = app.k8s.confirm.as_ref().unwrap();
         assert_eq!(confirm.target_name, "api-server");
         assert_eq!(
             confirm.action,
@@ -13869,24 +14272,17 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
-        app.k8s_panel.as_mut().unwrap().available_contexts =
-            vec!["prod".to_string(), "staging".to_string()];
+        app.k8s.available_contexts = vec!["prod".to_string(), "staging".to_string()];
 
         app.handle_key(plain_key(KeyCode::Char('c')));
 
-        assert_eq!(
-            app.k8s_panel.as_ref().unwrap().picker,
-            Some(K8sPicker::Context)
-        );
+        assert_eq!(app.k8s.picker, Some(K8sPicker::Context));
 
         app.handle_key(plain_key(KeyCode::Down));
         app.handle_key(plain_key(KeyCode::Enter));
 
-        assert_eq!(
-            app.k8s_panel.as_ref().unwrap().context.as_deref(),
-            Some("staging")
-        );
-        assert!(app.k8s_panel.as_ref().unwrap().picker.is_none());
+        assert_eq!(app.k8s.context.as_deref(), Some("staging"));
+        assert!(app.k8s.picker.is_none());
     }
 
     #[test]
@@ -13894,21 +14290,17 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
-        let panel = app.k8s_panel.as_mut().unwrap();
-        panel.available_namespaces = vec!["default".to_string()];
-        panel.namespace = Some("default".to_string());
+        app.k8s.available_namespaces = vec!["default".to_string()];
+        app.k8s.namespace = Some("default".to_string());
 
         app.handle_key(plain_key(KeyCode::Char('n')));
-        assert_eq!(
-            app.k8s_panel.as_ref().unwrap().picker,
-            Some(K8sPicker::Namespace)
-        );
+        assert_eq!(app.k8s.picker, Some(K8sPicker::Namespace));
 
         // Index 0 is the synthetic "no namespace filter" entry (§3.5).
         app.handle_key(plain_key(KeyCode::Enter));
 
-        assert_eq!(app.k8s_panel.as_ref().unwrap().namespace, None);
-        assert!(app.k8s_panel.as_ref().unwrap().picker.is_none());
+        assert_eq!(app.k8s.namespace, None);
+        assert!(app.k8s.picker.is_none());
     }
 
     #[test]
@@ -13916,13 +14308,224 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleK8sPanel);
-        app.k8s_panel.as_mut().unwrap().available_contexts = vec!["prod".to_string()];
+        app.k8s.available_contexts = vec!["prod".to_string()];
         app.handle_key(plain_key(KeyCode::Char('c')));
 
         app.handle_key(plain_key(KeyCode::Esc));
 
-        assert!(app.k8s_panel.as_ref().unwrap().picker.is_none());
-        assert!(app.k8s_panel.as_ref().unwrap().context.is_none());
+        assert!(app.k8s.picker.is_none());
+        assert!(app.k8s.context.is_none());
+    }
+
+    // -- T33: TUI Tool Window Docking (`tui-tool-window-docking.md`) --
+
+    #[test]
+    fn handle_left_dock_key_tab_and_backtab_cycle_files_and_todos() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        // `left_dock` starts open on `Files`, focused, by default.
+        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Files);
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Todos);
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Files);
+
+        app.handle_key(plain_key(KeyCode::BackTab));
+        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Todos);
+    }
+
+    #[test]
+    fn handle_bottom_dock_key_tab_cycles_through_all_five_tabs_and_back() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleDockerPanel);
+        assert_eq!(app.bottom_dock.as_ref().unwrap().tab, BottomDockTab::Docker);
+
+        let forward = [
+            BottomDockTab::Kubernetes,
+            BottomDockTab::Cargo,
+            BottomDockTab::Problems,
+            BottomDockTab::GitLog,
+            BottomDockTab::Docker,
+        ];
+        for expected in forward {
+            app.handle_key(plain_key(KeyCode::Tab));
+            assert_eq!(app.bottom_dock.as_ref().unwrap().tab, expected);
+        }
+
+        app.handle_key(plain_key(KeyCode::BackTab));
+        assert_eq!(app.bottom_dock.as_ref().unwrap().tab, BottomDockTab::GitLog);
+    }
+
+    #[test]
+    fn toggle_left_dock_focus_is_a_three_way_toggle_that_always_targets_left_dock() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.focus, Focus::LeftDock); // default
+
+        app.run_action(Action::ToggleLeftDockFocus);
+        assert_eq!(app.focus, Focus::Editor);
+
+        app.run_action(Action::ToggleLeftDockFocus);
+        assert_eq!(app.focus, Focus::LeftDock);
+
+        app.focus = Focus::BottomDock;
+        app.run_action(Action::ToggleLeftDockFocus);
+        assert_eq!(
+            app.focus,
+            Focus::LeftDock,
+            "always targets LeftDock, never a cyclic next-focus"
+        );
+    }
+
+    #[test]
+    fn toggle_bottom_dock_focus_is_a_three_way_toggle_that_always_targets_bottom_dock() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.focus, Focus::LeftDock); // default
+
+        app.run_action(Action::ToggleBottomDockFocus);
+        assert_eq!(app.focus, Focus::BottomDock);
+
+        app.run_action(Action::ToggleBottomDockFocus);
+        assert_eq!(app.focus, Focus::Editor);
+
+        app.focus = Focus::LeftDock;
+        app.run_action(Action::ToggleBottomDockFocus);
+        assert_eq!(app.focus, Focus::BottomDock);
+    }
+
+    #[test]
+    fn toggle_left_dock_action_opens_and_closes_regardless_of_which_tab_it_holds() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some()); // open by default
+
+        app.run_action(Action::ToggleLeftDock);
+        assert!(app.left_dock.is_none());
+        assert_eq!(
+            app.focus,
+            Focus::Editor,
+            "closing a dock that had focus moves focus to Editor"
+        );
+
+        app.run_action(Action::ToggleLeftDock);
+        assert!(app.left_dock.is_some());
+    }
+
+    #[test]
+    fn toggle_bottom_dock_action_opens_and_closes_regardless_of_which_tab_it_holds() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.bottom_dock.is_none()); // closed by default
+
+        app.run_action(Action::ToggleBottomDock);
+        assert!(app.bottom_dock.is_some());
+        assert_eq!(
+            app.bottom_dock.as_ref().unwrap().tab,
+            BottomDockTab::Docker,
+            "a freshly opened bottom dock defaults to its first tab"
+        );
+
+        app.run_action(Action::ToggleBottomDock);
+        assert!(app.bottom_dock.is_none());
+    }
+
+    #[test]
+    fn grow_and_shrink_focused_dock_clamp_to_their_range() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.left_dock_width_pct, 30);
+
+        app.run_action(Action::GrowFocusedDock);
+        assert_eq!(app.left_dock_width_pct, 35);
+        app.run_action(Action::ShrinkFocusedDock);
+        assert_eq!(app.left_dock_width_pct, 30);
+
+        for _ in 0..20 {
+            app.run_action(Action::ShrinkFocusedDock);
+        }
+        assert_eq!(app.left_dock_width_pct, 15, "clamps at the range floor");
+
+        for _ in 0..20 {
+            app.run_action(Action::GrowFocusedDock);
+        }
+        assert_eq!(app.left_dock_width_pct, 60, "clamps at the range ceiling");
+
+        app.run_action(Action::ToggleBottomDock); // opens it (doesn't focus it)
+        app.run_action(Action::ToggleBottomDockFocus); // LeftDock -> BottomDock
+        assert_eq!(app.bottom_dock_height_pct, 30);
+        for _ in 0..20 {
+            app.run_action(Action::GrowFocusedDock);
+        }
+        assert_eq!(
+            app.bottom_dock_height_pct, 70,
+            "bottom dock has its own, wider range ceiling"
+        );
+    }
+
+    #[test]
+    fn resize_focused_dock_is_a_noop_on_editor_focus_or_a_closed_dock() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleLeftDockFocus); // -> Editor
+        assert_eq!(app.focus, Focus::Editor);
+
+        app.run_action(Action::GrowFocusedDock);
+        assert_eq!(app.left_dock_width_pct, 30, "no dock has focus");
+
+        app.run_action(Action::ToggleBottomDockFocus); // -> BottomDock, still closed
+        assert!(app.bottom_dock.is_none());
+        app.run_action(Action::GrowFocusedDock);
+        assert_eq!(
+            app.bottom_dock_height_pct, 30,
+            "the focused dock isn't open"
+        );
+    }
+
+    #[test]
+    fn handle_git_log_dock_key_enter_selects_a_commit_and_switches_to_diff_focus() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "a.txt", "hello\nworld\nagain", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.git.graph.len(), 2);
+        app.show_bottom_dock_tab(BottomDockTab::GitLog);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.git_log_dock.graph_selected, 1);
+        // Clamped at the last row.
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.git_log_dock.graph_selected, 1);
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.git_log_dock.focus, GitPanelFocus::Diff);
+        let expected_id = app.git.graph[1].id.clone();
+        assert_eq!(
+            app.git.selected_commit.as_deref(),
+            Some(expected_id.as_str())
+        );
+    }
+
+    #[test]
+    fn handle_git_log_dock_key_brackets_toggle_focus_and_diff_scrolls_independently() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::GitLog);
+        assert_eq!(app.git_log_dock.focus, GitPanelFocus::Graph);
+
+        app.handle_key(plain_key(KeyCode::Char('[')));
+        assert_eq!(app.git_log_dock.focus, GitPanelFocus::Diff);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.git_log_dock.diff_scroll, 1);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.git_log_dock.diff_scroll, 0);
+
+        app.handle_key(plain_key(KeyCode::Char(']')));
+        assert_eq!(app.git_log_dock.focus, GitPanelFocus::Graph);
     }
 
     /// Regression test for a real bug report: a tab-indented file (Go's
@@ -14104,7 +14707,7 @@ mod tests {
             &hits,
         );
 
-        assert_eq!(app.focus, Focus::Tree);
+        assert_eq!(app.focus, Focus::LeftDock);
         let active_path = app.tabs[app.active_tab.unwrap()].path.clone();
         assert_eq!(active_path.file_name().unwrap(), target_name);
     }
