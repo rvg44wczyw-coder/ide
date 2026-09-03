@@ -293,9 +293,13 @@ after the next save" for free, with no separate hook needed).
 
 ### 2.4 `crates/tui/src/ui.rs`
 
-`render_editor`'s per-row loop gains a second prepend, after the blame
-prefix (§2.4 order in `tui-blame.md`, blame lane innermost/leftmost) and
-before the fold-marker append is irrelevant here (fold markers append at
+`render_editor`'s per-row loop gains a second prepend, executed **before**
+`tui-blame.md` §2.4's existing blame prepend in the same per-row closure
+(order matters here: each prepend is a front-insert into `spans`, so
+running git-gutter's first and blame's second is what makes blame end up
+outermost/leftmost of the two, per §1.1's stated lane order — blame lane,
+then git-gutter lane, then buffer text). Whether the fold-marker append
+runs before or after either prepend is irrelevant (fold markers append at
 the row's *end*, unrelated to either leading lane):
 
 ```rust
@@ -315,10 +319,12 @@ if app.git_gutter_lane_width() > 0 {
 
 Same rebuild-the-`Line`-from-a-new-`spans`-vec technique `tui-blame.md`
 §2.4's own prepend uses (`ratatui::text::Line` has no in-place
-"push to front" method) — applied **after** blame's own prepend in
-`render_editor`'s per-row closure, so git-gutter's span ends up first
-(leftmost) in the final `spans` vec relative to blame's, matching §1.1's
-stated lane order (blame lane, then git-gutter lane, then buffer text).
+"push to front" method) — applied **before** blame's own prepend runs in
+`render_editor`'s per-row closure (this block's `styled.spans` input is
+the un-prefixed line; blame's own prepend, running second, then wraps
+around this block's output), so blame's span ends up outermost/leftmost
+of the two in the final `spans` vec, matching §1.1's stated lane order
+(blame lane, then git-gutter lane, then buffer text).
 
 New `render_git_gutter_popup(frame: &mut Frame, app: &App, area: Rect)`:
 a small fixed-size popup (same `clamp`-to-small-box shape
