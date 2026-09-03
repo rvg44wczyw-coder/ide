@@ -777,9 +777,16 @@ mod tests {
         assert!(status.success());
     }
 
+    /// `-b main` and a repo-local identity make these repos independent of
+    /// the runner's ambient git config -- see `crates/tui/src/app.rs`'s
+    /// `init_git_repo` doc comment for why both are needed (not just an
+    /// `init.defaultBranch` gap: `GitRepo::commit`'s git2 signature never
+    /// reads `run`'s `GIT_AUTHOR_NAME` env vars, only actual git config).
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        run(dir.path(), &["init", "-q"]);
+        run(dir.path(), &["init", "-q", "-b", "main"]);
+        run(dir.path(), &["config", "user.name", "Test"]);
+        run(dir.path(), &["config", "user.email", "test@example.com"]);
         dir
     }
 
