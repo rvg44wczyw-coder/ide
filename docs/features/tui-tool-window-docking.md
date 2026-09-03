@@ -408,9 +408,12 @@ acceptable; the requirement is "hidden dock takes zero space, the
 sibling area gets all of it," not a specific `ratatui` call shape.)
 
 `render_left_dock`/`render_bottom_dock` (new) each render a one-row tab
-strip above their content — reusing the exact "`* ` prefix on the focused
-tab's title" convention `render_debug_panel`'s `section_title` closure
-already establishes (`ui.rs:1325-1326`) — then dispatch to the active
+strip above their content — marking the focused tab with `[brackets]`
+around its title, a convention distinct from both the editor tab strip's
+reverse-video highlight (`render_tab_strip`) and `render_debug_panel`'s
+`section_title` closure's `* ` prefix (`ui.rs:1325-1326`), chosen because
+this strip packs multiple short labels onto one line where a color-only
+cue would be lost on a monochrome terminal — then dispatch to the active
 tab's existing render function:
 
 - `LeftDockTab::Files` → the existing `render_tree` body (called with the
@@ -559,12 +562,20 @@ simultaneously, and neither's state affects the other's (§4).
   "close" for a permanently-mounted tab's cursor, only "not currently the
   active tab," so leaving and returning to `BottomDockTab::GitLog` shows
   the same commit/scroll position as before).
-- **The full Git Panel and the `GitLog` dock tab are fully independent.**
-  Opening the full modal Git Panel (`ToggleGitPanel`) does not affect
-  `bottom_dock`'s state or the `GitLog` tab's cursor, and vice versa —
-  a commit selected in one has no effect on the other's `graph_selected`.
-  This is a deliberate consequence of §2.1's scope trim, not an oversight;
-  a future phase could unify them, but doing so now would mean solving
+- **The full Git Panel and the `GitLog` dock tab have independent cursor
+  state, but share the underlying commit/diff cache.** Each has its own
+  `graph_selected`/`diff_scroll` (`GitPanelState` vs. `GitLogDockState`),
+  so scrolling or navigating in one never moves the other's cursor. They
+  are *not*, however, fully independent: both read and write
+  `self.git.selected_commit`/`graph`/diff content, the same shared cache
+  `toggle_git_panel` already left untouched across opens/closes before
+  this doc's feature existed — so selecting a commit in one does change
+  what the other shows as "the selected commit" if opened next (its own
+  cursor position stays put, but the underlying selection/diff it would
+  jump to on `Enter`, or already display in `Diff` focus, is shared). This
+  is a deliberate consequence of §2.1's scope trim, not an oversight — a
+  future phase could give each surface its own independent copy of that
+  cache, or unify the two entirely, but doing so now would mean solving
   the much larger "make the whole modal Git Panel state machine
   permanently mounted" problem this doc explicitly declines to take on.
 - **Resizing never lets a dock shrink the editor to zero or negative
@@ -776,3 +787,31 @@ both are implementation-detail fixes to keep the doc accurate against what
 was actually necessary to build a working feature, surfaced here per
 `CLAUDE.md`'s "fix all findings" convention rather than left silently
 diverging.
+
+### Round 5 (post-`rev`, two doc/comment corrections)
+
+`rev` (non-blocking `[quality]`/`[docs]` findings) caught two places where
+this doc, or a code comment written against it, claimed something the
+actual implementation doesn't do:
+
+1. **The tab-strip convention.** §2.3 originally said
+   `render_left_dock`/`render_bottom_dock` reuse `render_debug_panel`'s
+   `* `-prefix convention; the actual implementation uses `[brackets]`
+   instead, and the matching `ui.rs` doc comment incorrectly claimed this
+   was reusing "the bracketed-active-tab convention this file's tab strip
+   already establishes for editor tabs" — no such convention existed
+   before this diff (the editor tab strip uses reverse-video highlighting,
+   not brackets). Both the doc and the code comment now describe brackets
+   as the actual, deliberately new convention, with the rationale (packing
+   multiple short labels onto one line, where a color-only cue would be
+   lost on a monochrome terminal).
+2. **Git Panel / GitLog dock independence.** The original §3 bullet
+   claimed the two are "fully independent." Verified against the code:
+   only each surface's own cursor bookkeeping (`graph_selected`/
+   `diff_scroll`) is independent — both still read and write the same
+   shared `self.git.selected_commit`/`graph`/diff cache, a pre-existing
+   sharing pattern this feature adds a second consumer to rather than
+   introduces. The bullet now describes this accurately instead of
+   overclaiming isolation that doesn't exist.
+
+Neither correction changes behavior — both are doc/comment-accuracy fixes.

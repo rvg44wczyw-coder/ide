@@ -256,9 +256,12 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
 
 /// New in `docs/features/tui-tool-window-docking.md` (T33): renders a
 /// one-row tab strip above `dock`'s content, then dispatches to whichever
-/// existing per-tab render function matches `dock.tab` -- reusing the
-/// bracketed-active-tab convention this file's tab strip already
-/// establishes for editor tabs, rather than inventing a second one.
+/// existing per-tab render function matches `dock.tab` -- marks the active
+/// tab with `[brackets]`, a convention distinct from both the editor tab
+/// strip's reverse-video highlight (`render_tab_strip`) and
+/// `render_debug_panel`'s `* `-prefix, chosen here because this strip
+/// packs multiple short labels onto one line where a color-only cue would
+/// be lost in a monochrome terminal.
 fn render_left_dock(
     frame: &mut Frame,
     app: &App,
