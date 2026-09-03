@@ -277,7 +277,7 @@ finding).
   movement never updates a pushed entry). This is not a TUI-specific gap;
   `ide-ui`'s own `pending_cursor_offset` mechanism has the identical
   limitation.
-- `nav: NavHistory` is in-memory only, not persisted across restarts —
+- `nav_history: NavHistory` is in-memory only, not persisted across restarts —
   `ide-ui`'s own `NavHistory` isn't persisted either (`recent_files`/
   `nav_state`'s bookmarks are, via `project_settings`, but the back/
   forward stack itself is session-scoped in both frontends).
