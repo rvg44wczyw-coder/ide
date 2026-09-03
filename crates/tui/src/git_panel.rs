@@ -649,6 +649,17 @@ impl GitPanel {
     /// on success or `worktrees_popup.error` on failure. Not eagerly
     /// called by `refresh()` itself -- same lazy-load reasoning
     /// `reload_branches` already documents.
+    ///
+    /// Sanitizes `name`/`branch`/`path` before storing -- the same layer
+    /// `commit_detail` already strips bidi controls at
+    /// (`docs/security-findings/tui-git-worktrees-2026-09-03.md`'s finding
+    /// 1, extending the un-actioned `git-worktrees-core-2026-09-01.md`'s
+    /// finding 1). `GitRepo::worktrees()` reads back whatever a worktree
+    /// registration happens to contain -- created by this app's own
+    /// (bidi-checked-for-`name`-only, unchecked-for-`path`) `add_worktree`
+    /// or by an external tool entirely outside this app's validation --
+    /// so the render layer can't assume the data arriving here is already
+    /// clean.
     pub fn refresh_worktrees(&mut self) {
         let Some(repo) = &self.repo else {
             self.worktrees_popup.worktrees = Vec::new();
@@ -656,7 +667,8 @@ impl GitPanel {
         };
         match repo.worktrees() {
             Ok(worktrees) => {
-                self.worktrees_popup.worktrees = worktrees;
+                self.worktrees_popup.worktrees =
+                    worktrees.into_iter().map(sanitize_worktree_info).collect();
                 self.worktrees_popup.error = None;
             }
             Err(e) => self.worktrees_popup.error = Some(e.to_string()),
@@ -810,6 +822,25 @@ impl GitPanel {
 const MAX_COMMIT_DETAIL_SUMMARY_CHARS: usize = 200;
 const MAX_COMMIT_DETAIL_BODY_CHARS: usize = 4000;
 const MAX_COMMIT_DETAIL_NAME_CHARS: usize = 200;
+
+/// Strips bidi control characters from every text field `refresh_worktrees`
+/// stores (`docs/security-findings/tui-git-worktrees-2026-09-03.md`,
+/// finding 1). `path` goes through the same `strip_bidi_controls`
+/// treatment as `name`/`branch` even though today's `add_worktree` only
+/// validates `name` at creation time, since this popup can't assume every
+/// entry `GitRepo::worktrees()` returns was created through that check.
+fn sanitize_worktree_info(wt: WorktreeInfo) -> WorktreeInfo {
+    WorktreeInfo {
+        name: crate::blame_gutter::strip_bidi_controls(&wt.name),
+        path: PathBuf::from(crate::blame_gutter::strip_bidi_controls(
+            &wt.path.to_string_lossy(),
+        )),
+        branch: wt
+            .branch
+            .map(|b| crate::blame_gutter::strip_bidi_controls(&b)),
+        is_locked: wt.is_locked,
+    }
+}
 
 fn non_empty(text: &str) -> Option<String> {
     let trimmed = text.trim();
@@ -1624,6 +1655,46 @@ mod tests {
             panel.worktrees_popup.worktrees.len(),
             1,
             "refresh() must not clear an already-loaded worktrees list"
+        );
+    }
+
+    #[test]
+    fn refresh_worktrees_strips_bidi_controls_from_name_branch_and_path() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        let wt_dir = tempfile::tempdir().unwrap();
+        let evil_path = wt_dir.path().join("good\u{202E}evil");
+        run(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat\u{202E}ure",
+                evil_path.to_str().unwrap(),
+            ],
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_worktrees_popup(dir.path());
+
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+        let wt = &panel.worktrees_popup.worktrees[0];
+        assert!(
+            !wt.name.contains('\u{202E}'),
+            "name must have bidi controls stripped: {:?}",
+            wt.name
+        );
+        assert!(
+            !wt.path.to_string_lossy().contains('\u{202E}'),
+            "path must have bidi controls stripped: {:?}",
+            wt.path
+        );
+        assert!(
+            !wt.branch.as_deref().unwrap_or("").contains('\u{202E}'),
+            "branch must have bidi controls stripped: {:?}",
+            wt.branch
         );
     }
 
