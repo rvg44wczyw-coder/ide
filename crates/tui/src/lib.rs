@@ -42,6 +42,7 @@ mod editor;
 mod files_search;
 mod find;
 mod folding;
+mod git_gutter;
 mod git_panel;
 mod highlight;
 mod k8s_panel;
@@ -210,6 +211,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // (`docs/features/tui-git-staging-branches-and-log-filters.md`
         // §3.1).
         app.sync_git_status();
+        // Same reasoning, for the ambient git-gutter sign column
+        // (`docs/features/tui-git-gutter.md` §3.1) -- unconditional, not
+        // gated on the Git Panel being open, since the gutter renders in
+        // the editor itself.
+        app.sync_git_gutter();
         // Same reasoning, for Go to File's live per-keystroke refresh and
         // Go to Symbol's outline/workspace-query refetch (`docs/features/
         // tui-go-to-file-and-symbol.md` §3.1/§3.2).

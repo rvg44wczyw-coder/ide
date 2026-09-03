@@ -626,6 +626,17 @@ pub struct App {
     /// commit id, so a second lookup never inherits the first one's
     /// scroll position.
     pub(crate) blame_popup_scroll: u16,
+    /// The active tab's gutter marks, recomputed every frame `sync_git_
+    /// gutter` runs (`docs/features/tui-git-gutter.md` §3.1) -- empty with
+    /// no active tab, a dirty buffer, or no repo.
+    pub(crate) git_gutter: Vec<crate::git_gutter::GutterMark>,
+    /// The path `git_gutter` answers for -- lets a render call tell "these
+    /// marks are for the tab on screen right now" apart from one frame of
+    /// staleness at a tab switch, same role `last_git_diff_target` plays.
+    git_gutter_path: Option<PathBuf>,
+    /// The buffer line a sign-column click landed on, while its "Revert
+    /// Hunk (r) / Show Diff (d)" popup is open. `None` when closed.
+    pub(crate) git_gutter_popup_line: Option<usize>,
     /// Presence is visibility, same convention `git_panel` uses -- unlike
     /// `git`/`git_panel`'s split (an always-present service plus a
     /// separate open/focus wrapper), `DockerPanel`/`K8sPanel` carry their
@@ -747,6 +758,9 @@ impl App {
             last_git_diff_target: None,
             blame_popup: None,
             blame_popup_scroll: 0,
+            git_gutter: Vec::new(),
+            git_gutter_path: None,
+            git_gutter_popup_line: None,
             docker_panel: None,
             k8s_panel: None,
             language,
@@ -2673,6 +2687,185 @@ impl App {
         }
     }
 
+    /// Called once per frame from `crates/tui/src/lib.rs`'s main loop,
+    /// alongside `sync_git_working_tree_diff`/`sync_code_actions`
+    /// (`docs/features/tui-git-gutter.md` §2.3/§3.1). Clears `git_gutter`/
+    /// `git_gutter_path` on no active tab or a dirty buffer (§3.1 --
+    /// `GitRepo::diff_file` diffs on-disk content, which no longer matches
+    /// an unsaved buffer's line numbers); else, only when the active tab's
+    /// path differs from `git_gutter_path` (the same changed-since-last-
+    /// frame guard those siblings use), recomputes from `self.git.
+    /// gutter_marks_for(path)`.
+    pub(crate) fn sync_git_gutter(&mut self) {
+        let Some(idx) = self.active_tab else {
+            self.git_gutter.clear();
+            self.git_gutter_path = None;
+            return;
+        };
+        if self.tabs[idx].buffer.is_dirty() {
+            self.git_gutter.clear();
+            self.git_gutter_path = None;
+            return;
+        }
+        let path = self.tabs[idx].path.clone();
+        if self.git_gutter_path.as_ref() == Some(&path) {
+            return;
+        }
+        self.git_gutter = self.git.gutter_marks_for(&path);
+        self.git_gutter_path = Some(path);
+    }
+
+    /// `2` when `self.git.is_repo()` **and** the active tab's buffer isn't
+    /// dirty -- i.e. the same condition under which `sync_git_gutter`
+    /// would (re)compute marks at all -- else `0`. Deliberately **not**
+    /// based on whether `git_gutter` happens to be empty: a clean,
+    /// unchanged file still inside a repo must reserve the same 2 columns
+    /// a modified one does, or the lane would jump from 0 to 2 the instant
+    /// the file's first hunk appears -- exactly the resize-on-arrival
+    /// jitter `docs/features/tui-git-gutter.md` §1.1/§4 says this lane
+    /// must not have.
+    pub(crate) fn git_gutter_lane_width(&self) -> u16 {
+        if !self.git.is_repo() {
+            return 0;
+        }
+        match self.active_buffer() {
+            Some(buf) if !buf.buffer.is_dirty() => 2,
+            _ => 0,
+        }
+    }
+
+    /// `blame_lane_width() + git_gutter_lane_width()` -- the one value
+    /// both the mouse-click column math (`handle_mouse_click`) and
+    /// `render_editor`'s native-cursor-position fix use, so neither ever
+    /// computes the combined offset independently (`docs/features/
+    /// tui-git-gutter.md` §1.1/§2.3, the same "two things that could
+    /// drift" concern `tui-blame.md` §2.3 already resolved for its own
+    /// single lane).
+    pub(crate) fn editor_lane_width(&self) -> u16 {
+        self.blame_lane_width() + self.git_gutter_lane_width()
+    }
+
+    /// The active tab's path, only while `git_gutter_popup_line` names a
+    /// line still backed by fresh (non-stale) marks for that same path --
+    /// shared gating for `trigger_revert_hunk` and the popup's own render
+    /// call, mirroring `ide-ui`'s identical `git_gutter_popup_target`
+    /// helper for this same feature.
+    fn git_gutter_popup_target(&self) -> Option<(PathBuf, usize)> {
+        let idx = self.active_tab?;
+        let path = self.tabs[idx].path.clone();
+        if self.git_gutter_path.as_ref() != Some(&path) {
+            return None;
+        }
+        Some((path, self.git_gutter_popup_line?))
+    }
+
+    /// Row is relative to the editor's text area's top-left corner, same
+    /// bounds-check shape as `click_blame_lane`/`click_editor_at`
+    /// (`docs/features/tui-git-gutter.md` §2.3). Maps to a buffer line,
+    /// looks it up in `git_gutter` by exact line match (`GutterMark.line`,
+    /// not a run -- unlike blame annotations, one mark decorates exactly
+    /// one line); a hit opens the popup (`git_gutter_popup_line =
+    /// Some(line)`), a miss (a reserved-but-unmarked row -- most rows,
+    /// since only changed lines carry a mark) does nothing.
+    fn click_git_gutter_lane(&mut self, area_row: u16) {
+        let Some(buf) = self.active_buffer() else {
+            return;
+        };
+        let text_buffer = buf.buffer.text_buffer();
+        let ranges = text_buffer.fold_ranges();
+        let line_count = text_buffer.lines().line_count();
+        let visual = VisualLines::build(line_count, &ranges, &buf.folded);
+        let clicked_row = buf.scroll as usize + area_row as usize;
+        if clicked_row >= visual.row_count() {
+            return;
+        }
+        let line = visual.buffer_line(clicked_row);
+        if self.git_gutter.iter().any(|m| m.line == line) {
+            self.git_gutter_popup_line = Some(line);
+        }
+    }
+
+    /// Routes the git-gutter popup's two single-letter actions -- `r`
+    /// (Revert Hunk), `d` (Show Diff) -- checked in `handle_key`'s
+    /// popup-precedence chain alongside `blame_popup`; any other key
+    /// (including `Esc`) closes it, same "any key closes a confirm-style
+    /// popup" convention `handle_blame_popup_key`'s default arm uses
+    /// (`docs/features/tui-git-gutter.md` §2.3).
+    fn handle_git_gutter_popup_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Char('r') => self.trigger_revert_hunk(),
+            KeyCode::Char('d') => self.trigger_show_diff_for_gutter(),
+            _ => self.git_gutter_popup_line = None,
+        }
+        LoopSignal::Continue
+    }
+
+    /// No-op unless `git_gutter_popup_line` names a line still backed by
+    /// fresh (non-stale) marks for the active tab's current path. Builds
+    /// `revert_hunk_change` from `self.git.hunks_for(path)` against the
+    /// active buffer's *current* text and, on `Some`, applies it via
+    /// `Transaction::new(vec![change]).expect("a single change never
+    /// overlaps")` on the active buffer (one undo step -- `Ctrl+Z` undoes
+    /// it) and closes the popup either way. **Never writes to disk
+    /// directly** -- the user's own next `Ctrl+S` persists it
+    /// (`docs/features/tui-git-gutter.md` §2.3/§3.3).
+    fn trigger_revert_hunk(&mut self) {
+        let target = self.git_gutter_popup_target();
+        self.git_gutter_popup_line = None;
+        let Some((path, line)) = target else {
+            return;
+        };
+        let Some(idx) = self.active_tab else {
+            return;
+        };
+        let hunks = self.git.hunks_for(&path);
+        let Some(change) = crate::git_gutter::revert_hunk_change(
+            &hunks,
+            line,
+            self.tabs[idx].buffer.text_buffer(),
+        ) else {
+            return;
+        };
+        let transaction =
+            Transaction::new(vec![change]).expect("a single change never overlaps itself");
+        self.tabs[idx].buffer.apply(transaction);
+    }
+
+    /// Closes the popup, opens the Git Panel if not already open
+    /// (`toggle_git_panel`-style, but never *closing* an already-open
+    /// panel), and calls `self.git.show_working_tree_diff(path)` for the
+    /// active tab's path -- reuses the existing diff pane wholesale rather
+    /// than a hunk-scrolled sub-view, matching `editor-git-gutter.md`
+    /// §3.4's own v1 simplification. Clears `git.selected_commit` first so
+    /// this always shows the *ambient* working-tree diff even if a commit
+    /// was previously pinned via the commit graph, and updates
+    /// `last_git_diff_target` to match so `sync_git_working_tree_diff`'s
+    /// own per-frame refresh keeps working afterward rather than staying
+    /// gated on a stale selection. Also sets `state.view =
+    /// GitPanelView::Log` and `state.focus = GitPanelFocus::Diff`
+    /// (resetting `state.diff_scroll = 0`) on the panel's `GitPanelState`,
+    /// the same pair `handle_git_panel_key`'s existing "Enter on commit
+    /// graph" flow sets together -- `show_working_tree_diff` alone only
+    /// populates `self.git.diff`, it does not touch panel navigation state
+    /// (`docs/features/tui-git-gutter.md` §2.3).
+    fn trigger_show_diff_for_gutter(&mut self) {
+        self.git_gutter_popup_line = None;
+        let Some(idx) = self.active_tab else {
+            return;
+        };
+        let path = self.tabs[idx].path.clone();
+        self.git.selected_commit = None;
+        self.git.show_working_tree_diff(&path);
+        self.last_git_diff_target = Some(path);
+        if self.git_panel.is_none() {
+            self.git_panel = Some(GitPanelState::default());
+        }
+        let state = self.git_panel.as_mut().expect("just ensured Some above");
+        state.view = GitPanelView::Log;
+        state.focus = GitPanelFocus::Diff;
+        state.diff_scroll = 0;
+    }
+
     /// `ToggleGitPanel` command (palette-only, no default binding -- see
     /// `commands.rs`): opens/closes the Git Panel overlay. `self.git`'s own
     /// fields persist across the toggle -- only the transient cursor/scroll
@@ -3971,6 +4164,9 @@ impl App {
         if self.blame_popup.is_some() {
             return self.handle_blame_popup_key(key);
         }
+        if self.git_gutter_popup_line.is_some() {
+            return self.handle_git_gutter_popup_key(key);
+        }
         if self.git_panel.is_some() {
             return self.handle_git_panel_key(key);
         }
@@ -4034,6 +4230,7 @@ impl App {
             || self.rename_popup.is_some()
             || self.pending_rename_preview.is_some()
             || self.blame_popup.is_some()
+            || self.git_gutter_popup_line.is_some()
             || self.git_panel.is_some()
             || self.docker_panel.is_some()
             || self.k8s_panel.is_some()
@@ -4095,9 +4292,12 @@ impl App {
             if area.contains(point.into()) {
                 let col = event.column - area.x;
                 let row = event.row - area.y;
-                let lane = self.blame_lane_width();
-                if (col as usize) < lane as usize {
+                let blame_w = self.blame_lane_width();
+                let lane = self.editor_lane_width();
+                if (col as usize) < blame_w as usize {
                     self.click_blame_lane(row);
+                } else if (col as usize) < lane as usize {
+                    self.click_git_gutter_lane(row);
                 } else {
                     self.click_editor_at(col - lane, row);
                 }
@@ -6076,6 +6276,25 @@ mod tests {
         app.open_or_focus_tab(dir.path().join("f.rs")).unwrap();
         app.focus = Focus::Editor;
         (dir, app)
+    }
+
+    /// A fresh, empty repo (no commits yet) -- for git-gutter tests that
+    /// need to commit under their own filename. `run_git`/`git_commit`
+    /// (T11's own helpers, above) do the actual `git` subprocess work.
+    fn git_repo_without_commits() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]);
+        dir
+    }
+
+    /// Opens `name` (already committed inside `dir`, a real repo) as the
+    /// active tab -- `App::new` calls `git.refresh` on the project root
+    /// itself, so no separate `git.refresh` call is needed here.
+    fn open_committed_tab(dir: &Path, name: &str) -> App {
+        let mut app = App::new(dir.to_path_buf()).unwrap();
+        app.open_or_focus_tab(dir.join(name)).unwrap();
+        app.focus = Focus::Editor;
+        app
     }
 
     fn set_caret(app: &mut App, offset: usize) {
@@ -14058,6 +14277,340 @@ mod tests {
             caret(&app),
         );
         assert_eq!((line, column), (1, 2));
+    }
+
+    #[test]
+    fn sync_git_gutter_with_no_active_tab_clears_marks() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        app.active_tab = None;
+        app.git_gutter = vec![crate::git_gutter::GutterMark {
+            line: 0,
+            kind: crate::git_gutter::GutterMarkKind::Added,
+        }];
+        app.git_gutter_path = Some(PathBuf::from("/stale.rs"));
+
+        app.sync_git_gutter();
+
+        assert!(app.git_gutter.is_empty());
+        assert!(app.git_gutter_path.is_none());
+    }
+
+    #[test]
+    fn sync_git_gutter_clears_marks_while_the_buffer_is_dirty() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.active_buffer_mut().unwrap().buffer.insert(0, "x");
+
+        app.sync_git_gutter();
+
+        assert!(app.git_gutter.is_empty());
+        assert!(app.git_gutter_path.is_none());
+    }
+
+    #[test]
+    fn sync_git_gutter_reflects_a_saved_working_tree_change() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+
+        app.sync_git_gutter();
+
+        assert_eq!(app.git_gutter.len(), 1);
+        assert_eq!(app.git_gutter[0].line, 1);
+        assert_eq!(
+            app.git_gutter[0].kind,
+            crate::git_gutter::GutterMarkKind::Modified
+        );
+        assert_eq!(
+            app.git_gutter_path,
+            Some(dir.path().join("f.txt").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn sync_git_gutter_does_not_recompute_when_the_path_is_unchanged() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+        // Mutate the cached marks directly -- a second `sync_git_gutter`
+        // with the same active-tab path must leave this alone rather than
+        // recomputing (same guard `sync_git_working_tree_diff` already
+        // uses via `last_git_diff_target`).
+        app.git_gutter.clear();
+
+        app.sync_git_gutter();
+
+        assert!(app.git_gutter.is_empty());
+    }
+
+    #[test]
+    fn git_gutter_lane_width_is_zero_with_no_repo() {
+        let (_dir, app) = open_rust_tab("fn main() {}\n");
+        assert_eq!(app.git_gutter_lane_width(), 0);
+    }
+
+    #[test]
+    fn git_gutter_lane_width_is_two_inside_a_clean_repo() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        let app = open_committed_tab(dir.path(), "f.txt");
+        assert_eq!(app.git_gutter_lane_width(), 2);
+    }
+
+    #[test]
+    fn git_gutter_lane_width_is_zero_while_the_buffer_is_dirty() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.active_buffer_mut().unwrap().buffer.insert(0, "x");
+        assert_eq!(app.git_gutter_lane_width(), 0);
+    }
+
+    #[test]
+    fn editor_lane_width_sums_blame_and_gutter_lanes() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        assert_eq!(app.editor_lane_width(), app.git_gutter_lane_width());
+        app.toggle_blame_annotations();
+        assert_eq!(
+            app.editor_lane_width(),
+            app.blame_lane_width() + app.git_gutter_lane_width()
+        );
+        assert!(app.editor_lane_width() > app.git_gutter_lane_width());
+    }
+
+    #[test]
+    fn click_git_gutter_lane_on_a_marked_line_opens_the_popup() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
+            &hits,
+        );
+        assert_eq!(app.git_gutter_popup_line, Some(1));
+    }
+
+    #[test]
+    fn click_git_gutter_lane_on_an_unmarked_line_is_a_noop() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &hits,
+        );
+        assert!(app.git_gutter_popup_line.is_none());
+    }
+
+    #[test]
+    fn click_past_the_git_gutter_lane_still_places_the_caret() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+        let lane = app.editor_lane_width();
+
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 60,
+                height: 5,
+            }),
+            tab_strip: vec![],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), lane, 1),
+            &hits,
+        );
+        assert!(app.git_gutter_popup_line.is_none());
+        let (line, column) = cursor_line_column(
+            app.active_buffer().unwrap().buffer.text_buffer(),
+            caret(&app),
+        );
+        assert_eq!((line, column), (1, 0));
+    }
+
+    #[test]
+    fn handle_git_gutter_popup_key_r_reverts_the_hunk() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+        app.git_gutter_popup_line = Some(1);
+
+        app.handle_git_gutter_popup_key(plain_key(KeyCode::Char('r')));
+
+        assert_eq!(active_text(&app), "a\nb\nc\n");
+        assert!(app.git_gutter_popup_line.is_none());
+    }
+
+    #[test]
+    fn handle_git_gutter_popup_key_d_shows_the_diff() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+        app.git_gutter_popup_line = Some(1);
+
+        app.handle_git_gutter_popup_key(plain_key(KeyCode::Char('d')));
+
+        assert!(app.git_gutter_popup_line.is_none());
+        assert!(app.git.diff.is_some());
+        let state = app.git_panel.as_ref().unwrap();
+        assert_eq!(state.view, GitPanelView::Log);
+        assert_eq!(state.focus, GitPanelFocus::Diff);
+    }
+
+    #[test]
+    fn handle_git_gutter_popup_key_any_other_key_closes_it() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+        app.git_gutter_popup_line = Some(1);
+
+        app.handle_git_gutter_popup_key(plain_key(KeyCode::Esc));
+
+        assert!(app.git_gutter_popup_line.is_none());
+        assert_eq!(
+            active_text(&app),
+            "a\nB\nc\n",
+            "Esc must not revert anything"
+        );
+    }
+
+    #[test]
+    fn handle_key_routes_to_the_git_gutter_popup_before_anything_else() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.git_gutter_popup_line = Some(0);
+        app.handle_key(plain_key(KeyCode::Char('z')));
+        assert!(
+            app.git_gutter_popup_line.is_none(),
+            "any non-r/d key must close the popup rather than falling through to editor input"
+        );
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_git_gutter_popup() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        assert!(!app.any_popup_open());
+        app.git_gutter_popup_line = Some(0);
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn trigger_revert_hunk_with_no_popup_open_is_a_noop() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+
+        app.trigger_revert_hunk();
+
+        assert_eq!(active_text(&app), "a\nB\nc\n");
+    }
+
+    #[test]
+    fn trigger_revert_hunk_with_stale_marks_is_a_noop() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.sync_git_gutter();
+        app.git_gutter_popup_line = Some(1);
+        // Marks are now stale for the active tab's path (a fresh edit
+        // invalidates them, same as `sync_git_gutter`'s own dirty-buffer
+        // rule) -- `trigger_revert_hunk` must refuse to act on them.
+        app.git_gutter_path = Some(PathBuf::from("/different.rs"));
+
+        app.trigger_revert_hunk();
+
+        assert_eq!(active_text(&app), "a\nB\nc\n");
+        assert!(app.git_gutter_popup_line.is_none());
+    }
+
+    #[test]
+    fn trigger_show_diff_for_gutter_opens_the_panel_on_the_diff_pane() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        // Simulate a panel that was left open on a different view/focus,
+        // and a previously-pinned commit selection, from an earlier
+        // session -- both must be overridden, not merely left alone.
+        app.git_panel = Some(GitPanelState {
+            view: GitPanelView::Changes,
+            focus: GitPanelFocus::Graph,
+            ..GitPanelState::default()
+        });
+        app.git.selected_commit = Some("deadbeef".to_string());
+        app.git_gutter_popup_line = Some(1);
+
+        app.trigger_show_diff_for_gutter();
+
+        assert!(app.git_gutter_popup_line.is_none());
+        assert!(app.git.selected_commit.is_none());
+        assert!(app.git.diff.is_some());
+        let state = app.git_panel.as_ref().unwrap();
+        assert_eq!(state.view, GitPanelView::Log);
+        assert_eq!(state.focus, GitPanelFocus::Diff);
+        assert_eq!(state.diff_scroll, 0);
+    }
+
+    #[test]
+    fn trigger_show_diff_for_gutter_with_no_active_tab_is_a_noop() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.active_tab = None;
+
+        app.trigger_show_diff_for_gutter();
+
+        assert!(app.git_panel.is_none());
     }
 
     #[test]
