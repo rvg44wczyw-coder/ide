@@ -4293,13 +4293,13 @@ impl App {
                 let col = event.column - area.x;
                 let row = event.row - area.y;
                 let blame_w = self.blame_lane_width();
-                let gutter_w = self.git_gutter_lane_width();
+                let lane = self.editor_lane_width();
                 if (col as usize) < blame_w as usize {
                     self.click_blame_lane(row);
-                } else if (col as usize) < (blame_w + gutter_w) as usize {
+                } else if (col as usize) < lane as usize {
                     self.click_git_gutter_lane(row);
                 } else {
-                    self.click_editor_at(col - blame_w - gutter_w, row);
+                    self.click_editor_at(col - lane, row);
                 }
                 self.focus = Focus::Editor;
             }
