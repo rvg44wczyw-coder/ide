@@ -83,32 +83,42 @@ anything else.
 ```rust
 struct App {
     // ...
-    nav: NavHistory,
+    nav_history: NavHistory,
     // ...
 }
 ```
 
-Named `nav`, matching `ide-ui`'s own field name. This is a distinct field
-from the pre-existing `nav_state` (`tui-recent-files-and-bookmarks.md`'s
-persisted Recent-Files/Bookmarks state) — different concept, deliberately
-not merged or renamed to avoid disturbing that already-shipped feature;
-callers must not confuse the two.
+Named `nav_history` rather than `ide-ui`'s own bare `nav` field name,
+specifically to stay visually distinct from the pre-existing `nav_state`
+(`tui-recent-files-and-bookmarks.md`'s persisted Recent-Files/Bookmarks
+state) sitting right next to it in the struct — an unrelated field with a
+confusingly similar name; the more distinct name costs nothing and removes
+the at-a-glance ambiguity a matching `nav`/`nav_state` pair would invite.
 
 ```rust
 impl App {
     /// Records **the tab that is active at call time** (path + `offset`)
-    /// as the new current entry in `nav`. No-op with no active tab or an
-    /// untitled one (no path to return to). Every call site opens (or
-    /// focuses) its destination tab *first*, then calls this -- it always
-    /// records the destination just jumped to, never the origin the jump
-    /// started from (identical to `ide-ui`'s own `push_nav_location`,
-    /// which reads `self.active_tab` after its caller's own `open_file`
-    /// already switched it). `ide-ui`'s version reads a deferred
-    /// `pending_cursor_offset` field for the offset instead of taking a
-    /// parameter -- `ide-tui` has no such field (it's fully synchronous,
-    /// unlike egui's frame-deferred consumption), so callers pass the
-    /// offset directly.
+    /// as the new current entry in `nav_history`. No-op with no active tab
+    /// or an untitled one (no path to return to). Every call site opens
+    /// (or focuses) its destination tab *first*, then calls this -- it
+    /// always records the destination just jumped to, never the origin
+    /// the jump started from (identical to `ide-ui`'s own
+    /// `push_nav_location`, which reads `self.active_tab` after its
+    /// caller's own `open_file` already switched it). `ide-ui`'s version
+    /// reads a deferred `pending_cursor_offset` field for the offset
+    /// instead of taking a parameter -- `ide-tui` has no such field (it's
+    /// fully synchronous, unlike egui's frame-deferred consumption), so
+    /// callers pass the offset directly -- see §2.3 on where that offset
+    /// comes from at each call site.
     fn push_nav_location(&mut self, offset: usize);
+
+    /// The active buffer's actual current caret offset, or `0` with no
+    /// active tab (`docs/features/tui-back-forward-navigation.md` §2.3's
+    /// fix-round finding). Reading this live, rather than assuming a
+    /// jump's own nominal target offset, is what keeps `push_nav_location`
+    /// accurate when `open_or_focus_tab` refocuses a tab that was already
+    /// open -- that branch never touches the tab's live caret.
+    fn active_caret_offset(&self) -> usize;
 
     /// `NavigateBack` command: opens the previous location's file (via
     /// `open_or_focus_tab`, switching tabs if already open) and places
@@ -151,8 +161,8 @@ Go to Line for a binding conflict) for precedent:
 | `open_location` | **Yes** | Direct match for `ide-ui`'s `open_at`. `ide-tui` already consolidates what `ide-ui` keeps as two separate functions (`open_at` for LSP jumps, `open_stack_frame` for debugger jumps) into this one function (`open_stack_frame` here just calls `open_location` internally) -- adding the push here alone covers **both** cases, a TUI-specific simplification worth noting for anyone diffing against `ide-ui`'s two call sites. |
 | `open_search_result` | **Yes** | Direct match for `ide-ui`'s `open_search_result`. |
 | `handle_tree_enter` | **Yes** | Direct match for `ide-ui`'s tree-click handler (`render.rs:4249`, `open_file` then `push_nav_location`). Push after a successful `open_or_focus_tab`, not on the directory-toggle branch. |
-| `confirm_go_to_file` | **Yes** | Same "pick a file from a list, open it" shape as the tree click; `ide-ui` has no separate Go to File precedent to mirror, but the underlying action (open a new file, land at a new location) is identical in kind. Push after the successful `open_or_focus_tab`, before the offset-0 caret reset. |
-| `confirm_bookmark_jump` | **Yes** | `ide-ui` has no Bookmarks feature at all (`ide-tui`-only), so no direct precedent -- judgment call, reasoned from `ide-ui`'s own stated invariant (§2.1 above): Bookmarks is an independent list, not itself sourced from `nav` (unlike Recent Locations, which `ide-ui`'s `recent_locations_confirm` deliberately excludes for exactly that self-referential-growth reason -- `crates/ui/src/app.rs:2259-2273`). Jumping from an independent list to a new caret position is exactly the shape every other "yes" row already has. Push after the successful `open_or_focus_tab`, before the best-effort caret placement. |
+| `confirm_go_to_file` | **Yes** | Same "pick a file from a list, open it" shape as the tree click; `ide-ui` has no separate Go to File precedent to mirror, but the underlying action (open a new file, land at a new location) is identical in kind. Push *after* the successful `open_or_focus_tab` **and** after its own explicit offset-0 caret reset (unlike every other "Yes" row, which pushes before any caret placement) -- pushing first would read whatever stale caret the buffer had before this jump, since the reset is what actually sets it to `0`. |
+| `confirm_bookmark_jump` | **Yes** | `ide-ui` has no Bookmarks feature at all (`ide-tui`-only), so no direct precedent -- judgment call, reasoned from `ide-ui`'s own stated invariant (§2.1 above): Bookmarks is an independent list, not itself sourced from `nav_history` (unlike Recent Locations, which `ide-ui`'s `recent_locations_confirm` deliberately excludes for exactly that self-referential-growth reason -- `crates/ui/src/app.rs:2259-2273`). Jumping from an independent list to a new caret position is exactly the shape every other "yes" row already has. Push after the successful `open_or_focus_tab`, before the best-effort caret placement. |
 | `confirm_new_scratch_file` | **Yes** | Creates and opens a brand-new file -- changes the active tab exactly like any other open. `ide-ui` has no scratch-files feature to mirror; reasoned the same way as `confirm_go_to_file`. Push after the successful `open_or_focus_tab`. |
 | `confirm_scratch_file` | **Yes** | Opens an existing scratch file chosen from a list -- same "pick from a list, open it" shape as `confirm_go_to_file`. Push after the successful `open_or_focus_tab`. |
 | `confirm_recent_file` | **No** | Direct match for `ide-ui`'s `recent_files_confirm` (`crates/ui/src/app.rs:2176-2183`), which deliberately does not call `push_nav_location` -- Recent Files' whole point is "go back to where you already were" (it doesn't move the caret at all), so pushing a nav entry here would be pushing a location the user didn't actually navigate *to* in the offset sense. Same reasoning `ide-tui`'s own doc comment on `confirm_recent_file` already gives for not touching the caret. |
@@ -160,24 +170,26 @@ Go to Line for a binding conflict) for precedent:
 Every "Yes" row passes the target offset explicitly (`push_nav_location`
 takes it as a parameter, §2.2) rather than relying on a deferred field:
 `open_location`/`open_search_result` pass the offset they're about to
-place the caret at; `confirm_go_to_file`/`confirm_new_scratch_file`/
-`confirm_scratch_file`/`handle_tree_enter` pass `0`; `confirm_bookmark_jump`
-passes the resolved line-start offset (or skips the push entirely if the
-bookmarked line no longer resolves, mirroring its own existing
-permissive-`None` handling).
+place the caret at; `confirm_bookmark_jump` passes the resolved line-start
+offset (or skips the push entirely if the bookmarked line no longer
+resolves, mirroring its own existing permissive-`None` handling).
 
-The `0` for `confirm_go_to_file`/`confirm_new_scratch_file` is exact (both
-explicitly place the caret at offset 0 after opening). For
-`confirm_scratch_file`/`handle_tree_enter`, `0` is only exact when the
-target wasn't already open — `open_or_focus_tab`'s already-open branch
-just refocuses the existing tab without touching its live caret, so the
-recorded `0` can under-report the real position in that case. This is not
-a new TUI inaccuracy: it's the identical imprecision `ide-ui`'s own tree
-click already has (its `pending_cursor_offset` is `None` — thus also
-defaults to `0` — for that same already-open-tab case, since nothing sets
-it between `open_file` and `push_nav_location` there either). Accepted
-as-is rather than fixed here, to stay a faithful port rather than a
-silent behavior change beyond what the doc asks for.
+`confirm_go_to_file`/`confirm_new_scratch_file`/`confirm_scratch_file`/
+`handle_tree_enter` instead pass `App::active_caret_offset()` — the active
+buffer's actual current-caret offset, read *after* `open_or_focus_tab`
+returns (and, for `confirm_go_to_file` specifically, after its own
+explicit offset-0 caret reset). This is a deliberate deviation from a
+literal port of `ide-ui`'s own `pending_cursor_offset` mechanism: `ide-ui`
+records `0` unconditionally for these cases (via a `None` deferred field
+that defaults to `0`), which under-reports the real position whenever
+`open_or_focus_tab`/`open_file`'s already-open branch refocuses a tab
+without touching its live caret. `ide-tui` fixes this rather than
+reproducing it — reading the live caret costs one extra call and is
+correct in every case (a freshly-opened tab's caret is `0` by construction,
+so the two approaches agree there; they only diverge on the already-open
+case, where the live read is simply right). `crates/tui/src/app.rs`'s
+`reopening_an_already_open_tab_pushes_its_real_caret_not_zero` test is the
+regression test for this.
 
 ### 2.4 Keybinding (`crates/tui/src/commands.rs`)
 
@@ -295,8 +307,9 @@ finding).
 
 ## 6. Dependencies & integration points
 
-- `crates/tui/src/app.rs`: new `nav` field, `push_nav_location`/
-  `nav_back`/`nav_forward` methods, and the 7 call-site edits in §2.3.
+- `crates/tui/src/app.rs`: new `nav_history` field, `push_nav_location`/
+  `nav_back`/`nav_forward`/`active_caret_offset` methods, and the 7
+  call-site edits in §2.3.
 - `crates/tui/src/commands.rs`: two new `Action` variants and their
   bindings (§2.4).
 - No `ide-core`/`ide-lsp`/`ide-dap` changes — this is pure `ide-tui`
@@ -309,3 +322,21 @@ finding).
   by this doc). Not on `CLAUDE.md`'s declared security-sensitive-paths
   list; `hacker` is skipped for this run per the `dev-chain` skill's own
   rule.
+
+## Revision notes
+
+Post-merge fix round, addressing two `rev` controversial findings the
+user asked to act on rather than leave as accepted tradeoffs:
+
+- Renamed the `nav` field to `nav_history` (§2.2) to remove the
+  at-a-glance confusability with the pre-existing, unrelated `nav_state`
+  field sitting next to it in `App`.
+- Fixed the offset-0 imprecision at `confirm_go_to_file`/
+  `confirm_new_scratch_file`/`confirm_scratch_file`/`handle_tree_enter`
+  (§2.3) instead of accepting it as a faithfully-ported `ide-ui`
+  limitation: these now push `App::active_caret_offset()` (a new method,
+  §2.2) — the buffer's real live caret — rather than a hardcoded `0`,
+  which was wrong whenever `open_or_focus_tab` refocused a tab that was
+  already open. `confirm_go_to_file`'s push also moved to *after* its own
+  explicit offset-0 caret reset, since reading the caret before that reset
+  would read the stale pre-jump value instead.
