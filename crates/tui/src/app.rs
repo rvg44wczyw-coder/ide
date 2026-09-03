@@ -35,7 +35,7 @@ use crate::editor::{
 use crate::files_search::FilesSearchPanel;
 use crate::find::{FindField, FindState};
 use crate::folding::{self, VisualLines};
-use crate::git_panel::GitPanel;
+use crate::git_panel::{GitPanel, WorktreeAddField};
 use crate::k8s_panel::{K8sPanel, K8sPicker, K8sTab};
 use crate::keymap::{self, KeymapOverlay};
 use crate::lsp_bridge::LspBridge;
@@ -2973,6 +2973,15 @@ impl App {
         if self.git.branches_popup.open {
             return self.handle_git_branches_key(key);
         }
+        if self.git.worktrees_popup.pending_force_remove.is_some() {
+            return self.handle_git_worktree_remove_confirm_key(key);
+        }
+        if self.git.worktrees_popup.adding {
+            return self.handle_git_worktree_add_key(key);
+        }
+        if self.git.worktrees_popup.open {
+            return self.handle_git_worktrees_key(key);
+        }
         if self.git.active_conflict.is_some() || self.git.binary_conflict.is_some() {
             match key.code {
                 KeyCode::Esc => self.git.cancel_conflict(),
@@ -3463,6 +3472,103 @@ impl App {
         LoopSignal::Continue
     }
 
+    /// Worktrees popup normal navigation, reached only while `git.
+    /// worktrees_popup.open` and neither `adding` nor
+    /// `pending_force_remove` is set (`docs/features/tui-git-worktrees.md`
+    /// §2.2).
+    fn handle_git_worktrees_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.git.close_worktrees_popup(),
+            KeyCode::Up => {
+                self.git.worktrees_popup.selected =
+                    self.git.worktrees_popup.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let count = self.git.worktrees_popup.worktrees.len();
+                if self.git.worktrees_popup.selected + 1 < count {
+                    self.git.worktrees_popup.selected += 1;
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(name) = self
+                    .git
+                    .worktrees_popup
+                    .worktrees
+                    .get(self.git.worktrees_popup.selected)
+                    .map(|wt| wt.name.clone())
+                {
+                    self.git.remove_worktree(&name, false);
+                }
+            }
+            KeyCode::Char('n') => {
+                self.git.worktrees_popup.adding = true;
+                self.git.worktrees_popup.add_field = WorktreeAddField::Name;
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Add-worktree form text entry, reached only while `git.
+    /// worktrees_popup.adding` (`docs/features/tui-git-worktrees.md`
+    /// §2.2). `Tab`/`Shift+Tab` cycle which of the three fields
+    /// `Backspace`/`Char` edit.
+    fn handle_git_worktree_add_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => {
+                self.git.worktrees_popup.adding = false;
+                self.git.worktrees_popup.new_name.clear();
+                self.git.worktrees_popup.new_path.clear();
+                self.git.worktrees_popup.new_branch.clear();
+            }
+            KeyCode::Tab => {
+                self.git.worktrees_popup.add_field = self.git.worktrees_popup.add_field.next();
+            }
+            KeyCode::BackTab => {
+                self.git.worktrees_popup.add_field = self.git.worktrees_popup.add_field.prev();
+            }
+            KeyCode::Enter => self.git.create_worktree(),
+            KeyCode::Backspace => {
+                let field = match self.git.worktrees_popup.add_field {
+                    WorktreeAddField::Name => &mut self.git.worktrees_popup.new_name,
+                    WorktreeAddField::Path => &mut self.git.worktrees_popup.new_path,
+                    WorktreeAddField::Branch => &mut self.git.worktrees_popup.new_branch,
+                };
+                field.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let field = match self.git.worktrees_popup.add_field {
+                    WorktreeAddField::Name => &mut self.git.worktrees_popup.new_name,
+                    WorktreeAddField::Path => &mut self.git.worktrees_popup.new_path,
+                    WorktreeAddField::Branch => &mut self.git.worktrees_popup.new_branch,
+                };
+                field.push(c);
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Worktree-remove force-confirm interception, reached only while
+    /// `git.worktrees_popup.pending_force_remove.is_some()`
+    /// (`docs/features/tui-git-worktrees.md` §2.2). A second `r` on the
+    /// same still-pending worktree retries with `force: true` -- the
+    /// keyboard-native rendering of the inline "press r again to force
+    /// remove" affordance (§2.4), same shape
+    /// `handle_git_branch_delete_confirm_key` already uses for branches.
+    fn handle_git_worktree_remove_confirm_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.git.worktrees_popup.pending_force_remove = None,
+            KeyCode::Char('r') => {
+                if let Some(name) = self.git.worktrees_popup.pending_force_remove.clone() {
+                    self.git.remove_worktree(&name, true);
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
     /// `GitBranches` command (palette-only, no default binding -- see
     /// `commands.rs`): opens the Git Panel if it wasn't already, then
     /// opens the branches popup over whichever view was active.
@@ -3471,6 +3577,16 @@ impl App {
             self.toggle_git_panel();
         }
         self.git.open_branches_popup(&self.project_root);
+    }
+
+    /// `GitWorktrees` command (palette-only, no default binding -- see
+    /// `commands.rs`): opens the Git Panel if it wasn't already, then
+    /// opens the worktrees popup over whichever view was active.
+    fn trigger_git_worktrees(&mut self) {
+        if self.git_panel.is_none() {
+            self.toggle_git_panel();
+        }
+        self.git.open_worktrees_popup(&self.project_root);
     }
 
     /// `ShowFileHistory` command (palette-only -- see `commands.rs`):
@@ -4575,6 +4691,7 @@ impl App {
             Action::Rename => self.trigger_rename(),
             Action::ToggleGitPanel => self.toggle_git_panel(),
             Action::GitBranches => self.trigger_git_branches(),
+            Action::GitWorktrees => self.trigger_git_worktrees(),
             Action::ShowFileHistory => self.trigger_show_file_history(),
             Action::ToggleBlameAnnotations => self.toggle_blame_annotations(),
             Action::ShowBlameForCurrentLine => self.show_blame_for_current_line(),

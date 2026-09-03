@@ -29,7 +29,7 @@ use crate::claude_terminal::{AnsiColor, Cell};
 use crate::docker_panel::DockerTab;
 use crate::editor::cursor_line_column;
 use crate::folding::VisualLines;
-use crate::git_panel::assign_lanes;
+use crate::git_panel::{assign_lanes, WorktreeAddField};
 use crate::highlight::{
     document_highlight_marks, inlay_hint_chips, semantic_token_marks, styled_line, LineOverlays,
 };
@@ -1815,6 +1815,9 @@ fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
     if app.git.branches_popup.open {
         render_git_branches_popup(frame, app, popup);
     }
+    if app.git.worktrees_popup.open {
+        render_git_worktrees_popup(frame, app, popup);
+    }
 }
 
 fn render_git_log_view(
@@ -2090,6 +2093,103 @@ fn render_git_branches_popup(frame: &mut Frame, app: &App, area: Rect) {
             .to_string()
     };
     let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// `docs/features/tui-git-worktrees.md` §2.4.
+fn render_git_worktrees_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.clamp(30, 70).min(area.width);
+    let height = area.height.clamp(6, 16).min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let state = &app.git.worktrees_popup;
+
+    if state.adding {
+        let field_marker = |field: WorktreeAddField| {
+            if state.add_field == field {
+                ">"
+            } else {
+                " "
+            }
+        };
+        let branch_value = if state.new_branch.is_empty() && !state.new_name.is_empty() {
+            format!("(new branch named {})", state.new_name)
+        } else {
+            state.new_branch.clone()
+        };
+        let mut items = vec![
+            ListItem::new(Line::from(format!(
+                "{} Name: {}",
+                field_marker(WorktreeAddField::Name),
+                state.new_name
+            ))),
+            ListItem::new(Line::from(format!(
+                "{} Path: {}",
+                field_marker(WorktreeAddField::Path),
+                state.new_path
+            ))),
+            ListItem::new(Line::from(format!(
+                "{} Branch: {}",
+                field_marker(WorktreeAddField::Branch),
+                branch_value
+            ))),
+        ];
+        if let Some(error) = state.error.as_ref() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                error.clone(),
+                Style::default().fg(Color::Red),
+            ))));
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Add Worktree  (Tab: next field, Enter: create, Esc: cancel)");
+        frame.render_widget(List::new(items).block(block), popup);
+        return;
+    }
+
+    let selected = state.selected;
+    let mut items: Vec<ListItem> = state
+        .worktrees
+        .iter()
+        .enumerate()
+        .map(|(i, wt)| {
+            let style = if i == selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let branch = wt.branch.as_deref().unwrap_or("(detached / unavailable)");
+            let mut label = format!("{}  {}  {}", wt.name, branch, wt.path.display());
+            if wt.is_locked {
+                label.push_str("  [locked]");
+            }
+            if state.pending_force_remove.as_deref() == Some(wt.name.as_str()) {
+                label.push_str(
+                    "  (has uncommitted changes or is locked -- press r again to force remove)",
+                );
+            }
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from("No worktrees.")));
+    }
+    if let Some(error) = state.error.as_ref() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        ))));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Worktrees  (r: remove, n: add, Esc: close)");
     frame.render_widget(List::new(items).block(block), popup);
 }
 
