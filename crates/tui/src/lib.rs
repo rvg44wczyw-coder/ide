@@ -34,6 +34,7 @@ mod blame_gutter;
 mod cargo_panel;
 mod claude_panel;
 mod claude_terminal;
+mod clone_panel;
 mod commands;
 mod debug_config;
 mod debug_panel;
@@ -241,6 +242,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // in-flight receiver, since a fresh fetch is cheap to re-request.
         app.poll_docker();
         app.poll_k8s();
+        // Only while a clone is actually running -- `poll_clone` itself
+        // guards on `is_running()` (`docs/features/tui-git-clone.md` §2.4,
+        // T34).
+        app.poll_clone();
         // Same reasoning, for external file-system changes (tree refresh,
         // a tab's file modified/deleted on disk) delivered by the
         // background file watcher (`docs/features/tui-file-watcher.md`

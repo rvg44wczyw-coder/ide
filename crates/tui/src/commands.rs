@@ -242,6 +242,7 @@ pub enum Action {
     ShowBlameForCurrentLine,
     NavigateBack,
     NavigateForward,
+    ToggleClonePanel,
     Exit,
 }
 
@@ -955,6 +956,16 @@ pub fn commands() -> &'static [Command] {
             // (`docs/features/tui-tool-window-docking.md` §2.1).
             binding: None,
             action: Action::ToggleBottomDockFocus,
+        },
+        Command {
+            id: "ToggleClonePanel",
+            title: "Clone Repository",
+            // Palette-only, same reasoning as `ToggleDockerPanel`/
+            // `ToggleGitPanel` above -- no JetBrains macOS keymap this
+            // project tracks binds a clone dialog to a fixed key
+            // (`docs/features/tui-git-clone.md` §2.2).
+            binding: None,
+            action: Action::ToggleClonePanel,
         },
         Command {
             id: "Exit",

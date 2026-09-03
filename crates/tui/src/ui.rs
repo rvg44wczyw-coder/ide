@@ -27,6 +27,7 @@ use crate::app::{
 };
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
+use crate::clone_panel::ClonePanelField;
 use crate::docker_panel::DockerTab;
 use crate::editor::cursor_line_column;
 use crate::folding::VisualLines;
@@ -156,6 +157,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     if app.git_panel.is_some() {
         render_git_panel(frame, app, size);
+    }
+    if app.clone_panel_open {
+        render_clone_panel(frame, app, size);
     }
     if app.go_to_file.is_some() {
         render_go_to_file_popup(frame, app, size);
@@ -2271,6 +2275,70 @@ fn render_git_worktrees_popup(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Worktrees  (r: remove, n: add, Esc: close)");
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// The standalone Clone Repository popup (`docs/features/tui-git-clone.md`
+/// §2.3/§3.1, T34) -- same `Clear`-plus-centered-`Rect` construction as
+/// `render_git_worktrees_popup` above, but not nested inside the full Git
+/// Panel: `app.clone_panel_open` gates this independently of
+/// `app.git_panel`.
+fn render_clone_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.clamp(40, 70).min(area.width);
+    let height = area.height.clamp(6, 8).min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let state = &app.clone;
+    let field_marker = |field: ClonePanelField| {
+        if state.field == field {
+            ">"
+        } else {
+            " "
+        }
+    };
+    let mut items = vec![
+        ListItem::new(Line::from(format!(
+            "{} URL: {}",
+            field_marker(ClonePanelField::Url),
+            state.url
+        ))),
+        ListItem::new(Line::from(format!(
+            "{} Destination: {}",
+            field_marker(ClonePanelField::Destination),
+            state.destination
+        ))),
+    ];
+    if let Some(error) = state.error.as_ref() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        ))));
+    } else if let Some(progress) = state.progress {
+        let text = if progress.total_objects > 0 {
+            format!(
+                "{}/{} objects",
+                progress.received_objects, progress.total_objects
+            )
+        } else {
+            "Cloning…".to_string()
+        };
+        items.push(ListItem::new(Line::from(text)));
+    } else if let Some(path) = state.done.as_ref() {
+        items.push(ListItem::new(Line::from(format!(
+            "Cloned to {}",
+            path.display()
+        ))));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Clone Repository  (Tab: next field, Enter: clone, Esc: close)");
     frame.render_widget(List::new(items).block(block), popup);
 }
 
