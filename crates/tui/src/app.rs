@@ -587,6 +587,14 @@ pub struct App {
     /// never a failure to open the project.
     watcher: Option<FileWatcher>,
     pub(crate) keymap: KeymapOverlay,
+    /// `Some` only ever set by a test, to redirect `persist_keymap`'s
+    /// writes to a tempdir instead of the real `$HOME/.config/ide-tui/
+    /// keymap.json` -- without it, a test exercising rebind-capture/
+    /// reset would corrupt the machine's actual keymap file (and, since
+    /// `cargo test` runs this crate's tests in one process, race every
+    /// other concurrently-running test's `App::new` -> `keymap::load()`
+    /// against that corruption). Always `None` in production.
+    keymap_path_override: Option<std::path::PathBuf>,
     pub(crate) keymap_popup: Option<KeymapPopupState>,
     pub(crate) new_scratch_file: Option<NewScratchFileState>,
     pub(crate) scratch_files: Option<ScratchFilesState>,
@@ -739,6 +747,7 @@ impl App {
             todo_panel: None,
             watcher,
             keymap: crate::keymap::load(),
+            keymap_path_override: None,
             keymap_popup: None,
             new_scratch_file: None,
             scratch_files: None,
@@ -4527,7 +4536,7 @@ impl App {
             Action::ToggleKeymapSettings => self.toggle_keymap_popup(),
             Action::ResetAllKeybindings => {
                 self.keymap.reset_all();
-                keymap::save(&self.keymap);
+                self.persist_keymap();
                 self.notify("Reset all keybindings to default.");
             }
             Action::NewScratchFile => self.toggle_new_scratch_file(),
@@ -5691,6 +5700,16 @@ impl App {
         LoopSignal::Continue
     }
 
+    /// The one place `self.keymap` is written to disk -- routes through
+    /// `keymap_path_override` when a test has set one, otherwise the real
+    /// `keymap::save` (`$HOME/.config/ide-tui/keymap.json`).
+    fn persist_keymap(&self) {
+        match &self.keymap_path_override {
+            Some(path) => keymap::save_to(path, &self.keymap),
+            None => keymap::save(&self.keymap),
+        }
+    }
+
     /// Enters capture mode for the currently-selected row -- no-op if
     /// nothing is selected (e.g. an empty filtered list).
     fn start_keymap_capture(&mut self) {
@@ -5715,7 +5734,7 @@ impl App {
         let id = self.keymap_popup_rows().get(state.selected).map(|c| c.id);
         if let Some(id) = id {
             self.keymap.reset(id);
-            keymap::save(&self.keymap);
+            self.persist_keymap();
             self.notify(format!("Reset \"{id}\" to its default binding."));
         }
     }
@@ -5735,7 +5754,7 @@ impl App {
         let chord = (key.modifiers, key.code);
         let conflicts = self.keymap.conflicts(id, chord);
         self.keymap.set_override(id, Some(chord));
-        keymap::save(&self.keymap);
+        self.persist_keymap();
         if let Some(state) = self.keymap_popup.as_mut() {
             state.capturing = None;
         }
@@ -12587,7 +12606,9 @@ mod tests {
     #[test]
     fn capturing_a_new_chord_rebinds_and_a_later_key_press_dispatches_the_new_action() {
         let dir = sample_project();
+        let keymap_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap_path_override = Some(keymap_dir.path().join("keymap.json"));
         app.run_action(Action::ToggleKeymapSettings);
         // "Save" is the first registered command (`commands.rs`'s own
         // table order).
@@ -12630,7 +12651,9 @@ mod tests {
     #[test]
     fn capture_surfaces_a_conflict_notification_but_still_applies_the_binding() {
         let dir = sample_project();
+        let keymap_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap_path_override = Some(keymap_dir.path().join("keymap.json"));
         app.run_action(Action::ToggleKeymapSettings);
         app.handle_key(plain_key(KeyCode::Enter)); // capture "SaveAll"
 
@@ -12647,10 +12670,12 @@ mod tests {
     #[test]
     fn delete_resets_a_customized_row_to_its_default() {
         let dir = sample_project();
+        let keymap_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap_path_override = Some(keymap_dir.path().join("keymap.json"));
         app.keymap
             .set_override("SaveAll", Some((KeyModifiers::CONTROL, KeyCode::Char('x'))));
-        keymap::save(&app.keymap);
+        app.persist_keymap();
         app.run_action(Action::ToggleKeymapSettings);
 
         app.handle_key(plain_key(KeyCode::Delete));
@@ -12665,7 +12690,9 @@ mod tests {
     #[test]
     fn reset_all_keybindings_action_clears_every_override() {
         let dir = sample_project();
+        let keymap_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap_path_override = Some(keymap_dir.path().join("keymap.json"));
         app.keymap
             .set_override("SaveAll", Some((KeyModifiers::CONTROL, KeyCode::Char('x'))));
         app.keymap.set_override("Undo", None);
