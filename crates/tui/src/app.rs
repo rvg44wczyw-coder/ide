@@ -6283,7 +6283,7 @@ mod tests {
     /// (T11's own helpers, above) do the actual `git` subprocess work.
     fn git_repo_without_commits() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        run_git(dir.path(), &["init", "-q"]);
+        init_git_repo(dir.path());
         dir
     }
 
@@ -9748,9 +9748,24 @@ mod tests {
         run_git(dir, &["commit", "-q", "-m", message]);
     }
 
+    /// `-b main` and a repo-local identity make these repos independent of
+    /// the runner's ambient git config: `init.defaultBranch` isn't set on
+    /// every CI image (tests that `checkout main` later would otherwise
+    /// fail with a "pathspec 'main' did not match" error), and `GitRepo`'s
+    /// production commit path goes through git2, which reads `user.name`/
+    /// `user.email` from git config -- never from the `GIT_AUTHOR_NAME`
+    /// env vars `run_git` sets for its own `git` CLI subprocess -- so a
+    /// runner with no global identity configured fails signature creation
+    /// (mirrors the fix already applied to `ide-core`'s own git tests).
+    fn init_git_repo(dir: &std::path::Path) {
+        run_git(dir, &["init", "-q", "-b", "main"]);
+        run_git(dir, &["config", "user.name", "Test"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+    }
+
     fn sample_git_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        run_git(dir.path(), &["init", "-q"]);
+        init_git_repo(dir.path());
         git_commit(dir.path(), "a.txt", "hello\nworld", "first");
         dir
     }
