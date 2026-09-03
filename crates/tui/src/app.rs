@@ -23,6 +23,7 @@ use ide_lsp::{Diagnostic, Location, LspRequest, Position, Symbol};
 use crate::cargo_panel::{CargoCommand, CargoPanel};
 use crate::claude_panel::ClaudePanel;
 use crate::claude_terminal::{self, ClaudeTerminalPanel};
+use crate::clone_panel::{ClonePanel, ClonePanelField, ClonePollResult};
 use crate::commands::{commands, Action, Command};
 use crate::debug_config::{self, DebugAdapterConfig, DebugAdapterEntry};
 use crate::debug_panel::DebugPanel;
@@ -750,6 +751,12 @@ pub struct App {
     pub(crate) left_dock_width_pct: u16,
     pub(crate) bottom_dock_height_pct: u16,
     pub(crate) git_log_dock: GitLogDockState,
+    /// Always alive; visibility is `clone_panel_open`, not `Option`-ness
+    /// (`docs/features/tui-git-clone.md` §2.4/§3.4, T34) -- a background
+    /// clone must keep running, and its progress must stay readable,
+    /// across the popup being closed and reopened.
+    pub(crate) clone: ClonePanel,
+    pub(crate) clone_panel_open: bool,
     /// The one detected project language, retained instead of being a
     /// `let` local `App::new` discards after starting the LSP server
     /// (`docs/features/tui-debugger.md` §2.2) -- `None` for an
@@ -882,6 +889,8 @@ impl App {
             left_dock_width_pct: 30,
             bottom_dock_height_pct: 30,
             git_log_dock: GitLogDockState::default(),
+            clone: ClonePanel::default(),
+            clone_panel_open: false,
             language,
             debug_adapters,
             debug: DebugPanel::default(),
@@ -951,6 +960,30 @@ impl App {
     /// Same reasoning as `poll_docker`, for the Kubernetes panel.
     pub fn poll_k8s(&mut self) {
         self.k8s.poll();
+    }
+
+    /// Called once per frame (`lib.rs`'s main loop) -- unlike
+    /// `poll_docker`/`poll_cargo`'s trivial `self.x.poll();` wrappers, this
+    /// one needs to act on the *result* of a poll (surface a completion
+    /// into the notification log), not just let `ClonePanel::poll` drain
+    /// into its own internal state (`docs/features/tui-git-clone.md`
+    /// §2.4). No-op while no clone is running, same guard `is_running()`
+    /// exists for.
+    pub fn poll_clone(&mut self) {
+        if !self.clone.is_running() {
+            return;
+        }
+        match self.clone.poll() {
+            Some(ClonePollResult::Succeeded(path)) => {
+                self.notify(format!("Cloned to {}", path.display()));
+            }
+            Some(ClonePollResult::Failed) => {
+                if let Some(e) = &self.clone.error {
+                    self.notify(format!("Clone failed: {e}"));
+                }
+            }
+            Some(ClonePollResult::Progress) | None => {}
+        }
     }
 
     /// Same shape, for a Find in Path search running in the background
@@ -1606,12 +1639,17 @@ impl App {
 
     /// Closes every true modal overlay (Goto picker, Notifications, Hover,
     /// Find in Path, Code Actions, Rename popup, Rename preview, the full
-    /// Git Panel, ...) -- called before opening any one of them, so at most
-    /// one is ever open at a time (`docs/features/tui-problems.md` §4,
-    /// extended by `docs/features/tui-cargo-panel.md` §4, `docs/features/
-    /// tui-hover-and-inlay-hints.md` §2.2, `docs/features/
-    /// tui-find-in-path.md` §3.1, and `docs/features/
-    /// tui-code-actions-and-rename.md` §2.3/§4). Does not touch
+    /// Git Panel, the Clone Repository popup, ...) -- called before opening
+    /// any one of them, so at most one is ever open at a time (`docs/
+    /// features/tui-problems.md` §4, extended by `docs/features/
+    /// tui-cargo-panel.md` §4, `docs/features/tui-hover-and-inlay-hints.md`
+    /// §2.2, `docs/features/tui-find-in-path.md` §3.1, `docs/features/
+    /// tui-code-actions-and-rename.md` §2.3/§4, and `docs/features/
+    /// tui-git-clone.md` §2.4/T34). Setting `clone_panel_open = false` here
+    /// only ever hides the popup -- `self.clone` itself (the background
+    /// clone's progress/error/done) is never touched by this function, the
+    /// same as every other field this function *doesn't* list resetting
+    /// (`tui-git-clone.md` §3.4 explains why). Does not touch
     /// `find`/`palette`, which sit at an outer interception tier in
     /// `handle_key` and are never open at the same time as one of these in
     /// the first place. Does not touch `left_dock`/`bottom_dock` either --
@@ -1644,6 +1682,7 @@ impl App {
         self.debug_panel_open = false;
         self.debug_adapter_config_popup = None;
         self.debug.show_launch_popup = false;
+        self.clone_panel_open = false;
     }
 
     /// Shared "ensure `left_dock` is open, on `tab`, and focused" mechanics
@@ -3121,6 +3160,56 @@ impl App {
         if opening {
             self.git_panel = Some(GitPanelState::default());
         }
+    }
+
+    /// `ToggleClonePanel` command (palette-only, no default binding -- see
+    /// `commands.rs`): opens/closes the Clone Repository popup
+    /// (`docs/features/tui-git-clone.md` §2.4/§3.4, T34). Unlike
+    /// `toggle_git_panel`, opening never resets `self.clone` -- a
+    /// background clone survives being closed and reopened, so `self.clone`
+    /// is only ever mutated by `ClonePanel::start`/`poll` themselves, never
+    /// by this toggle.
+    fn toggle_clone_panel(&mut self) {
+        let opening = !self.clone_panel_open;
+        self.close_all_overlays();
+        self.clone_panel_open = opening;
+    }
+
+    /// `crates/tui/src/clone_panel.rs`'s own key handling (`docs/features/
+    /// tui-git-clone.md` §3.2/§3.3). `Esc` only ever flips
+    /// `clone_panel_open` -- never `self.clone` (§3.4).
+    fn handle_clone_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.clone_panel_open = false,
+            KeyCode::Tab => self.clone.field = self.clone.field.next(),
+            KeyCode::BackTab => self.clone.field = self.clone.field.prev(),
+            KeyCode::Enter => {
+                if !self.clone.url.trim().is_empty()
+                    && !self.clone.destination.trim().is_empty()
+                    && !self.clone.is_running()
+                {
+                    self.clone.start();
+                }
+            }
+            KeyCode::Backspace if !self.clone.is_running() => {
+                let field = match self.clone.field {
+                    ClonePanelField::Url => &mut self.clone.url,
+                    ClonePanelField::Destination => &mut self.clone.destination,
+                };
+                field.pop();
+            }
+            KeyCode::Char(c)
+                if !self.clone.is_running() && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let field = match self.clone.field {
+                    ClonePanelField::Url => &mut self.clone.url,
+                    ClonePanelField::Destination => &mut self.clone.destination,
+                };
+                field.push(c);
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
     }
 
     /// `ToggleDockerPanel` command (palette-only, no default binding --
@@ -4607,6 +4696,9 @@ impl App {
         if self.git_panel.is_some() {
             return self.handle_git_panel_key(key);
         }
+        if self.clone_panel_open {
+            return self.handle_clone_panel_key(key);
+        }
         if self.keymap_popup.is_some() {
             return self.handle_keymap_popup_key(key);
         }
@@ -4681,6 +4773,7 @@ impl App {
             || self.blame_popup.is_some()
             || self.git_gutter_popup_line.is_some()
             || self.git_panel.is_some()
+            || self.clone_panel_open
             || self.keymap_popup.is_some()
             || self.new_scratch_file.is_some()
             || self.scratch_files.is_some()
@@ -5029,6 +5122,7 @@ impl App {
             Action::ConfigureDebugAdapter => self.toggle_debug_adapter_config_popup(),
             Action::NavigateBack => self.nav_back(),
             Action::NavigateForward => self.nav_forward(),
+            Action::ToggleClonePanel => self.toggle_clone_panel(),
             Action::Exit => return LoopSignal::Exit,
         }
         LoopSignal::Continue
@@ -10454,6 +10548,257 @@ mod tests {
 
         app.close_all_overlays();
         assert!(app.git_panel.is_none());
+    }
+
+    // -- T34: TUI Git Clone (`tui-git-clone.md`) --
+
+    #[test]
+    fn toggle_clone_panel_opens_and_closes() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.clone_panel_open);
+
+        app.toggle_clone_panel();
+        assert!(app.clone_panel_open);
+
+        app.toggle_clone_panel();
+        assert!(!app.clone_panel_open);
+    }
+
+    #[test]
+    fn toggle_clone_panel_leaves_a_dock_tab_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::Problems);
+
+        app.toggle_clone_panel();
+
+        assert!(app.clone_panel_open);
+        assert!(app.problems_open());
+    }
+
+    #[test]
+    fn toggle_clone_panel_closes_the_git_panel_and_vice_versa() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        assert!(app.git_panel.is_some());
+
+        app.toggle_clone_panel();
+        assert!(app.clone_panel_open);
+        assert!(
+            app.git_panel.is_none(),
+            "opening one true modal closes the other, same as every other pair"
+        );
+
+        app.toggle_git_panel();
+        assert!(app.git_panel.is_some());
+        assert!(!app.clone_panel_open);
+    }
+
+    #[test]
+    fn toggle_clone_panel_never_resets_clone_state() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+        app.clone.url = "https://example.com/repo.git".to_string();
+        app.clone.destination = "/tmp/wherever".to_string();
+
+        app.toggle_clone_panel(); // close
+        assert!(!app.clone_panel_open);
+        assert_eq!(app.clone.url, "https://example.com/repo.git");
+        assert_eq!(app.clone.destination, "/tmp/wherever");
+
+        app.toggle_clone_panel(); // reopen
+        assert!(app.clone_panel_open);
+        assert_eq!(app.clone.url, "https://example.com/repo.git");
+        assert_eq!(app.clone.destination, "/tmp/wherever");
+    }
+
+    #[test]
+    fn close_all_overlays_closes_the_clone_panel_but_never_touches_clone_state() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+        app.clone.url = "https://example.com/repo.git".to_string();
+        assert!(app.clone_panel_open);
+
+        app.close_all_overlays();
+
+        assert!(!app.clone_panel_open);
+        assert_eq!(app.clone.url, "https://example.com/repo.git");
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_clone_panel() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.toggle_clone_panel();
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn handle_clone_panel_key_tab_and_backtab_cycle_the_two_fields() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+        assert_eq!(app.clone.field, ClonePanelField::Url);
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.clone.field, ClonePanelField::Destination);
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.clone.field, ClonePanelField::Url);
+
+        app.handle_key(plain_key(KeyCode::BackTab));
+        assert_eq!(app.clone.field, ClonePanelField::Destination);
+    }
+
+    #[test]
+    fn handle_clone_panel_key_char_and_backspace_edit_the_focused_field() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+
+        for c in "https://x".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.clone.url, "https://x");
+        assert_eq!(app.clone.destination, "");
+
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.clone.url, "https://");
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Char('/')));
+        app.handle_key(plain_key(KeyCode::Char('t')));
+        assert_eq!(app.clone.destination, "/t");
+        assert_eq!(
+            app.clone.url, "https://",
+            "editing Destination doesn't touch Url"
+        );
+    }
+
+    #[test]
+    fn handle_clone_panel_key_char_ignores_control_modified_keys() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.clone.url, "");
+    }
+
+    #[test]
+    fn handle_clone_panel_key_enter_is_a_noop_when_a_field_is_empty() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+        app.clone.url = "https://example.com/repo.git".to_string();
+        // `destination` left empty.
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(!app.clone.is_running());
+    }
+
+    #[test]
+    fn handle_clone_panel_key_enter_starts_a_clone_when_both_fields_are_set() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+        app.clone.url = "https://example.com/repo.git".to_string();
+        // A destination whose parent directory doesn't exist either --
+        // `clone_repo` fails creating it locally, before any network I/O,
+        // keeping this test fast and offline (same reasoning as
+        // `clone_panel.rs`'s own `start_then_poll_eventually_reports_
+        // failure_for_a_bad_destination`).
+        app.clone.destination = "/nonexistent-root-does-not-exist-abc123/x".to_string();
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.clone.is_running());
+    }
+
+    #[test]
+    fn handle_clone_panel_key_enter_is_a_noop_while_already_running() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+        app.clone.url = "https://example.com/repo.git".to_string();
+        app.clone.destination = "/nonexistent-root-does-not-exist-abc123/x".to_string();
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(app.clone.is_running());
+
+        // A second Enter while running must not start a second thread --
+        // editing is also blocked, so the fields can't have changed either.
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        assert_eq!(app.clone.url, "https://example.com/repo.git");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.clone.is_running() {
+            app.poll_clone();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "clone never reported a terminal result"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.clone.error.is_some());
+        assert!(app
+            .notifications
+            .iter()
+            .any(|n| n.message.starts_with("Clone failed:")));
+    }
+
+    #[test]
+    fn handle_clone_panel_key_esc_closes_without_touching_clone_state() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_clone_panel();
+        app.clone.url = "https://example.com/repo.git".to_string();
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.clone_panel_open);
+        assert_eq!(app.clone.url, "https://example.com/repo.git");
+    }
+
+    #[test]
+    fn poll_clone_notifies_on_success() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        // Cloning `dir` itself (a real git repository, not just any
+        // directory -- `clone_repo`/`RepoBuilder::clone` requires a valid
+        // source repo) onto a local destination is a same-filesystem clone
+        // `clone_repo` can complete near-instantly with no network I/O,
+        // matching `git-remote.md`'s own local-clone examples.
+        let source = dir.path().to_str().unwrap().to_string();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::remove_dir(dest.path()).unwrap(); // clone_repo creates it
+        app.clone.url = source;
+        app.clone.destination = dest.path().to_str().unwrap().to_string();
+
+        app.clone.start();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.clone.is_running() {
+            app.poll_clone();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "clone never reported a terminal result"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(app.clone.done.is_some());
+        assert!(app
+            .notifications
+            .iter()
+            .any(|n| n.message.starts_with("Cloned to ")));
     }
 
     #[test]

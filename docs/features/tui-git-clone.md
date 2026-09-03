@@ -392,3 +392,32 @@ different destinations) by any key sequence.
    copy of `url`/`dest` by that point, so editing the displayed fields
    could never affect it. Reworded to state the real reason: UI clarity,
    not correctness.
+
+### Round 2 (post-implementation, two filled-in details)
+
+Two behaviors the doc implied but never stated outright, both filled in
+during implementation and worth recording explicitly:
+
+1. **`toggle_clone_panel` closes every other true modal, and vice versa.**
+   §1/§2.4 place `clone_panel_open` "at the same tier" as `git_panel`/
+   `goto`/`notifications` in `handle_key`'s precedence chain, but never
+   said whether *opening* the clone popup also closes those other true
+   modals the way `toggle_git_panel` already closes everything via
+   `close_all_overlays`. It does: `toggle_clone_panel` calls
+   `close_all_overlays` exactly like `toggle_git_panel`, and
+   `close_all_overlays` itself gained `self.clone_panel_open = false` --
+   never `self.clone` itself, preserving §3.4's invariant. Without this,
+   opening Goto while the clone popup was open would have left both
+   simultaneously "open" (harmless for key routing, since only the
+   first match in `handle_key`'s chain ever wins, but wrong for
+   rendering -- both would draw overlapping popups).
+2. **`poll_clone` isn't a trivial wrapper like `poll_docker`/`poll_cargo`.**
+   §2.4 showed the per-frame poll block acting on `ClonePollResult`
+   directly; every other panel's poll method in this crate
+   (`poll_docker`/`poll_k8s`/`poll_cargo`) is a bare `self.x.poll();` with
+   no return-value handling, since none of them currently do anything
+   with a completion the way this feature's `notify()` calls need to.
+   `App::poll_clone` is therefore its own small function (guard on
+   `is_running()`, `match` the result, `notify()` on `Succeeded`/`Failed`)
+   rather than a one-line wrapper, called from `lib.rs`'s main loop
+   alongside the others.
