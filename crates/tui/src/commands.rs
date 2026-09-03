@@ -234,6 +234,8 @@ pub enum Action {
     ShowFileHistory,
     ToggleBlameAnnotations,
     ShowBlameForCurrentLine,
+    NavigateBack,
+    NavigateForward,
     Exit,
 }
 
@@ -877,6 +879,27 @@ pub fn commands() -> &'static [Command] {
             // Commit Details popup for a mouse-hostile terminal session).
             binding: None,
             action: Action::ShowBlameForCurrentLine,
+        },
+        Command {
+            id: "NavigateBack",
+            title: "Navigate Back",
+            // `⌘⌥←` translated -- `ide-ui`'s own binding for the same
+            // action (`crates/ui/src/command.rs` lines 607-622).
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                KeyCode::Left,
+            )),
+            action: Action::NavigateBack,
+        },
+        Command {
+            id: "NavigateForward",
+            title: "Navigate Forward",
+            // `⌘⌥→` translated.
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                KeyCode::Right,
+            )),
+            action: Action::NavigateForward,
         },
         Command {
             id: "Exit",

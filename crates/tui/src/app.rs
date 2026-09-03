@@ -39,6 +39,7 @@ use crate::git_panel::GitPanel;
 use crate::k8s_panel::{K8sPanel, K8sPicker, K8sTab};
 use crate::keymap::{self, KeymapOverlay};
 use crate::lsp_bridge::LspBridge;
+use crate::nav_history::{NavHistory, NavLocation};
 use crate::project_state::{self, ProjectNavigationState};
 use crate::scratch;
 use crate::search_panel::SearchPanel;
@@ -578,6 +579,11 @@ pub struct App {
     pub(crate) go_to_file: Option<GoToFileState>,
     pub(crate) go_to_symbol: Option<GoToSymbolState>,
     pub(crate) nav_state: ProjectNavigationState,
+    /// Back/forward jump history (`docs/features/
+    /// tui-back-forward-navigation.md`, T31) -- distinct from `nav_state`
+    /// above (Recent Files/Bookmarks); the two are unrelated concepts that
+    /// happen to share a name prefix.
+    pub(crate) nav: NavHistory,
     pub(crate) recent_files: Option<RecentFilesState>,
     pub(crate) bookmarks_popup: Option<BookmarksPopupState>,
     pub(crate) todo: TodoPanel,
@@ -741,6 +747,7 @@ impl App {
             go_to_file: None,
             go_to_symbol: None,
             nav_state: project_state::load(project.root()),
+            nav: NavHistory::default(),
             recent_files: None,
             bookmarks_popup: None,
             todo: TodoPanel::default(),
@@ -1445,6 +1452,7 @@ impl App {
         buf.buffer
             .text_buffer_mut()
             .set_selections(Selections::single(Selection::caret(offset)));
+        self.push_nav_location(offset);
     }
 
     /// `Ctrl+B` entry point (`docs/features/tui-goto-and-usages.md` §2.3).
@@ -1977,6 +1985,7 @@ impl App {
         buf.buffer
             .text_buffer_mut()
             .set_selections(Selections::single(Selection::caret(byte_offset)));
+        self.push_nav_location(byte_offset);
     }
 
     /// `Ctrl+Shift+N` entry point (`docs/features/
@@ -2048,6 +2057,7 @@ impl App {
             self.notify(err.to_string());
             return;
         }
+        self.push_nav_location(0);
         if let Some(buf) = self.active_buffer_mut() {
             buf.desired_column = None;
             buf.buffer
@@ -2409,6 +2419,10 @@ impl App {
             return;
         };
         let Some(offset) = buf.buffer.text_buffer().lines().line_start(bookmark.line) else {
+            return;
+        };
+        self.push_nav_location(offset);
+        let Some(buf) = self.active_buffer_mut() else {
             return;
         };
         Self::scroll_to_and_reveal(buf, bookmark.line);
@@ -4118,6 +4132,64 @@ impl App {
         self.active_tab.and_then(move |idx| self.tabs.get_mut(idx))
     }
 
+    /// Records the tab that is active **at call time** (path + `offset`)
+    /// as the new current entry in `nav` (`docs/features/
+    /// tui-back-forward-navigation.md` §2.2). No-op with no active tab --
+    /// every "open a new file" tab always has a path (unlike `ide-ui`,
+    /// which also guards against a never-saved untitled buffer), so that
+    /// case can't currently occur here, but the check costs nothing and
+    /// keeps this from panicking if that ever changes.
+    fn push_nav_location(&mut self, offset: usize) {
+        let Some(buf) = self.active_buffer() else {
+            return;
+        };
+        self.nav.push(NavLocation {
+            path: buf.path.clone(),
+            offset,
+        });
+    }
+
+    /// `NavigateBack` command (§2.2). No-op at the oldest entry. Never
+    /// calls `push_nav_location` itself -- every Back/Forward press would
+    /// otherwise immediately push a new forward-erasing entry (§3).
+    fn nav_back(&mut self) {
+        if !self.nav.can_go_back() {
+            return;
+        }
+        let Some(location) = self.nav.go_back() else {
+            return;
+        };
+        self.go_to_nav_location(location);
+    }
+
+    /// `NavigateForward` command (§2.2). Same shape as `nav_back`,
+    /// opposite direction.
+    fn nav_forward(&mut self) {
+        if !self.nav.can_go_forward() {
+            return;
+        }
+        let Some(location) = self.nav.go_forward() else {
+            return;
+        };
+        self.go_to_nav_location(location);
+    }
+
+    fn go_to_nav_location(&mut self, location: NavLocation) {
+        if let Err(err) = self.open_or_focus_tab(location.path) {
+            self.notify(err.to_string());
+            return;
+        }
+        let Some(buf) = self.active_buffer_mut() else {
+            return;
+        };
+        let (line, _) = cursor_line_column(buf.buffer.text_buffer(), location.offset);
+        Self::scroll_to_and_reveal(buf, line);
+        buf.desired_column = None;
+        buf.buffer
+            .text_buffer_mut()
+            .set_selections(Selections::single(Selection::caret(location.offset)));
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> LoopSignal {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return LoopSignal::Continue;
@@ -4552,6 +4624,8 @@ impl App {
             Action::PauseProgram => self.debug.pause(),
             Action::ToggleDebugPanel => self.toggle_debug_panel(),
             Action::ConfigureDebugAdapter => self.toggle_debug_adapter_config_popup(),
+            Action::NavigateBack => self.nav_back(),
+            Action::NavigateForward => self.nav_forward(),
             Action::Exit => return LoopSignal::Exit,
         }
         LoopSignal::Continue
@@ -4577,7 +4651,10 @@ impl App {
         }
         let path = row.path.clone();
         match self.open_or_focus_tab(path) {
-            Ok(()) => self.status = None,
+            Ok(()) => {
+                self.status = None;
+                self.push_nav_location(0);
+            }
             Err(err) => self.status = Some(err.to_string()),
         }
     }
@@ -5824,7 +5901,9 @@ impl App {
                 self.new_scratch_file = None;
                 if let Err(err) = self.open_or_focus_tab(path) {
                     self.notify(err.to_string());
+                    return;
                 }
+                self.push_nav_location(0);
             }
             Ok(None) => self.notify("could not resolve a scratch files directory (no $HOME)."),
             Err(err) => self.notify(err.to_string()),
@@ -5908,6 +5987,7 @@ impl App {
             self.notify(err.to_string());
             return;
         }
+        self.push_nav_location(0);
         self.scratch_files = None;
     }
 }
@@ -15219,5 +15299,236 @@ mod tests {
 
         app.handle_key(plain_key(KeyCode::F(9))); // ResumeProgram, no session: no-op
         assert!(!app.debug.is_active());
+    }
+
+    // -- T31: Back/Forward navigation
+    // (docs/features/tui-back-forward-navigation.md) --
+
+    #[test]
+    fn open_location_pushes_a_nav_entry_and_navigate_back_returns_to_the_prior_file() {
+        let dir = sample_project(); // a.txt: "hello\nworld", b.txt: "second file"
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.handle_key(plain_key(KeyCode::Down)); // sub, a.txt, b.txt -- land on a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.active_buffer().unwrap().path, root.join("a.txt"));
+
+        app.open_location(location(root.join("b.txt"), 0, 3));
+        assert_eq!(app.active_buffer().unwrap().path, root.join("b.txt"));
+
+        assert!(app.nav.can_go_back());
+        app.run_action(Action::NavigateBack);
+        assert_eq!(app.active_buffer().unwrap().path, root.join("a.txt"));
+
+        assert!(app.nav.can_go_forward());
+        app.run_action(Action::NavigateForward);
+        assert_eq!(app.active_buffer().unwrap().path, root.join("b.txt"));
+        assert_eq!(
+            app.active_buffer()
+                .unwrap()
+                .buffer
+                .text_buffer()
+                .selections()
+                .primary()
+                .head,
+            3
+        );
+    }
+
+    #[test]
+    fn navigate_back_at_the_oldest_entry_is_a_noop() {
+        let dir = sample_project();
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(root.join("a.txt")).unwrap();
+        app.push_nav_location(0);
+
+        app.run_action(Action::NavigateBack);
+
+        assert_eq!(app.active_buffer().unwrap().path, root.join("a.txt"));
+    }
+
+    #[test]
+    fn navigate_forward_at_the_newest_entry_is_a_noop() {
+        let dir = sample_project();
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(root.join("a.txt")).unwrap();
+        app.push_nav_location(0);
+
+        app.run_action(Action::NavigateForward);
+
+        assert_eq!(app.active_buffer().unwrap().path, root.join("a.txt"));
+    }
+
+    #[test]
+    fn navigate_back_and_forward_with_empty_history_do_not_panic() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.run_action(Action::NavigateBack);
+        app.run_action(Action::NavigateForward);
+
+        assert!(app.active_tab.is_none());
+    }
+
+    #[test]
+    fn repeated_jumps_within_one_file_coalesce_into_a_single_nav_entry() {
+        let dir = sample_project();
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(root.join("a.txt")).unwrap();
+        app.push_nav_location(0);
+
+        app.open_location(location(root.join("a.txt"), 1, 0)); // still a.txt
+
+        assert!(!app.nav.can_go_back());
+    }
+
+    #[test]
+    fn navigate_back_then_a_new_jump_truncates_the_forward_branch() {
+        let dir = sample_project();
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(root.join("a.txt")).unwrap();
+        app.push_nav_location(0);
+        app.open_location(location(root.join("b.txt"), 0, 0));
+
+        app.run_action(Action::NavigateBack); // back to a.txt
+        app.open_search_result(root.join("sub/c.txt"), 0); // new jump from the middle
+
+        assert!(!app.nav.can_go_forward());
+    }
+
+    #[test]
+    fn confirm_recent_file_does_not_push_a_nav_entry() {
+        let dir = sample_project();
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(root.join("a.txt")).unwrap();
+        app.open_or_focus_tab(root.join("b.txt")).unwrap();
+        app.active_tab = None;
+
+        app.run_action(Action::RecentFiles);
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(!app.nav.can_go_back());
+    }
+
+    #[test]
+    fn toggling_a_directory_row_does_not_push_a_nav_entry() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.handle_key(plain_key(KeyCode::Enter)); // "sub" is the first row, a directory
+
+        assert!(app.active_tab.is_none());
+        assert!(!app.nav.can_go_back());
+    }
+
+    #[test]
+    fn confirm_go_to_file_pushes_a_nav_entry() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_file = Some(GoToFileState::default());
+        app.go_to_file.as_mut().unwrap().query = "a.txt".to_string();
+        app.sync_go_to_file();
+        wait_until(|| {
+            app.poll_search();
+            !app.files_search.searching
+        });
+
+        app.confirm_go_to_file();
+        assert!(app.active_tab.is_some());
+
+        // A lone push leaves nothing to go back to yet (single entry) --
+        // confirmed instead by a subsequent different-file jump growing
+        // history into two entries, which only happens if the first jump
+        // was actually recorded.
+        let root = dir.path().canonicalize().unwrap();
+        app.open_location(location(root.join("b.txt"), 0, 0));
+        assert!(app.nav.can_go_back());
+    }
+
+    #[test]
+    fn confirm_new_scratch_file_pushes_a_nav_entry() {
+        let name = "_ide_tui_test_t31_scratch_nav.txt";
+        cleanup_scratch_file(name);
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::NewScratchFile);
+        app.new_scratch_file.as_mut().unwrap().name = name.to_string();
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        let root = dir.path().canonicalize().unwrap();
+        app.open_location(location(root.join("a.txt"), 0, 0));
+        assert!(app.nav.can_go_back());
+
+        cleanup_scratch_file(name);
+    }
+
+    #[test]
+    fn confirm_scratch_file_pushes_a_nav_entry() {
+        let name = "_ide_tui_test_t31_confirm_scratch_nav.txt";
+        cleanup_scratch_file(name);
+        let path = scratch::new_scratch_path(name).unwrap().unwrap();
+        std::fs::write(&path, "hello").unwrap();
+
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleScratchFiles);
+        app.scratch_files.as_mut().unwrap().query = name.to_string();
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        let root = dir.path().canonicalize().unwrap();
+        app.open_location(location(root.join("a.txt"), 0, 0));
+        assert!(app.nav.can_go_back());
+
+        cleanup_scratch_file(name);
+    }
+
+    #[test]
+    fn confirm_bookmark_jump_pushes_a_nav_entry_at_the_bookmarked_offset() {
+        let dir = sample_project(); // a.txt: "hello\nworld"
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter)); // pushes a.txt @ offset 0
+        app.active_buffer_mut()
+            .unwrap()
+            .buffer
+            .text_buffer_mut()
+            .set_selections(Selections::single(Selection::caret(6)));
+        app.run_action(Action::ToggleBookmark); // bookmarks line 1 ("world")
+        app.active_tab = None;
+
+        app.run_action(Action::ShowBookmarks);
+        app.handle_key(plain_key(KeyCode::Enter)); // should coalesce-replace the
+                                                   // entry above with offset 6
+
+        let root = dir.path().canonicalize().unwrap();
+        app.open_location(location(root.join("b.txt"), 0, 0)); // grows a 2nd entry
+        app.run_action(Action::NavigateBack);
+
+        let buf = app.active_buffer().unwrap();
+        assert_eq!(buf.path, root.join("a.txt"));
+        let offset = buf.buffer.text_buffer().selections().primary().head;
+        assert_eq!(
+            offset, 6,
+            "confirm_bookmark_jump must push the resolved bookmark offset, not the stale 0 from the earlier tree click"
+        );
+    }
+
+    #[test]
+    fn push_nav_location_with_no_active_tab_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.push_nav_location(0);
+
+        assert!(!app.nav.can_go_back());
+        assert!(!app.nav.can_go_forward());
     }
 }
