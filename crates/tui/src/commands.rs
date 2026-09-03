@@ -231,6 +231,7 @@ pub enum Action {
     ToggleDebugPanel,
     ConfigureDebugAdapter,
     GitBranches,
+    GitWorktrees,
     ShowFileHistory,
     ToggleBlameAnnotations,
     ShowBlameForCurrentLine,
@@ -851,6 +852,16 @@ pub fn commands() -> &'static [Command] {
             // category as `handle_git_panel_key`'s own 'o'/'t'.
             binding: None,
             action: Action::GitBranches,
+        },
+        Command {
+            id: "GitWorktrees",
+            title: "Git Worktrees...",
+            // Palette-only -- this action has no JetBrains-IDE precedent to
+            // copy a binding from (`git-worktrees.md` §2.2.2 already
+            // establishes this for the GUI side; nothing about the TUI
+            // changes that reasoning).
+            binding: None,
+            action: Action::GitWorktrees,
         },
         Command {
             id: "ShowFileHistory",

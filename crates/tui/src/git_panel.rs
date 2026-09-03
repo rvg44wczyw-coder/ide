@@ -12,8 +12,8 @@
 //! `egui`/`eframe` dependency itself.
 
 use ide_core::{
-    BranchInfo, CommitLogFilter, CommitNode, ConflictSides, FileDiff, GitRepo, MergeOutcome,
-    WorkingTreeStatus,
+    BranchInfo, CommitLogFilter, CommitNode, ConflictSides, FileDiff, GitError, GitRepo,
+    MergeOutcome, WorkingTreeStatus, WorktreeInfo,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,6 +73,68 @@ pub struct BranchesPopupState {
     pub pending_delete: Option<String>,
 }
 
+/// The worktrees popup's own transient UI state (`docs/features/
+/// git-worktrees.md` §2.2.1's `WorktreesPopupState`, adapted for
+/// keyboard-only interaction, `docs/features/tui-git-worktrees.md` §2.1).
+#[derive(Default)]
+pub struct WorktreesPopupState {
+    pub open: bool,
+    pub worktrees: Vec<WorktreeInfo>,
+    /// Row navigation. `ide-ui`'s own `WorktreesPopupState` has no such
+    /// field -- each row carries its own click targets there. `ide-tui`
+    /// is keyboard-only, so it needs an index the same way
+    /// `branches_popup.selected` already does.
+    pub selected: usize,
+    /// `true` while the "Add worktree" form has focus (§2.2's `n` key) --
+    /// `ide-tui`-specific: `ide-ui`'s three fields are always-visible
+    /// inline text boxes with no modal "now typing" state to track.
+    pub adding: bool,
+    pub add_field: WorktreeAddField,
+    pub new_name: String,
+    pub new_path: String,
+    /// Empty means "create a new branch named `new_name`" (`GitRepo::
+    /// add_worktree`'s own `branch: None` case) -- surfaced as placeholder
+    /// text while `add_field == Branch` and the field is still empty
+    /// (§2.4), not a separate checkbox, exactly like `ide-ui`'s own form.
+    pub new_branch: String,
+    pub error: Option<String>,
+    /// Set when a plain (`force: false`) `remove_worktree` call fails with
+    /// `WorktreeHasUncommittedChanges` or `WorktreeLocked`, so the popup
+    /// can offer a force-confirm instead of just showing the error --
+    /// same two-step pattern `branches_popup.pending_delete` already uses.
+    pub pending_force_remove: Option<String>,
+}
+
+/// Which of the "Add worktree" form's three fields is currently being
+/// typed into. `Tab`/`Shift+Tab` cycle through all three in this order
+/// (wrapping); this is a 3-way generalization of `DebugConfigField`'s
+/// existing 2-way toggle (`tui-debugger.md` §2.5) -- the same shape, one
+/// more variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorktreeAddField {
+    #[default]
+    Name,
+    Path,
+    Branch,
+}
+
+impl WorktreeAddField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Path,
+            Self::Path => Self::Branch,
+            Self::Branch => Self::Name,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Branch,
+            Self::Path => Self::Name,
+            Self::Branch => Self::Path,
+        }
+    }
+}
+
 /// The log viewer's own filter-bar state (`docs/features/
 /// tui-git-staging-branches-and-log-filters.md` §2.1, porting
 /// `git-log-viewer.md` §2.2) -- kept separate from `GitPanel::graph`
@@ -128,6 +190,10 @@ pub struct GitPanel {
     /// a branch listing nobody's currently looking at).
     pub branches: Vec<BranchInfo>,
     pub branches_popup: BranchesPopupState,
+    /// Loaded by `open_worktrees_popup` and refreshed after every mutating
+    /// worktree operation -- not eagerly loaded by `refresh()` itself,
+    /// same laziness as `branches`/`branches_popup`.
+    pub worktrees_popup: WorktreesPopupState,
     /// `true` between a `merge_branch` call that returned `Conflicts(_)`
     /// and the resulting commit actually landing -- purely a UI label/
     /// default-message concern. Cleared the moment `commit()` succeeds,
@@ -555,6 +621,117 @@ impl GitPanel {
         result
     }
 
+    /// Opens the worktrees popup: resets `worktrees_popup` to a fresh
+    /// (but `open: true`) default *before* loading, then calls
+    /// `refresh_worktrees` -- this order matters here specifically because
+    /// (unlike `open_branches_popup`, where the loaded list lives in a
+    /// `GitPanel`-level field the popup-state reset never touches)
+    /// `worktrees_popup.worktrees` lives *inside* the struct being reset,
+    /// so resetting after loading would silently discard what was just
+    /// loaded. Defensively re-opens the repository if it somehow isn't
+    /// loaded yet, same as `open_branches_popup`.
+    pub fn open_worktrees_popup(&mut self, project_root: &Path) {
+        if self.repo.is_none() {
+            self.refresh(project_root);
+        }
+        self.worktrees_popup = WorktreesPopupState {
+            open: true,
+            ..WorktreesPopupState::default()
+        };
+        self.refresh_worktrees();
+    }
+
+    pub fn close_worktrees_popup(&mut self) {
+        self.worktrees_popup = WorktreesPopupState::default();
+    }
+
+    /// Calls `GitRepo::worktrees`, populating `worktrees_popup.worktrees`
+    /// on success or `worktrees_popup.error` on failure. Not eagerly
+    /// called by `refresh()` itself -- same lazy-load reasoning
+    /// `reload_branches` already documents.
+    ///
+    /// Sanitizes `name`/`branch`/`path` before storing -- the same layer
+    /// `commit_detail` already strips bidi controls at
+    /// (`docs/security-findings/tui-git-worktrees-2026-09-03.md`'s finding
+    /// 1, extending the un-actioned `git-worktrees-core-2026-09-01.md`'s
+    /// finding 1). `GitRepo::worktrees()` reads back whatever a worktree
+    /// registration happens to contain -- created by this app's own
+    /// (bidi-checked-for-`name`-only, unchecked-for-`path`) `add_worktree`
+    /// or by an external tool entirely outside this app's validation --
+    /// so the render layer can't assume the data arriving here is already
+    /// clean.
+    pub fn refresh_worktrees(&mut self) {
+        let Some(repo) = &self.repo else {
+            self.worktrees_popup.worktrees = Vec::new();
+            return;
+        };
+        match repo.worktrees() {
+            Ok(worktrees) => {
+                self.worktrees_popup.worktrees =
+                    worktrees.into_iter().map(sanitize_worktree_info).collect();
+                self.worktrees_popup.error = None;
+            }
+            Err(e) => self.worktrees_popup.error = Some(e.to_string()),
+        }
+    }
+
+    /// Creates a worktree from the popup's own `new_name`/`new_path`/
+    /// `new_branch` fields (empty `new_branch` becomes `None`). On
+    /// success, clears the form, exits `adding` mode, and refreshes the
+    /// list; on failure, sets `error` and leaves the form fields as-is so
+    /// the user can fix and retry rather than retype. Doesn't close the
+    /// whole popup either way -- unlike `create_branch`, adding a worktree
+    /// isn't a context switch.
+    pub fn create_worktree(&mut self) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
+        let branch = (!self.worktrees_popup.new_branch.is_empty())
+            .then(|| self.worktrees_popup.new_branch.clone());
+        let result = repo.add_worktree(
+            &self.worktrees_popup.new_name,
+            &self.worktrees_popup.new_path,
+            branch.as_deref(),
+        );
+        match result {
+            Ok(()) => {
+                self.worktrees_popup.new_name.clear();
+                self.worktrees_popup.new_path.clear();
+                self.worktrees_popup.new_branch.clear();
+                self.worktrees_popup.adding = false;
+                self.worktrees_popup.error = None;
+                self.refresh_worktrees();
+            }
+            Err(e) => self.worktrees_popup.error = Some(e.to_string()),
+        }
+    }
+
+    /// Removes `name`. On a `WorktreeHasUncommittedChanges` or
+    /// `WorktreeLocked` failure with `force: false`, sets
+    /// `pending_force_remove` *instead of* `error` -- the popup's confirm
+    /// step uses a fixed message, not the raw error text, same two-step
+    /// pattern `confirm_delete_branch` already uses for `BranchNotMerged`.
+    /// Any other failure (including a retry with `force: true` that still
+    /// fails) surfaces as `error`.
+    pub fn remove_worktree(&mut self, name: &str, force: bool) {
+        let Some(repo) = &self.repo else {
+            return;
+        };
+        match repo.remove_worktree(name, force) {
+            Ok(()) => {
+                self.worktrees_popup.pending_force_remove = None;
+                self.worktrees_popup.error = None;
+                self.refresh_worktrees();
+            }
+            Err(GitError::WorktreeHasUncommittedChanges(_) | GitError::WorktreeLocked(_))
+                if !force =>
+            {
+                self.worktrees_popup.pending_force_remove = Some(name.to_string());
+            }
+            Err(e) => self.worktrees_popup.error = Some(e.to_string()),
+        }
+    }
+
     /// Starts a merge of `name` into the current branch. On `Conflicts`,
     /// refreshes state (which repopulates `conflicts` from the repo's own
     /// index) and sets `merging` plus a pre-filled default commit message,
@@ -645,6 +822,25 @@ impl GitPanel {
 const MAX_COMMIT_DETAIL_SUMMARY_CHARS: usize = 200;
 const MAX_COMMIT_DETAIL_BODY_CHARS: usize = 4000;
 const MAX_COMMIT_DETAIL_NAME_CHARS: usize = 200;
+
+/// Strips bidi control characters from every text field `refresh_worktrees`
+/// stores (`docs/security-findings/tui-git-worktrees-2026-09-03.md`,
+/// finding 1). `path` goes through the same `strip_bidi_controls`
+/// treatment as `name`/`branch` even though today's `add_worktree` only
+/// validates `name` at creation time, since this popup can't assume every
+/// entry `GitRepo::worktrees()` returns was created through that check.
+fn sanitize_worktree_info(wt: WorktreeInfo) -> WorktreeInfo {
+    WorktreeInfo {
+        name: crate::blame_gutter::strip_bidi_controls(&wt.name),
+        path: PathBuf::from(crate::blame_gutter::strip_bidi_controls(
+            &wt.path.to_string_lossy(),
+        )),
+        branch: wt
+            .branch
+            .map(|b| crate::blame_gutter::strip_bidi_controls(&b)),
+        is_locked: wt.is_locked,
+    }
+}
 
 fn non_empty(text: &str) -> Option<String> {
     let trimmed = text.trim();
@@ -1422,6 +1618,225 @@ mod tests {
              caller (App::handle_git_branches_key) closes it and redirects"
         );
         assert!(!panel.conflicts.is_empty());
+    }
+
+    // ---- worktrees ----
+
+    #[test]
+    fn open_worktrees_popup_loads_worktrees_and_reset_is_lazy_on_refresh() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("feature");
+        run(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt_path.to_str().unwrap(),
+            ],
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        assert!(
+            panel.worktrees_popup.worktrees.is_empty(),
+            "worktrees stay lazily loaded"
+        );
+
+        panel.open_worktrees_popup(dir.path());
+        assert!(panel.worktrees_popup.open);
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+
+        panel.refresh(dir.path());
+        assert_eq!(
+            panel.worktrees_popup.worktrees.len(),
+            1,
+            "refresh() must not clear an already-loaded worktrees list"
+        );
+    }
+
+    #[test]
+    fn refresh_worktrees_strips_bidi_controls_from_name_branch_and_path() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        let wt_dir = tempfile::tempdir().unwrap();
+        let evil_path = wt_dir.path().join("good\u{202E}evil");
+        run(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat\u{202E}ure",
+                evil_path.to_str().unwrap(),
+            ],
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_worktrees_popup(dir.path());
+
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+        let wt = &panel.worktrees_popup.worktrees[0];
+        assert!(
+            !wt.name.contains('\u{202E}'),
+            "name must have bidi controls stripped: {:?}",
+            wt.name
+        );
+        assert!(
+            !wt.path.to_string_lossy().contains('\u{202E}'),
+            "path must have bidi controls stripped: {:?}",
+            wt.path
+        );
+        assert!(
+            !wt.branch.as_deref().unwrap_or("").contains('\u{202E}'),
+            "branch must have bidi controls stripped: {:?}",
+            wt.branch
+        );
+    }
+
+    #[test]
+    fn close_worktrees_popup_resets_transient_popup_state() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_worktrees_popup(dir.path());
+        panel.worktrees_popup.new_name = "leftover".to_string();
+        panel.worktrees_popup.selected = 3;
+        panel.worktrees_popup.adding = true;
+
+        panel.close_worktrees_popup();
+
+        assert!(!panel.worktrees_popup.open);
+        assert!(panel.worktrees_popup.new_name.is_empty());
+        assert_eq!(panel.worktrees_popup.selected, 0);
+        assert!(!panel.worktrees_popup.adding);
+    }
+
+    #[test]
+    fn create_worktree_with_empty_branch_field_creates_a_new_branch() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("feature");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_worktrees_popup(dir.path());
+        panel.worktrees_popup.adding = true;
+        panel.worktrees_popup.new_name = "feature".to_string();
+        panel.worktrees_popup.new_path = wt_path.to_str().unwrap().to_string();
+
+        panel.create_worktree();
+
+        assert!(panel.worktrees_popup.error.is_none());
+        assert!(!panel.worktrees_popup.adding);
+        assert!(panel.worktrees_popup.new_name.is_empty());
+        assert!(panel.worktrees_popup.new_path.is_empty());
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+        assert_eq!(panel.worktrees_popup.worktrees[0].name, "feature");
+        assert!(wt_path.exists());
+    }
+
+    #[test]
+    fn create_worktree_failure_sets_error_and_keeps_form_fields() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_worktrees_popup(dir.path());
+        panel.worktrees_popup.adding = true;
+        panel.worktrees_popup.new_name = "bad/name".to_string();
+        panel.worktrees_popup.new_path = "/tmp/wherever".to_string();
+
+        panel.create_worktree();
+
+        assert!(panel.worktrees_popup.error.is_some());
+        assert!(panel.worktrees_popup.adding, "form stays open on failure");
+        assert_eq!(panel.worktrees_popup.new_name, "bad/name");
+        assert!(panel.worktrees_popup.worktrees.is_empty());
+    }
+
+    #[test]
+    fn remove_worktree_deletes_a_clean_worktree() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("feature");
+        run(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt_path.to_str().unwrap(),
+            ],
+        );
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_worktrees_popup(dir.path());
+
+        panel.remove_worktree("feature", false);
+
+        assert!(panel.worktrees_popup.error.is_none());
+        assert!(panel.worktrees_popup.pending_force_remove.is_none());
+        assert!(panel.worktrees_popup.worktrees.is_empty());
+        assert!(!wt_path.exists());
+    }
+
+    #[test]
+    fn remove_worktree_with_uncommitted_changes_sets_pending_force_remove() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "one\n", "first");
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("feature");
+        run(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt_path.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(wt_path.join("untracked.txt"), "dirty\n").unwrap();
+
+        let mut panel = GitPanel::default();
+        panel.refresh(dir.path());
+        panel.open_worktrees_popup(dir.path());
+
+        panel.remove_worktree("feature", false);
+
+        assert!(panel.worktrees_popup.error.is_none());
+        assert_eq!(
+            panel.worktrees_popup.pending_force_remove.as_deref(),
+            Some("feature")
+        );
+        assert_eq!(panel.worktrees_popup.worktrees.len(), 1);
+
+        panel.remove_worktree("feature", true);
+
+        assert!(panel.worktrees_popup.pending_force_remove.is_none());
+        assert!(panel.worktrees_popup.worktrees.is_empty());
+    }
+
+    #[test]
+    fn worktree_add_field_next_and_prev_cycle_and_wrap() {
+        assert_eq!(WorktreeAddField::Name.next(), WorktreeAddField::Path);
+        assert_eq!(WorktreeAddField::Path.next(), WorktreeAddField::Branch);
+        assert_eq!(WorktreeAddField::Branch.next(), WorktreeAddField::Name);
+        assert_eq!(WorktreeAddField::Name.prev(), WorktreeAddField::Branch);
+        assert_eq!(WorktreeAddField::Path.prev(), WorktreeAddField::Name);
+        assert_eq!(WorktreeAddField::Branch.prev(), WorktreeAddField::Path);
     }
 
     // ---- assign_lanes ----
