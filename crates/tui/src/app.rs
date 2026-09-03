@@ -580,10 +580,11 @@ pub struct App {
     pub(crate) go_to_symbol: Option<GoToSymbolState>,
     pub(crate) nav_state: ProjectNavigationState,
     /// Back/forward jump history (`docs/features/
-    /// tui-back-forward-navigation.md`, T31) -- distinct from `nav_state`
-    /// above (Recent Files/Bookmarks); the two are unrelated concepts that
-    /// happen to share a name prefix.
-    pub(crate) nav: NavHistory,
+    /// tui-back-forward-navigation.md`, T31) -- an unrelated concept from
+    /// `nav_state` above (Recent Files/Bookmarks); named distinctly from
+    /// it (rather than `ide-ui`'s own bare `nav`) precisely to avoid the
+    /// two being confused at a glance.
+    pub(crate) nav_history: NavHistory,
     pub(crate) recent_files: Option<RecentFilesState>,
     pub(crate) bookmarks_popup: Option<BookmarksPopupState>,
     pub(crate) todo: TodoPanel,
@@ -747,7 +748,7 @@ impl App {
             go_to_file: None,
             go_to_symbol: None,
             nav_state: project_state::load(project.root()),
-            nav: NavHistory::default(),
+            nav_history: NavHistory::default(),
             recent_files: None,
             bookmarks_popup: None,
             todo: TodoPanel::default(),
@@ -2057,13 +2058,13 @@ impl App {
             self.notify(err.to_string());
             return;
         }
-        self.push_nav_location(0);
         if let Some(buf) = self.active_buffer_mut() {
             buf.desired_column = None;
             buf.buffer
                 .text_buffer_mut()
                 .set_selections(Selections::single(Selection::caret(0)));
         }
+        self.push_nav_location(0);
         self.go_to_file = None;
     }
 
@@ -4133,7 +4134,7 @@ impl App {
     }
 
     /// Records the tab that is active **at call time** (path + `offset`)
-    /// as the new current entry in `nav` (`docs/features/
+    /// as the new current entry in `nav_history` (`docs/features/
     /// tui-back-forward-navigation.md` §2.2). No-op with no active tab --
     /// every "open a new file" tab always has a path (unlike `ide-ui`,
     /// which also guards against a never-saved untitled buffer), so that
@@ -4143,20 +4144,32 @@ impl App {
         let Some(buf) = self.active_buffer() else {
             return;
         };
-        self.nav.push(NavLocation {
+        self.nav_history.push(NavLocation {
             path: buf.path.clone(),
             offset,
         });
+    }
+
+    /// The active buffer's actual current caret offset, or `0` with no
+    /// active tab. Reading this live (rather than assuming a jump's own
+    /// nominal target offset) is what makes `push_nav_location` accurate
+    /// when `open_or_focus_tab` refocuses a tab that was already open --
+    /// that branch never touches the tab's live caret, so the caret can
+    /// differ from whatever offset the caller nominally jumped to.
+    fn active_caret_offset(&self) -> usize {
+        self.active_buffer()
+            .map(|buf| buf.buffer.text_buffer().selections().primary().head)
+            .unwrap_or(0)
     }
 
     /// `NavigateBack` command (§2.2). No-op at the oldest entry. Never
     /// calls `push_nav_location` itself -- every Back/Forward press would
     /// otherwise immediately push a new forward-erasing entry (§3).
     fn nav_back(&mut self) {
-        if !self.nav.can_go_back() {
+        if !self.nav_history.can_go_back() {
             return;
         }
-        let Some(location) = self.nav.go_back() else {
+        let Some(location) = self.nav_history.go_back() else {
             return;
         };
         self.go_to_nav_location(location);
@@ -4165,10 +4178,10 @@ impl App {
     /// `NavigateForward` command (§2.2). Same shape as `nav_back`,
     /// opposite direction.
     fn nav_forward(&mut self) {
-        if !self.nav.can_go_forward() {
+        if !self.nav_history.can_go_forward() {
             return;
         }
-        let Some(location) = self.nav.go_forward() else {
+        let Some(location) = self.nav_history.go_forward() else {
             return;
         };
         self.go_to_nav_location(location);
@@ -4653,7 +4666,8 @@ impl App {
         match self.open_or_focus_tab(path) {
             Ok(()) => {
                 self.status = None;
-                self.push_nav_location(0);
+                let offset = self.active_caret_offset();
+                self.push_nav_location(offset);
             }
             Err(err) => self.status = Some(err.to_string()),
         }
@@ -5903,7 +5917,8 @@ impl App {
                     self.notify(err.to_string());
                     return;
                 }
-                self.push_nav_location(0);
+                let offset = self.active_caret_offset();
+                self.push_nav_location(offset);
             }
             Ok(None) => self.notify("could not resolve a scratch files directory (no $HOME)."),
             Err(err) => self.notify(err.to_string()),
@@ -5987,7 +6002,8 @@ impl App {
             self.notify(err.to_string());
             return;
         }
-        self.push_nav_location(0);
+        let offset = self.active_caret_offset();
+        self.push_nav_location(offset);
         self.scratch_files = None;
     }
 }
@@ -15317,11 +15333,11 @@ mod tests {
         app.open_location(location(root.join("b.txt"), 0, 3));
         assert_eq!(app.active_buffer().unwrap().path, root.join("b.txt"));
 
-        assert!(app.nav.can_go_back());
+        assert!(app.nav_history.can_go_back());
         app.run_action(Action::NavigateBack);
         assert_eq!(app.active_buffer().unwrap().path, root.join("a.txt"));
 
-        assert!(app.nav.can_go_forward());
+        assert!(app.nav_history.can_go_forward());
         app.run_action(Action::NavigateForward);
         assert_eq!(app.active_buffer().unwrap().path, root.join("b.txt"));
         assert_eq!(
@@ -15383,7 +15399,7 @@ mod tests {
 
         app.open_location(location(root.join("a.txt"), 1, 0)); // still a.txt
 
-        assert!(!app.nav.can_go_back());
+        assert!(!app.nav_history.can_go_back());
     }
 
     #[test]
@@ -15398,7 +15414,7 @@ mod tests {
         app.run_action(Action::NavigateBack); // back to a.txt
         app.open_search_result(root.join("sub/c.txt"), 0); // new jump from the middle
 
-        assert!(!app.nav.can_go_forward());
+        assert!(!app.nav_history.can_go_forward());
     }
 
     #[test]
@@ -15413,7 +15429,7 @@ mod tests {
         app.run_action(Action::RecentFiles);
         app.handle_key(plain_key(KeyCode::Enter));
 
-        assert!(!app.nav.can_go_back());
+        assert!(!app.nav_history.can_go_back());
     }
 
     #[test]
@@ -15424,7 +15440,7 @@ mod tests {
         app.handle_key(plain_key(KeyCode::Enter)); // "sub" is the first row, a directory
 
         assert!(app.active_tab.is_none());
-        assert!(!app.nav.can_go_back());
+        assert!(!app.nav_history.can_go_back());
     }
 
     #[test]
@@ -15448,7 +15464,7 @@ mod tests {
         // was actually recorded.
         let root = dir.path().canonicalize().unwrap();
         app.open_location(location(root.join("b.txt"), 0, 0));
-        assert!(app.nav.can_go_back());
+        assert!(app.nav_history.can_go_back());
     }
 
     #[test]
@@ -15464,7 +15480,7 @@ mod tests {
 
         let root = dir.path().canonicalize().unwrap();
         app.open_location(location(root.join("a.txt"), 0, 0));
-        assert!(app.nav.can_go_back());
+        assert!(app.nav_history.can_go_back());
 
         cleanup_scratch_file(name);
     }
@@ -15485,7 +15501,7 @@ mod tests {
 
         let root = dir.path().canonicalize().unwrap();
         app.open_location(location(root.join("a.txt"), 0, 0));
-        assert!(app.nav.can_go_back());
+        assert!(app.nav_history.can_go_back());
 
         cleanup_scratch_file(name);
     }
@@ -15528,7 +15544,43 @@ mod tests {
 
         app.push_nav_location(0);
 
-        assert!(!app.nav.can_go_back());
-        assert!(!app.nav.can_go_forward());
+        assert!(!app.nav_history.can_go_back());
+        assert!(!app.nav_history.can_go_forward());
+    }
+
+    #[test]
+    fn reopening_an_already_open_tab_pushes_its_real_caret_not_zero() {
+        // Regression test for the fix-round finding: `open_or_focus_tab`'s
+        // refocus branch never touches a tab's live caret, so a jump site
+        // that always pushed offset 0 could under-report where the caret
+        // actually was.
+        let dir = sample_project(); // a.txt: "hello\nworld"
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.handle_key(plain_key(KeyCode::Down)); // select a.txt's tree row
+        app.handle_key(plain_key(KeyCode::Enter)); // opens a.txt, pushes offset 0
+        app.active_buffer_mut()
+            .unwrap()
+            .buffer
+            .text_buffer_mut()
+            .set_selections(Selections::single(Selection::caret(6)));
+
+        app.open_location(location(root.join("b.txt"), 0, 0)); // switch away
+
+        // Tree selection is still on a.txt's row (untouched by the above) --
+        // pressing Enter again refocuses the already-open a.txt tab, whose
+        // caret is still 6.
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.active_buffer().unwrap().path, root.join("a.txt"));
+
+        app.run_action(Action::NavigateBack); // -> b.txt
+        assert_eq!(app.active_buffer().unwrap().path, root.join("b.txt"));
+        app.run_action(Action::NavigateForward); // -> back to a.txt
+
+        let buf = app.active_buffer().unwrap();
+        assert_eq!(buf.path, root.join("a.txt"));
+        let offset = buf.buffer.text_buffer().selections().primary().head;
+        assert_eq!(offset, 6, "must record the real caret, not a hardcoded 0");
     }
 }
