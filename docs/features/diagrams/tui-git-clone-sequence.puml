@@ -1,0 +1,45 @@
+@startuml
+title TUI Git Clone (T34) -- popup, background thread, App
+
+actor User
+participant "App\n(main thread)" as App
+participant "ClonePanel" as Panel
+participant "spawned thread" as Thread
+participant "ide_core::git::clone_repo" as Core
+
+User -> App: Ctrl+Shift+A -> ToggleClonePanel
+App -> App: clone_panel_open = true
+
+User -> App: type URL, Tab, type destination, Enter
+App -> Panel: start()
+Panel -> Panel: guard: !is_running() && fields non-empty
+Panel -> Thread: spawn(url, destination, tx)
+Panel --> App: (rx stored on ClonePanel)
+
+loop each frame while is_running()
+    Thread -> Core: clone_repo(url, dest, on_progress)
+    Core --> Thread: on_progress(CloneProgress)
+    Thread -> Panel: tx.send(CloneEvent::Progress)
+    App -> Panel: poll()
+    Panel --> App: Some(ClonePollResult::Progress)
+end
+
+alt clone succeeds
+    Core --> Thread: Ok(GitRepo)
+    Thread -> Panel: tx.send(CloneEvent::Done(Ok(path)))
+    App -> Panel: poll()
+    Panel --> App: Some(ClonePollResult::Succeeded(path))
+    App -> App: notify("Cloned to {path}")
+    note right of App: no auto-open (App is bound\nto one project root for its\nwhole process lifetime, §3.5)
+else clone fails
+    Core --> Thread: Err(GitError)
+    Thread -> Panel: tx.send(CloneEvent::Done(Err(msg)))
+    App -> Panel: poll()
+    Panel --> App: Some(ClonePollResult::Failed)
+    App -> App: notify("Clone failed: {msg}")
+end
+
+User -> App: Esc (any time)
+App -> App: clone_panel_open = false
+note right of Panel: self.clone itself is untouched --\nan in-flight thread keeps running,\nprogress/done/error survive (§3.4)
+@enduml
