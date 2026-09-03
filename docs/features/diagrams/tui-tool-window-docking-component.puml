@@ -1,0 +1,44 @@
+@startuml
+title TUI Tool Window Docking (T33)
+
+skinparam componentStyle rectangle
+
+package "App (crates/tui/src/app.rs)" {
+  [Focus: LeftDock | Editor | BottomDock] as Focus
+}
+
+frame "Screen" {
+  frame "Left Dock\n(left_dock: Option<LeftDockState>)" as LeftDock {
+    [Files tab\n(existing Project Tree)] as Files
+    [Todos tab\n(existing TodoPanel)] as Todos
+  }
+
+  frame "Editor\n(always visible, no toggle)" as Editor
+
+  frame "Bottom Dock\n(bottom_dock: Option<BottomDockState>)" as BottomDock {
+    [Docker tab] as Docker
+    [Kubernetes tab] as K8s
+    [Cargo tab] as Cargo
+    [Problems tab] as Problems
+    [Git Log tab\n(render_git_log_view +\nnew GitLogDockState)] as GitLog
+  }
+}
+
+note right of BottomDock
+  T35 (future): adds a
+  Terminal tab here
+end note
+
+note right of LeftDock
+  T34 (future): adds a
+  Structure tab here
+end note
+
+Focus --> LeftDock : routes keys when\nFocus::LeftDock
+Focus --> Editor : routes keys when\nFocus::Editor
+Focus --> BottomDock : routes keys when\nFocus::BottomDock
+
+[Full modal Git Panel\n(ToggleGitPanel, unchanged)] as FullGit
+GitLog .[#gray].> FullGit : independent state\n(no shared cursor)
+
+@enduml
