@@ -248,7 +248,7 @@ fn load_from(path: &Path) -> KeymapOverlay {
         .unwrap_or_default()
 }
 
-fn save_to(path: &Path, overlay: &KeymapOverlay) {
+pub(crate) fn save_to(path: &Path, overlay: &KeymapOverlay) {
     let Some(parent) = path.parent() else {
         return;
     };
