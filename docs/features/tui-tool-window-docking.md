@@ -251,16 +251,53 @@ entire Git Panel's modal state machine.
 #### New `Action` variants and redefined existing ones
 
 ```rust
-Action::ToggleLeftDock,     // new: show/hide the whole left dock group
-Action::ToggleBottomDock,   // new: show/hide the whole bottom dock group
-Action::GrowFocusedDock,    // new: widen/heighten whichever dock has focus
-Action::ShrinkFocusedDock,  // new: narrow/shorten whichever dock has focus
+Action::ToggleLeftDock,        // new: show/hide the whole left dock group
+Action::ToggleBottomDock,      // new: show/hide the whole bottom dock group
+Action::GrowFocusedDock,       // new: widen/heighten whichever dock has focus
+Action::ShrinkFocusedDock,     // new: narrow/shorten whichever dock has focus
+Action::ToggleBottomDockFocus, // new: swap keyboard focus between BottomDock and Editor
 ```
 
-`Action::ToggleTreeFocus` is renamed `Action::ToggleLeftDockFocus`
-(same rename reasoning as `Focus::Tree` → `Focus::LeftDock`; its
-behavior is unchanged — it still only swaps keyboard focus between
-`LeftDock` and `Editor`, it does not open/close the dock).
+`Action::ToggleTreeFocus` is renamed `Action::ToggleLeftDockFocus`, and its
+behavior is redefined for the three-focus world (this is a real behavior
+change, not a pure rename, unlike the `Focus::Tree` → `Focus::LeftDock`
+field rename above):
+
+```rust
+fn toggle_left_dock_focus(&mut self) {
+    self.focus = match self.focus {
+        Focus::LeftDock => Focus::Editor,
+        Focus::Editor | Focus::BottomDock => Focus::LeftDock,
+    };
+}
+```
+
+i.e. it always targets `LeftDock` specifically (never `BottomDock`),
+matching its literal "Project" command-palette title (`ToggleProjectToolWindow`,
+§2.2) — pressing it from `BottomDock` moves focus to `LeftDock`, not to
+`Editor`. `Action::ToggleBottomDockFocus` is new, mirrors the same shape for
+the other dock, and is what actually gets a keyboard-only user from
+`BottomDock` back to `Editor` without closing the dock (there was no such
+path before this doc: the old `Action::ToggleTreeFocus` only ever had two
+foci to swap between, and re-running one of the `ToggleXPanel` commands from
+§2.4 only closes the dock if it's already both showing that tab *and*
+focused — otherwise it just re-focuses the dock, per its own exception
+clause, so it can bring focus *to* a dock but was never a way *off* one):
+
+```rust
+fn toggle_bottom_dock_focus(&mut self) {
+    self.focus = match self.focus {
+        Focus::BottomDock => Focus::Editor,
+        Focus::Editor | Focus::LeftDock => Focus::BottomDock,
+    };
+}
+```
+
+`Action::ToggleBottomDockFocus` is registered palette-only, no default
+binding (§2.2) — there is no reference-IDE precedent for a *second*
+tool-window-focus toggle keybinding the way `Ctrl+T` is a verified existing
+binding for the first, so per `CLAUDE.md`'s "never invent a binding" rule it
+ships bindable-but-unbound rather than guessed.
 
 `Action::ToggleTodoPanel`/`ToggleDockerPanel`/`ToggleK8sPanel`/
 `ToggleProblems` keep their existing `Action` names and command-table
@@ -300,11 +337,18 @@ Command {
     binding: None,
     action: Action::ShrinkFocusedDock,
 },
+Command {
+    id: "ToggleBottomDockFocus",
+    title: "Toggle Bottom Dock Focus",
+    binding: None,
+    action: Action::ToggleBottomDockFocus,
+},
 ```
 
 `ToggleProjectToolWindow`'s existing entry (`id`, title "Project",
 `Ctrl+T` binding) is unchanged except its `action` field now points at
-the renamed `Action::ToggleLeftDockFocus`. `ToggleTodoPanel`/
+the renamed `Action::ToggleLeftDockFocus` (redefined behavior, §2.1).
+`ToggleTodoPanel`/
 `ToggleDockerPanel`/`ToggleK8sPanel`/`ToggleProblems`/`ToggleGitPanel`'s
 entries are entirely unchanged (same `id`, title, binding, `Action`
 variant) — only what running that already-registered action *does*
@@ -394,13 +438,13 @@ own chrome even before this doc.
 `handle_key`'s existing linear precedence chain (§ survey item 8) is
 unchanged in shape — every existing `if self.XXX.is_some() { return self.
 handle_XXX_key(key) }` check for the overlays listed in §1's "out of
-scope" list stays exactly where it is, in exactly the same order. Three
-new checks are inserted **immediately before** the final `match self.focus
-{ ... }` fallthrough (i.e., dock-tab keys are the *lowest* priority,
-same as today's bare `Tree`/`Editor` focus dispatch was) — this ordering
-matters: every existing modal popup (find, palette, code actions, etc.)
-must still intercept keys before dock routing ever sees them, exactly as
-today:
+scope" list stays exactly where it is, in exactly the same order. The
+final `match self.focus { ... }` fallthrough (i.e., dock-tab keys are the
+*lowest* priority, same as today's bare `Tree`/`Editor` focus dispatch was)
+gains a `BottomDock` arm alongside the renamed `LeftDock` one (`Editor`'s
+arm is unchanged) — this ordering matters: every existing modal popup
+(find, palette, code actions, etc.) must still intercept keys before dock
+routing ever sees them, exactly as today:
 
 ```rust
 match self.focus {
@@ -414,12 +458,40 @@ match self.focus {
 `BackTab` first (cycle `LeftDockTab`/`BottomDockTab`, same convention
 `handle_debug_panel_key` already uses for its own three sections), then
 delegate every other key to whichever existing per-panel key handler
-matches the active tab (e.g. `BottomDockTab::Docker` delegates to the
-existing `handle_docker_panel_key`, adapted to no longer require
-`docker_panel.is_some()` as a precondition since `self.docker` is now
-always alive). `Ctrl+T` (`ToggleLeftDockFocus`) and any future
-`ToggleBottomDockFocus`-shaped binding still intercept **before** this
-fallthrough is reached, in `binding_for`'s existing lookup, same as today.
+matches the active tab, with one new handler for the one tab that has no
+existing per-panel key handler to delegate to:
+
+- `LeftDockTab::Files` → the existing tree key handler.
+- `LeftDockTab::Todos` → the existing Todo-panel key handler, adapted to
+  `dock.todos_selected` (§2.1).
+- `BottomDockTab::Docker`/`Kubernetes`/`Cargo` → the existing
+  `handle_docker_panel_key`/`handle_k8s_panel_key`/`handle_cargo_panel_key`,
+  adapted to no longer require `docker_panel.is_some()`/`k8s_panel.is_some()`
+  as a precondition since `self.docker`/`self.k8s` are now always alive.
+- `BottomDockTab::Problems` → the existing Problems key handler, adapted to
+  `dock.problems_selected`.
+- `BottomDockTab::GitLog` → **new** `handle_git_log_dock_key(&mut self, key:
+  KeyEvent) -> bool`, since delegating to the existing `handle_git_panel_key`
+  is explicitly ruled out (§2.1's "deliberate trim" — that function's
+  precedence chain assumes `git_panel.is_some()` and reaches
+  branches/worktrees/staging/conflicts/`Filter`, none of which the dock tab
+  exposes) and no other existing handler covers commit-graph browsing. Its
+  entire body: `Up`/`Down` move `graph_selected` (saturating, clamped to the
+  current commit list length — same idiom as every other list cursor in this
+  crate, e.g. `branches_popup.selected`); `Tab`/`BackTab` or `Enter` swap
+  `self.git_log_dock.focus` between `GitPanelFocus::Graph` and `::Diff`;
+  `Up`/`Down` while `focus == Diff` scroll `diff_scroll` instead (saturating,
+  no clamp needed at the top since `0` is already the floor — `ratatui`'s
+  scroll widgets clamp an over-large value themselves at render time, same
+  as every other scrollable panel already in this crate). No other key does
+  anything in this handler; unhandled keys fall through unconsumed (`false`)
+  so `Tab`/`BackTab`'s dock-tab-cycling check in `handle_bottom_dock_key`
+  still gets a chance — same "handler returns whether it consumed the key"
+  convention `handle_docker_panel_key` etc. already use.
+
+`Ctrl+T` (`ToggleLeftDockFocus`) and `ToggleBottomDockFocus` (§2.1, no
+default binding) still intercept **before** this fallthrough is reached, in
+`binding_for`'s existing lookup, same as today.
 
 `ToggleTodoPanel`/`ToggleDockerPanel`/`ToggleK8sPanel`/`ToggleProblems`
 (run from `run_action`, reached only once the modal-popup precedence
@@ -559,12 +631,18 @@ simultaneously, and neither's state affects the other's (§4).
       Kubernetes fetch already in flight (if any) keeps running in the
       background, untouched.
 
-4. User presses Ctrl+T (ToggleLeftDockFocus, unchanged binding).
-   -> focus moves from BottomDock to LeftDock (or wherever it maps in the
-      three-way cycle -- exact behavior when there are three foci instead
-      of two is the implementer's to define sensibly, e.g. Ctrl+T always
-      targets LeftDock specifically rather than a cyclic "next focus",
-      matching its literal "Project" title's intent).
+4. User presses Ctrl+T (ToggleLeftDockFocus, unchanged binding, redefined
+   behavior).
+   -> focus moves from BottomDock to LeftDock (ToggleLeftDockFocus always
+      targets LeftDock specifically, never a cyclic "next focus" -- §2.1).
+      Pressing Ctrl+T again (focus is now LeftDock) moves focus to Editor.
+
+4b. User runs "Toggle Bottom Dock Focus" from the palette while focus is
+    Editor and bottom_dock is Some (still open from step 2/3).
+    -> focus moves to BottomDock, landing back on whichever tab was last
+       active there (Docker, from step 3) with its cursor untouched. This
+       is the keyboard-only path back into a dock that Ctrl+T alone cannot
+       reach, since Ctrl+T only ever targets LeftDock (§2.1).
 
 5. User runs "Toggle Bottom Dock" from the palette.
    -> bottom_dock becomes None. The Docker/Kubernetes/Cargo/Problems/
@@ -587,10 +665,12 @@ simultaneously, and neither's state affects the other's (§4).
   `todo_panel`/`problems` `Option` fields (state relocated); `docker_panel`/
   `k8s_panel` field type change from `Option<T>` to `T`; new
   `Action::ToggleLeftDock`/`ToggleBottomDock`/`GrowFocusedDock`/
-  `ShrinkFocusedDock`, renamed `Action::ToggleLeftDockFocus`; new
-  `handle_left_dock_key`/`handle_bottom_dock_key`; redefined bodies for
-  `ToggleTodoPanel`/`ToggleDockerPanel`/`ToggleK8sPanel`/`ToggleProblems`.
-- `crates/tui/src/commands.rs`: four new command entries, one renamed
+  `ShrinkFocusedDock`/`ToggleBottomDockFocus`, redefined
+  `Action::ToggleLeftDockFocus` (renamed from `ToggleTreeFocus`, three-focus
+  behavior per §2.1); new `handle_left_dock_key`/`handle_bottom_dock_key`/
+  `handle_git_log_dock_key`; redefined bodies for `ToggleTodoPanel`/
+  `ToggleDockerPanel`/`ToggleK8sPanel`/`ToggleProblems`.
+- `crates/tui/src/commands.rs`: five new command entries, one renamed
   `Action` reference on the existing `ToggleProjectToolWindow` entry.
 - `crates/tui/src/ui.rs`: `render`'s top-level layout restructured per
   §2.3; new `render_left_dock`/`render_bottom_dock`; every migrated
@@ -614,3 +694,36 @@ simultaneously, and neither's state affects the other's (§4).
 ## 7. Diagram
 
 ![Dock layout](diagrams/tui-tool-window-docking-component.png)
+
+## Revision notes
+
+Per `rev`'s first review pass (three required changes):
+
+1. **`Ctrl+T`'s three-focus behavior was left to "the implementer to define
+   sensibly."** Now pinned down explicitly (§2.1): `ToggleLeftDockFocus`
+   always targets `LeftDock` specifically (`BottomDock`/`Editor` → `LeftDock`,
+   `LeftDock` → `Editor`), matching its "Project" command title.
+2. **No documented way to move focus from `BottomDock` to `Editor`.** Added
+   `Action::ToggleBottomDockFocus` (§2.1, §2.2), a palette-only mirror of the
+   redefined `ToggleLeftDockFocus` for the bottom dock, and a new example
+   4b (§5) showing it in use.
+3. **The `GitLog` dock tab's key handling had no named handler** — §2.4
+   previously said to delegate to "whichever existing per-panel key handler
+   matches the active tab" without naming one for `GitLog`, while
+   simultaneously ruling out reusing `handle_git_panel_key`. Added a fully
+   specified `handle_git_log_dock_key` (§2.4: `Up`/`Down` move
+   `graph_selected` or scroll `diff_scroll` depending on `focus`,
+   `Tab`/`BackTab`/`Enter` swap `focus` between `Graph`/`Diff`, everything
+   else falls through unconsumed).
+
+Two devil's-advocate points from the same review (fixed two docking slots
+instead of freely-reassignable tool windows; `GrowFocusedDock`/
+`ShrinkFocusedDock` acting on whichever dock has focus rather than four
+separate directional commands) were raised as non-blocking; the user
+reviewed both and agreed to keep the doc as designed on both points — no
+change made for either.
+
+Round 2 (one Low finding): §2.4's opening paragraph referred to "three new
+checks... inserted before" the `match self.focus` fallthrough, but no three
+checks were ever enumerated there — the fallthrough itself just gains a
+`BottomDock` arm. Reworded to say that directly.
