@@ -68,8 +68,10 @@ impl NavHistory {
 }
 ```
 
-Carries over all 13 tests from `crates/ui/src/nav_history.rs`'s
-`#[cfg(test)] mod tests` unchanged. `recent_locations()` (the
+Carries over the 7 tests from `crates/ui/src/nav_history.rs`'s
+`#[cfg(test)] mod tests` that don't exercise `recent_locations()`
+unchanged (the other 4 are dropped along with that method -- see below).
+`recent_locations()` (the
 most-recent-first iterator `ide-ui`'s Recent Locations popup reads) is
 **not** ported — no consumer for it in `ide-tui` per §1's scope note;
 `ide-tui`'s copy of the struct is otherwise identical so a future Recent
