@@ -48,6 +48,7 @@ mod highlight;
 mod k8s_panel;
 mod keymap;
 mod lsp_bridge;
+mod nav_history;
 mod project_state;
 mod scratch;
 mod search_panel;
