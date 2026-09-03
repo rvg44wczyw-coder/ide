@@ -1,0 +1,30 @@
+@startuml tui-git-gutter-state
+title TUI Git Gutter (T30) -- ambient marks & popup lifecycle
+
+[*] --> NoMarks
+
+state NoMarks {
+  state "No repo / untracked / no diff / dirty buffer" as Empty
+  [*] --> Empty
+}
+
+state MarksShown {
+  state "Sign column rendered\n(+ green / ~ blue / - red / blank)" as Lane
+  [*] --> Lane
+}
+
+NoMarks --> MarksShown : sync_git_gutter\n(clean buffer, repo has a diff)
+MarksShown --> NoMarks : buffer becomes dirty\n(edit, before next save)
+MarksShown --> MarksShown : Save (success)\n[sync_git_gutter re-derives next frame]
+
+state "Revert/Show Diff popup" as Popup {
+  state "r: Revert Hunk\nd: Show Diff" as Actions
+  [*] --> Actions
+}
+
+Lane --> Popup : click sign column\non a marked line\n(click_git_gutter_lane)
+Popup --> MarksShown : r (trigger_revert_hunk)\n[one undo step, no disk write]
+Popup --> MarksShown : d (trigger_show_diff_for_gutter)\n[opens Git Panel diff pane]
+Popup --> MarksShown : Esc / any other key
+
+@enduml
