@@ -2480,9 +2480,10 @@ impl App {
 
     /// `Enter` while `search_state.field` is `Replacement` (`docs/features/
     /// tui-search-and-replace-in-path.md` §2.2/§3.3). No-op while a replace
-    /// is already in flight, the (trimmed) query or replacement is empty,
-    /// or no project is open (mirrors `search-in-path-v2.md`'s own
-    /// `run_replace_preview` guard).
+    /// is already in flight, or the (trimmed) query or replacement is
+    /// empty. (`search-in-path-v2.md`'s own `run_replace_preview` also
+    /// guards on "no project" -- inapplicable here, since `ide-tui`'s
+    /// `App` always has a project once constructed.)
     fn run_replace_preview(&mut self) {
         if self.search.replacing {
             return;
@@ -6591,11 +6592,19 @@ impl App {
     /// folding it into the char's case, unlike a plain typed keystroke).
     ///
     /// `Ctrl+Shift+R` (Replace All, `docs/features/tui-replace-all.md`
-    /// §2.2) is *never* also registered in `commands()`/`Action`, unlike
-    /// `Ctrl+R`: closing the bar drops `FindState` entirely, so a global
-    /// "fresh, bar closed" registration would always have an empty query
-    /// to act on -- the same no-op-or-unreachable shape that already
-    /// keeps `Ctrl+G`/`Ctrl+Shift+G` find-bar-local.
+    /// §2.2) is never registered in `commands()`/`Action` *for this
+    /// meaning*, unlike `Ctrl+R`: closing the bar drops `FindState`
+    /// entirely, so a global "fresh, bar closed" registration would always
+    /// have an empty query to act on -- the same no-op-or-unreachable
+    /// shape that already keeps `Ctrl+G`/`Ctrl+Shift+G` find-bar-local.
+    /// (`docs/features/tui-search-and-replace-in-path.md`'s `T37` later
+    /// claims this same chord in `commands()`/`Action` for its own,
+    /// unrelated `ReplaceInPath` command -- no collision, since `self.
+    /// find.is_some()` above returns from this function before `handle_
+    /// key`'s `keymap.action_for` dispatch is ever reached, so the two
+    /// meanings are mutually exclusive by construction: this arm only
+    /// fires with the find bar open, `ReplaceInPath` only resolves with it
+    /// closed.)
     ///
     /// `Ctrl+R` here (rather than only in `run_action`'s `Action::Replace`
     /// arm) is what makes "reveal the replace row on an already-open

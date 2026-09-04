@@ -235,18 +235,23 @@ impl App {
   matter for these two keys either way; `Enter`'s behavior depends on
   `field` — see below.
 - `submit_or_open_search_result` — `Enter` while `field` is `Query`,
-  `Include`, or `Exclude`: T15's exact submit-vs-open disambiguation,
-  extended to key on `(query, options)` together, not `query` alone
-  (§3.2) — a field/option edit that leaves the query text itself unchanged
-  still counts as "the results shown no longer answer the current
-  request," a case T15 itself never had to handle since it had no options
-  to vary independently of the query string.
+  `Include`, `Exclude`, **or one of the four boolean fields** (`Enter`
+  has no separate meaning of its own on a boolean field, so it falls
+  through to the same submit-vs-open path as the three string fields):
+  T15's exact submit-vs-open disambiguation, extended to key on `(query,
+  options)` together, not `query` alone (§3.2) — a field/option edit that
+  leaves the query text itself unchanged still counts as "the results
+  shown no longer answer the current request," a case T15 itself never
+  had to handle since it had no options to vary independently of the
+  query string.
 - `run_replace_preview` — `Enter` while `field` is `Replacement`. No-op if
   `self.search.replacing`, or if `search_state.query.trim()`/
-  `search_state.replacement` is empty, or no project (mirrors
-  `search-in-path-v2.md` §2.2's own `run_replace_preview` guard); otherwise
-  calls `self.search.run_replace(self.tree.clone(), query, replacement,
-  self.search_options.clone())`.
+  `search_state.replacement` is empty; otherwise calls `self.search.
+  run_replace(self.tree.clone(), query, replacement, self.search_options.
+  clone())`. (`search-in-path-v2.md` §2.2's own `run_replace_preview` also
+  guards on "no project" — that clause doesn't carry over here: `ide-tui`'s
+  `App` always has a project once constructed, so there is no "no project"
+  state for this crate to check.)
 - `handle_replace_preview_key` — while `pending_replace_in_path_preview`
   is `Some`: `Enter` calls `confirm_replace_in_path_preview`, `Esc` calls
   `cancel_replace_in_path_preview`, every other key ignored (matches
@@ -457,6 +462,15 @@ search_in_path`'s own behavior, already merged, not re-described here.
 `search_options`'s default (`respect_gitignore: true`, everything else
 `Default::default()`/empty) matches `ide-ui`'s own default exactly.
 
+`search_state.include`/`exclude` are single free-text fields, not a list
+widget — `current_search_options` (§2.2) splits each on `,`, trims each
+piece, and drops blank pieces, identical to `ide-ui`'s already-shipped
+`split_glob_list` (`crates/ui/src/app.rs`). This means a glob that itself
+legitimately contains a comma — a brace-alternation pattern like
+`{*.rs,*.toml}` — gets shredded into `{*.rs` and `*.toml}` rather than
+kept whole. Pre-existing limitation inherited from `search-in-path-v2.md`
+(same algorithm, same gap), not a new regression introduced by this port.
+
 ## 4. Constraints & invariants
 
 - **No new `ide-core`/`ide-lsp` surface** — see §1.
@@ -547,3 +561,21 @@ preview`); nothing new enough in shape to warrant one.
   one field in this group that *does* reset on `close_all_overlays`,
   matching `pending_rename_preview`'s precedent; `search`/`search_state`/
   `search_options`/`search_replace_open` still do not.
+- `rev`'s code-review pass found four Low-severity doc/comment-accuracy
+  gaps, all fixed: (1) §2.2's `run_replace_preview` description and its
+  matching rustdoc comment both claimed a "no project" guard that isn't
+  implemented and doesn't apply to `ide-tui` (this crate's `App` always
+  has a project once constructed) — the clause is removed and replaced
+  with an explanatory note; (2) §2.2 never stated what `Enter` does on one
+  of the four boolean fields — added a sentence confirming it falls
+  through to `submit_or_open_search_result`, the same as `Query`/
+  `Include`/`Exclude`; (3) §3.6 gained a note documenting `current_search_
+  options`'s comma-separated glob-list parsing and its brace-alternation-
+  glob edge case (a pre-existing limitation inherited from `search-in-
+  path-v2.md`'s `split_glob_list`, not a new regression); (4) `handle_find_
+  key`'s pre-existing doc comment in `app.rs` claimed `Ctrl+Shift+R` is
+  "never also registered in `commands()`/`Action`" — now false since this
+  phase registers exactly that chord for the unrelated `ReplaceInPath`
+  command — updated to acknowledge the new registration and explain why
+  the two don't collide (mutually exclusive by `self.find.is_some()`'s
+  early return ahead of keymap dispatch).
