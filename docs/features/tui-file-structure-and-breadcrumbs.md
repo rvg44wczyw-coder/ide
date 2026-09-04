@@ -201,10 +201,15 @@ While open:
   `selected` to `0` on every edit (same "stale index past a shorter new
   list" fix `tui-go-to-file-and-symbol.md` §7 already made for its own
   two overlays — applied here from the start).
-- `Up`/`Down` move `selected`, wrapping via `rem_euclid` against the
-  current `visible_rows(...)` length, same shape every other list popup
-  in this crate uses.
-- `Enter` or a row click calls `confirm_file_structure`.
+- `Up`/`Down` move `selected`, clamping at `0` and `visible_rows(...).len()
+  - 1` rather than wrapping — the actual shape `handle_go_to_file_key`/
+  `handle_go_to_symbol_key` use (checked directly: neither wraps, despite
+  an earlier draft of this section claiming otherwise).
+- `Enter` calls `confirm_file_structure` — no row-click path, consistent
+  with `render_go_to_symbol_popup`'s own popup (this crate's `HitMap` has
+  no per-row click target for any list popup, only `tree_area`/
+  `editor_text_area`/`tab_strip`) and with §1.2's own framing of this
+  popup as reached via "Up/Down/Enter".
 - `Esc` closes without jumping.
 
 No background thread, no polling — `visible_rows` is called fresh every
@@ -358,3 +363,19 @@ Tests required:
    ROWS`'s new value is exercised indirectly by any existing scroll/caret
    test that already depends on the constant being consistent with
    `render_editor`'s actual layout.
+
+## Revision notes
+
+- §3.1: corrected the Up/Down description from "wraps via `rem_euclid`"
+  to "clamps" after `rev`'s code-review pass checked
+  `handle_go_to_file_key`/`handle_go_to_symbol_key` directly and found
+  neither actually wraps — the original wording was simply wrong about
+  this crate's established convention. The shipped implementation
+  clamps (matching every other list popup here) and needed no code
+  change.
+- §3.1: dropped "or a row click" from `confirm_file_structure`'s trigger
+  list — no list popup in this crate has a `HitMap` entry for its rows
+  (confirmed: `HitMap` only tracks `tree_area`/`editor_text_area`/
+  `tab_strip`), and §1.2 already correctly describes this popup as
+  keyboard-only. The shipped implementation has no click handling and
+  needed no code change.
