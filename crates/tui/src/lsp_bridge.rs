@@ -5,12 +5,14 @@
 //! tui-hover-and-inlay-hints.md` (`T12`) for hover/document-highlight/
 //! inlay hints, and by `docs/features/tui-code-actions-and-rename.md`
 //! (`T13`) for code actions and rename, and by `docs/features/
-//! tui-go-to-file-and-symbol.md` (`T16`) for document/workspace symbols.
+//! tui-go-to-file-and-symbol.md` (`T16`) for document/workspace symbols,
+//! and by `docs/features/tui-formatting.md` (`T38`) for Reformat Code /
+//! Format on Save.
 //! Scoped to exactly what these features need -- buffer lifecycle
 //! notifications, Go to Declaration / Find Usages queries, diagnostics,
 //! semantic tokens, hover, document highlight, inlay hints, code actions,
-//! rename, and document/workspace symbols -- not the full surface
-//! `crates/ui/src/lsp_bridge.rs` exposes (no formatting). Mirrors that
+//! rename, document/workspace symbols, and formatting -- not the full
+//! surface `crates/ui/src/lsp_bridge.rs` exposes. Mirrors that
 //! file's conventions at a fraction of its size: a per-query `finding_*`/
 //! `*_ready` flag pair,
 //! clear-at-send, replace-wholesale on response, `ServerExited` clears
@@ -112,6 +114,21 @@ pub(crate) struct LspBridge {
     /// Go to Symbol's non-empty-query branch -- replaced wholesale on each
     /// `LspEvent::WorkspaceSymbol`.
     pub(crate) workspace_symbols: Vec<Symbol>,
+    /// The outcome of the most recently sent, not-yet-superseded
+    /// `Format`/`FormatRange` query -- replaced wholesale on each
+    /// `LspEvent::FormatReady`, cleared at send-time (same convention
+    /// `workspace_edit`/`code_actions` already follow in this struct;
+    /// `docs/features/tui-formatting.md` §2.3).
+    pub(crate) format_edit: Option<WorkspaceEdit>,
+    /// The path `format_edit` answers -- mirrors `workspace_edit_label`'s
+    /// staleness-guard role for every other per-path response in this
+    /// struct.
+    pub(crate) format_path: Option<PathBuf>,
+    /// True for exactly one `poll()` call after a `FormatReady` event
+    /// lands -- reset to `false` at the top of every `poll()`, same
+    /// one-frame-true edge every other `*_ready` flag in this struct
+    /// already establishes.
+    pub(crate) format_ready: bool,
 }
 
 impl LspBridge {
@@ -159,6 +176,9 @@ impl LspBridge {
         self.document_symbols_path = None;
         self.document_symbols_ready = false;
         self.workspace_symbols.clear();
+        self.format_edit = None;
+        self.format_path = None;
+        self.format_ready = false;
         match LspClient::start_with_command(project_root, command, args) {
             Ok(client) => self.client = Some(client),
             Err(e) => self.server_error = Some(e.to_string()),
@@ -371,6 +391,61 @@ impl LspBridge {
         });
     }
 
+    /// `tab_size`/`insert_spaces` come from the caller's already-resolved
+    /// `ide_core::IndentUnit` -- `ide-lsp` has no dependency on `ide-core`
+    /// and cannot resolve this itself (`docs/features/tui-formatting.md`
+    /// §2.3).
+    ///
+    /// Unlike every other `request_*` method on this type, a missing
+    /// client is **not** a silent no-op: it immediately sets
+    /// `format_ready = true`, `format_edit = None`,
+    /// `format_path = Some(path.to_path_buf())`, entirely inside
+    /// `LspBridge` -- the same observable outcome an unsupported-
+    /// capability response produces one layer down, so every caller
+    /// (including `maybe_trigger_format_on_save`'s bookkeeping) can rely
+    /// on "calling this always eventually sets `format_ready`" without
+    /// checking `LspBridge::is_running()` first.
+    pub(crate) fn request_format(&mut self, path: &Path, tab_size: u32, insert_spaces: bool) {
+        self.format_edit = None;
+        self.format_path = Some(path.to_path_buf());
+        if self.client.is_none() {
+            self.format_ready = true;
+            return;
+        }
+        self.send(LspRequest::Format {
+            path: path.to_path_buf(),
+            tab_size,
+            insert_spaces,
+        });
+    }
+
+    /// Same, for a range -- no `ide-tui` caller in this phase (no "current
+    /// selection" range plumbed out to app state for any LSP feature to
+    /// consume yet). Kept for wire-level parity and so a future
+    /// range-aware feature has it ready to call. Same no-client guarantee
+    /// as `request_format`.
+    #[allow(dead_code)]
+    pub(crate) fn request_format_range(
+        &mut self,
+        path: &Path,
+        range: Range,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) {
+        self.format_edit = None;
+        self.format_path = Some(path.to_path_buf());
+        if self.client.is_none() {
+            self.format_ready = true;
+            return;
+        }
+        self.send(LspRequest::FormatRange {
+            path: path.to_path_buf(),
+            range,
+            tab_size,
+            insert_spaces,
+        });
+    }
+
     /// Drains every event the client has ready. Returns whether anything
     /// changed, matching `ide-ui`'s `poll()` return contract even though
     /// this bridge's callers don't currently use it.
@@ -381,6 +456,7 @@ impl LspBridge {
         self.prepare_rename_ready = false;
         self.rename_ready = false;
         self.document_symbols_ready = false;
+        self.format_ready = false;
         let mut changed = false;
         while let Some(client) = &mut self.client {
             let Some(event) = client.try_recv() else {
@@ -473,10 +549,11 @@ impl LspBridge {
                     // at the top of this call), so there is nothing stale
                     // left to observe even without an explicit clear.
                 }
-                // `FormatReady` is the only remaining event kind with no
-                // state in this crate to update -- this bridge doesn't send
-                // `Format`/`FormatRange` requests, so it never arrives.
-                _ => {}
+                LspEvent::FormatReady { path, edit } => {
+                    self.format_edit = edit;
+                    self.format_path = Some(path);
+                    self.format_ready = true;
+                }
             }
         }
         changed
@@ -725,6 +802,43 @@ mod tests {
         assert!(bridge.rename_new_name.is_none());
     }
 
+    // Unlike every other `request_*with_no_client_running` case above, a
+    // missing client is deliberately NOT a no-op here -- `format_ready`
+    // must flip immediately so a caller never has to special-case
+    // `is_running()` before deciding whether a Reformat Code request will
+    // ever resolve (`docs/features/tui-formatting.md` §2.3).
+    #[test]
+    fn request_format_with_no_client_running_sets_ready_immediately() {
+        let mut bridge = LspBridge {
+            format_edit: Some(WorkspaceEdit { edits: vec![] }),
+            ..LspBridge::default()
+        };
+        bridge.request_format(Path::new("/f.rs"), 4, true);
+        assert!(bridge.format_ready);
+        assert!(bridge.format_edit.is_none());
+        assert_eq!(bridge.format_path, Some(PathBuf::from("/f.rs")));
+    }
+
+    #[test]
+    fn request_format_range_with_no_client_running_sets_ready_immediately() {
+        let mut bridge = LspBridge {
+            format_edit: Some(WorkspaceEdit { edits: vec![] }),
+            ..LspBridge::default()
+        };
+        bridge.request_format_range(
+            Path::new("/f.rs"),
+            ide_lsp::Range {
+                start: position(),
+                end: position(),
+            },
+            4,
+            true,
+        );
+        assert!(bridge.format_ready);
+        assert!(bridge.format_edit.is_none());
+        assert_eq!(bridge.format_path, Some(PathBuf::from("/f.rs")));
+    }
+
     /// `"true"` is a real, always-available binary that exits immediately
     /// -- spawns successfully (so `start_with_command` reports running),
     /// then its stdout closing drives `ide-lsp`'s background event loop to
@@ -888,5 +1002,14 @@ mod tests {
         );
 
         bridge.request_rename(Path::new("/f.rs"), position(), "new_name".to_string());
+
+        // `format_ready` is untouched (still `false`) here since the
+        // client is running -- it only flips true on the missing-client
+        // fast path (covered above) or once a real `FormatReady` event
+        // arrives via `poll()`, which needs a fixture-backed server, not
+        // `cat`.
+        bridge.request_format(Path::new("/f.rs"), 4, true);
+        assert!(!bridge.format_ready);
+        assert_eq!(bridge.format_path, Some(PathBuf::from("/f.rs")));
     }
 }

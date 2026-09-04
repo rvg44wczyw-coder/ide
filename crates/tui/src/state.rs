@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedState {
     pub last_project: Option<PathBuf>,
+    /// `#[serde(default)]` so a state file written before `T38` (Reformat
+    /// Code + Format on Save, `docs/features/tui-formatting.md` §2.3)
+    /// still deserializes -- a missing field means "not yet toggled on",
+    /// i.e. `false`, matching `bool::default()`.
+    #[serde(default)]
+    pub format_on_save: bool,
 }
 
 /// Best-effort load: a missing file, malformed JSON, or an unresolvable
@@ -37,8 +43,13 @@ pub fn save(state: &PersistedState) {
 }
 
 /// Split out from [`load`] so tests can point it at a tempdir-backed file
-/// directly, without mutating any real process environment variable.
-fn load_from(path: &Path) -> PersistedState {
+/// directly, without mutating any real process environment variable. Also
+/// used directly by `App`'s own `state_path_override` (`docs/features/
+/// tui-formatting.md` §2.3), the same convention `keymap::load_from`/
+/// `keymap::save_to` already establish for that crate's other persisted
+/// setting, so a test exercising `App::toggle_format_on_save` never writes
+/// to the real `$HOME/.config/ide-tui/state.json`.
+pub(crate) fn load_from(path: &Path) -> PersistedState {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|contents| serde_json::from_str(&contents).ok())
@@ -46,7 +57,7 @@ fn load_from(path: &Path) -> PersistedState {
 }
 
 /// Split out from [`save`] for the same reason as [`load_from`].
-fn save_to(path: &Path, state: &PersistedState) {
+pub(crate) fn save_to(path: &Path, state: &PersistedState) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -87,9 +98,24 @@ mod tests {
         let path = dir.path().join("nested/state.json");
         let remembered = PersistedState {
             last_project: Some(PathBuf::from("/tmp/some-project")),
+            format_on_save: true,
         };
         save_to(&path, &remembered);
         assert_eq!(load_from(&path), remembered);
+    }
+
+    #[test]
+    fn load_on_a_pre_t38_file_without_format_on_save_defaults_it_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, r#"{"last_project":"/tmp/some-project"}"#).unwrap();
+        assert_eq!(
+            load_from(&path),
+            PersistedState {
+                last_project: Some(PathBuf::from("/tmp/some-project")),
+                format_on_save: false,
+            }
+        );
     }
 
     #[test]
@@ -109,6 +135,7 @@ mod tests {
             &path,
             &PersistedState {
                 last_project: Some(PathBuf::from("/tmp/x")),
+                format_on_save: false,
             },
         );
         assert!(path.exists());
