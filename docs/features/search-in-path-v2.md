@@ -590,3 +590,26 @@ follow-up-note precedent).
   itself, so a user who hits the rejection sees the escape hatch inline
   rather than needing to find this doc. New regression test:
   `backslash_escaped_bang_excludes_the_literal_filename`.
+- §2.2's `build_matchers`, a second, closely-related finding surfaced by a
+  `hacker` adversarial pass over this same fix (bypass/edge-case testing of
+  the `!`-rejection above, not a re-run of the earlier broader review): an
+  *empty-string* exclude pattern reaches `format!("!{pattern}")` untouched
+  by the leading-`!` check (an empty string doesn't start with anything),
+  producing the bare string `"!"` — which `ignore::gitignore`'s parser
+  treats exactly like the leading-`!` case, consuming it as a negation
+  marker with an empty remainder that compiles to a glob matching *every*
+  path. Live-verified: `exclude: vec!["".to_string()]` against a
+  two-file project returned zero matches, not two — every file silently
+  excluded. Same root mechanism, same silent-misfire-on-a-write-path
+  concern as the leading-`!` bug, just reached through a different input
+  shape the first fix didn't cover. Fixed by skipping (not erroring on) an
+  empty pattern in both the include and exclude loops — a blank pattern is
+  a no-op, matching how an empty include pattern already behaved by
+  accident (verified: empty include left results unaffected, unlike empty
+  exclude). Both frontends already filter blank glob-list entries out
+  before they reach `PathSearchOptions` (comma-split, trimmed, non-empty
+  only per `current_search_options`/`split_glob_list`), so this was
+  unreachable through the shipped UI — the fix is `ide_core`'s own
+  public-API robustness, not a user-facing regression fix. New regression
+  tests: `empty_exclude_pattern_is_ignored_not_treated_as_exclude_
+  everything`, `empty_include_pattern_is_ignored`.

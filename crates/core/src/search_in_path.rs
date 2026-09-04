@@ -114,6 +114,23 @@ pub enum PathSearchError {
 /// here -- verified live: `ignore`'s glob parser reports it as an unclosed
 /// character class once the forced `!` prefix is prepended, so backslash
 /// escaping is the only supported escape hatch.)
+///
+/// An empty-string pattern is skipped entirely in both loops, rather than
+/// handed to `OverrideBuilder::add`, for the same "never silently misfire
+/// on a write path" reason as the leading-`!` rejection above -- and
+/// specifically for `exclude`, this isn't a hypothetical: `format!("!{}",
+/// "")` produces the bare string `"!"`, which the underlying
+/// `ignore::gitignore` parser treats exactly like the leading-`!` case
+/// above (consumes the forced `!` as its own negation marker, leaving an
+/// empty remainder that compiles to a `**/`-prefixed glob matching *every*
+/// path) -- silently excluding everything, verified live. Unlike the
+/// leading-`!` case this can't be caught by `starts_with('!')` (an empty
+/// string doesn't start with anything), so it needs its own guard. Both
+/// frontends already filter blank glob-list entries out of the `Vec`
+/// before it reaches `PathSearchOptions` (comma-split, trimmed, non-empty
+/// only), so this is unreachable through the shipped UI today; the guard
+/// exists for `ide_core::search_in_path`'s own public-API robustness, the
+/// same reasoning already applied to the leading-`!` case.
 fn build_matchers(
     root: &Path,
     options: &PathSearchOptions,
@@ -128,6 +145,9 @@ fn build_matchers(
 
     let mut override_builder = OverrideBuilder::new(root);
     for pattern in &options.include {
+        if pattern.is_empty() {
+            continue;
+        }
         override_builder
             .add(pattern)
             .map_err(|source| PathSearchError::InvalidGlob {
@@ -136,6 +156,9 @@ fn build_matchers(
             })?;
     }
     for pattern in &options.exclude {
+        if pattern.is_empty() {
+            continue;
+        }
         if pattern.starts_with('!') {
             return Err(PathSearchError::InvalidGlob {
                 glob: pattern.clone(),
@@ -576,6 +599,43 @@ mod tests {
             .map(|m| m.path.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["keep.rs".to_string()]);
+    }
+
+    #[test]
+    fn empty_exclude_pattern_is_ignored_not_treated_as_exclude_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        stdfs::write(dir.path().join("keep.rs"), "needle").unwrap();
+        stdfs::write(dir.path().join("drop.rs"), "needle").unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let tree = project.scan_tree();
+
+        // Before this fix, `format!("!{pattern}")` on an empty pattern
+        // produced the bare string "!", which the `ignore` crate's parser
+        // treats as a negation marker with an empty remainder -- compiling
+        // to a glob that matches every path, silently excluding
+        // everything. An empty pattern must be a no-op, not a blanket
+        // exclude.
+        let options = PathSearchOptions {
+            exclude: vec!["".to_string()],
+            ..opts()
+        };
+        let results = search_tree_advanced(&tree, "needle", &options).unwrap();
+        assert_eq!(results.matches.len(), 2);
+    }
+
+    #[test]
+    fn empty_include_pattern_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        stdfs::write(dir.path().join("keep.rs"), "needle").unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let tree = project.scan_tree();
+
+        let options = PathSearchOptions {
+            include: vec!["".to_string()],
+            ..opts()
+        };
+        let results = search_tree_advanced(&tree, "needle", &options).unwrap();
+        assert_eq!(results.matches.len(), 1);
     }
 
     #[test]
