@@ -90,6 +90,13 @@ impl GitRepo {
         remote_name: &str,
         on_progress: impl FnMut(TransferProgress),
     ) -> Result<(), GitError>;
+    // Caps local ref-update application at `MAX_ADVERTISED_REFS` via
+    // `update_tips` -- a `hacker` pass (Revision notes #9) found this
+    // does NOT bound the cost of receiving/parsing the remote's initial
+    // ref advertisement itself (no hook in `git2` 0.21.0's public API
+    // fires during that phase); see `MAX_ADVERTISED_REFS`'s own doc
+    // comment for the honest scope of what this cap does and doesn't
+    // cover.
 
     /// Resolves the current branch name *first* — `GitError::DetachedHead`
     /// if `HEAD` isn't on a branch — before doing anything else, so a
@@ -138,6 +145,13 @@ impl GitRepo {
         remote_name: &str,
         on_progress: impl FnMut(PushProgress),
     ) -> Result<(), GitError>;
+    // Hardened (Revision notes #9): `git2` 0.21.0's own FFI trampoline for
+    // `push_update_reference` panics instead of erroring if the remote's
+    // rejection reason is invalid UTF-8 -- `push` wraps the underlying
+    // `Remote::push` call in `std::panic::catch_unwind` and converts a
+    // caught panic into `Err(GitError::PushRejected(_))` with a fixed,
+    // honest message (the original panic payload carries no recoverable
+    // information by the time it reaches this boundary).
 }
 
 /// Byte-level push progress (`git2::RemoteCallbacks::
@@ -626,6 +640,19 @@ adversarial *server-controlled* rejection message (arbitrary bytes,
 oversized, non-UTF-8) to confirm `PushRejected`'s payload handling doesn't
 assume anything about what a server sends back.
 
+**Update (Revision notes #9):** that exact adversarial-rejection-message
+test was run, and did find something — a non-UTF-8 rejection reason panics
+inside `git2`-rs's own FFI trampoline rather than reaching `PushRejected`
+at all. `push` now catches this (see §2.1's `push` doc comment); a
+`hacker` pass on a future round should confirm the fix rather than
+assuming it from this doc alone. Similarly, `fetch`'s ref-advertisement
+handling has no cap a malicious/misbehaving remote can't trivially exceed
+(§2.1's `fetch`/`MAX_ADVERTISED_REFS` doc comments) — a real, if narrower
+than the advertisement-parsing cost itself, protection now exists via
+`update_tips` for the local-ref-application step, but the advertisement-
+parsing cost is not fixable within `git2` 0.21.0's public API and remains
+open.
+
 ## 7. Diagram
 
 ![Pull sequence](diagrams/git-fetch-pull-push-sequence.png)
@@ -692,3 +719,36 @@ the original draft:**
    same rejection-detection *wiring* via a ref-hierarchy collision instead
    of divergence, since divergence-based rejection is untestable against
    a local remote at all. §6's `hacker`-guidance was adjusted accordingly.
+
+**`hacker`'s adversarial pass on `rust-core-dev`'s implementation
+(`docs/security-findings/git-fetch-pull-push-2026-09-04.md`), fixed same
+day:**
+
+9. `push` now wraps its `Remote::push(...)` call in
+   `std::panic::catch_unwind`, converting a caught panic into
+   `Err(GitError::PushRejected(_))` with a fixed message. Root cause: a
+   live loopback test (a from-scratch minimal git-wire-protocol server,
+   since real `git-receive-pack`'s own hook-rejection messages are fixed
+   strings that never reach this field) confirmed `git2` 0.21.0's FFI
+   trampoline for `push_update_reference` calls
+   `str::from_utf8(...).unwrap()` on the remote-supplied rejection reason,
+   panicking instead of erroring when it's invalid UTF-8 — entirely under
+   a malicious/misbehaving remote's control. `fetch` gained a new
+   `MAX_ADVERTISED_REFS` constant and an `update_tips`-based cap
+   (`GitRepo::fetch_capped`, `fetch`'s private implementation), added as
+   the originally-planned mitigation for a live-confirmed resource-
+   exhaustion issue (2,000,000 fake refs cost ~26s/~400MB against a
+   `fetch` with no cap). That mitigation was then found, empirically, to
+   be *incomplete*: `update_tips` only fires while applying already-
+   negotiated local ref updates, never during the ref-advertisement phase
+   itself where the measured cost actually occurs — confirmed by directly
+   instrumenting `update_tips` against the same adversarial server and
+   observing zero invocations despite the full ~5s parsing cost still
+   being paid. No hook in `git2` 0.21.0's public API intercepts the
+   advertisement phase, so that specific cost is not fixable without
+   patching libgit2 or writing a custom transport, and is documented as an
+   open, upstream-level limitation (`MAX_ADVERTISED_REFS`'s own doc
+   comment) rather than presented as resolved. The cap that *was*
+   implemented still provides genuine, narrower protection: an attacker
+   who gets a fetch past the advertisement phase can no longer force an
+   unbounded number of local ref updates to be applied afterward.
