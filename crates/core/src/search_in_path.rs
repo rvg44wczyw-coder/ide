@@ -84,7 +84,8 @@ pub enum PathSearchError {
 /// -failure convention `crate::search::search_file` already uses for
 /// unreadable files), not a hard error.
 ///
-/// An exclude pattern that itself starts with `!` is rejected outright
+/// An exclude pattern that itself starts with an *unescaped* `!` is
+/// rejected outright
 /// (`docs/security-findings/tui-search-and-replace-in-path-2026-09-04.md`,
 /// finding 1) rather than passed through: every exclude pattern is already
 /// forced through `format!("!{pattern}")` below to make it a blacklist
@@ -96,6 +97,23 @@ pub enum PathSearchError {
 /// to disk. Failing closed here is deliberately more restrictive than
 /// necessary for the (rarer) literal-filename-starting-with-`!` case, in
 /// exchange for never silently defeating a user's exclude intent.
+///
+/// A pattern only starting with a *literal* `!` is not actually
+/// unreachable: `OverrideBuilder::add` (via `ignore::gitignore`'s parser,
+/// `backslash_escape(true)`) already treats a backslash as an escape
+/// character in glob patterns, so a user who types `\!important.txt` gets
+/// the forced prefix (`!\!important.txt`) parsed as one negation marker
+/// (`!`, consumed as the forced blacklist marker) followed by the literal,
+/// escaped filename `\!important.txt` -- excluding exactly the file
+/// literally named `!important.txt`, nothing more. Only a *bare* leading
+/// `!` (the doubled-negation footgun) is rejected; `starts_with('!')`
+/// correctly leaves a leading `\` alone. This is called out in this
+/// module's `PathSearchError::InvalidGlob` message so a user who hits the
+/// rejection has a documented way to still express the literal exclude.
+/// (The bracket-class alternative, `[!]important.txt`, does **not** work
+/// here -- verified live: `ignore`'s glob parser reports it as an unclosed
+/// character class once the forced `!` prefix is prepended, so backslash
+/// escaping is the only supported escape hatch.)
 fn build_matchers(
     root: &Path,
     options: &PathSearchOptions,
@@ -124,7 +142,9 @@ fn build_matchers(
                 source: ignore::Error::Glob {
                     glob: Some(pattern.clone()),
                     err: "exclude patterns may not start with '!' -- it would cancel \
-                          the implicit exclusion and silently stop excluding anything"
+                          the implicit exclusion and silently stop excluding anything; \
+                          to exclude a file literally named with a leading '!', escape \
+                          it as '\\!' (e.g. '\\!important.txt')"
                         .to_string(),
                 },
             });
@@ -531,6 +551,31 @@ mod tests {
         };
         let err = search_tree_advanced(&tree, "needle", &options).unwrap_err();
         assert!(matches!(err, PathSearchError::InvalidGlob { .. }));
+    }
+
+    #[test]
+    fn backslash_escaped_bang_excludes_the_literal_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        stdfs::write(dir.path().join("keep.rs"), "needle").unwrap();
+        stdfs::write(dir.path().join("!drop.rs"), "needle").unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let tree = project.scan_tree();
+
+        // The documented escape hatch for a file literally named with a
+        // leading '!': backslash-escape it. Must not be rejected by the
+        // bare-'!' check above (it doesn't start with '!', it starts with
+        // '\'), and must actually exclude only the literal filename.
+        let options = PathSearchOptions {
+            exclude: vec!["\\!drop.rs".to_string()],
+            ..opts()
+        };
+        let results = search_tree_advanced(&tree, "needle", &options).unwrap();
+        let names: Vec<_> = results
+            .matches
+            .iter()
+            .map(|m| m.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["keep.rs".to_string()]);
     }
 
     #[test]

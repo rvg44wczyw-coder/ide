@@ -569,3 +569,24 @@ follow-up-note precedent).
   fails closed instead of silently succeeding with the wrong semantics.
   New regression test: `exclude_pattern_starting_with_bang_is_rejected_
   not_silently_ineffective`.
+- §2.2's `build_matchers`, follow-up to the fix above: the reject-outright
+  fix is deliberately broader than strictly necessary — it also blocks the
+  (rarer) legitimate case of excluding a real file literally named with a
+  leading `!` (e.g. `!important.txt`), a tradeoff the code comment already
+  disclosed but didn't give the user a way out of. `OverrideBuilder::add`
+  (via `ignore::gitignore`'s parser, `backslash_escape(true)`) already
+  treats a backslash as an escape character in glob patterns, so
+  backslash-escaping the leading `!` (`\!important.txt`) reaches
+  `build_matchers` without tripping the bare-`!` check (it starts with
+  `\`, not `!`) and, after the forced `!` prefix, parses as one negation
+  marker followed by the literal escaped filename — excluding exactly
+  `!important.txt`, nothing more. Live-verified with a throwaway probe
+  binary against this exact code path, including ruling out the bracket-
+  class alternative `[!]important.txt`, which `ignore`'s glob parser
+  rejects outright as an unclosed character class once the forced `!`
+  prefix is prepended — backslash-escaping is the only supported escape
+  hatch, not merely the first one tried. Documented in `build_matchers`'s
+  own rustdoc and folded into the `PathSearchError::InvalidGlob` message
+  itself, so a user who hits the rejection sees the escape hatch inline
+  rather than needing to find this doc. New regression test:
+  `backslash_escaped_bang_excludes_the_literal_filename`.
