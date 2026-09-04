@@ -183,23 +183,78 @@ pub(crate) struct Notification {
     pub(crate) read: bool,
 }
 
-/// Find in Path's typed query and list selection (`docs/features/
-/// tui-find-in-path.md` §2.2) -- separate from `search: SearchPanel`
-/// (the background search machinery, ported from `ide-ui`) the same way
+/// Which of Search in Path's fields `Tab`/`BackTab` currently target
+/// (`docs/features/tui-search-and-replace-in-path.md` §2.2) -- the four
+/// string fields edited by `Backspace`/`Char`, the four boolean fields
+/// flipped by `Space`. No keyboard mnemonic exists for the four boolean
+/// options in the reference IDE either (§1.2 of that doc), so they're
+/// exposed as ordinary Tab-reachable fields instead of an invented
+/// binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SearchInPathField {
+    #[default]
+    Query,
+    Include,
+    Exclude,
+    Replacement,
+    CaseSensitive,
+    WholeWord,
+    Regex,
+    RespectGitignore,
+}
+
+impl SearchInPathField {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Query => Self::Include,
+            Self::Include => Self::Exclude,
+            Self::Exclude => Self::Replacement,
+            Self::Replacement => Self::CaseSensitive,
+            Self::CaseSensitive => Self::WholeWord,
+            Self::WholeWord => Self::Regex,
+            Self::Regex => Self::RespectGitignore,
+            Self::RespectGitignore => Self::Query,
+        }
+    }
+
+    pub(crate) fn prev(self) -> Self {
+        match self {
+            Self::Query => Self::RespectGitignore,
+            Self::Include => Self::Query,
+            Self::Exclude => Self::Include,
+            Self::Replacement => Self::Exclude,
+            Self::CaseSensitive => Self::Replacement,
+            Self::WholeWord => Self::CaseSensitive,
+            Self::Regex => Self::WholeWord,
+            Self::RespectGitignore => Self::Regex,
+        }
+    }
+}
+
+/// Search in Path's typed fields and list selection (`docs/features/
+/// tui-search-and-replace-in-path.md` §2.2) -- separate from `search:
+/// SearchPanel` (the background search/replace machinery) the same way
 /// `ProblemsState` is separate from `lsp.diagnostics`: this only tracks
 /// UI-local state, not the results themselves. Persists across the
 /// overlay closing/reopening, same as `cargo`/`CargoPanel` does.
 #[derive(Default)]
 pub(crate) struct SearchOverlayState {
     pub(crate) query: String,
+    pub(crate) include: String,
+    pub(crate) exclude: String,
+    pub(crate) replacement: String,
+    pub(crate) field: SearchInPathField,
     pub(crate) selected: usize,
     /// The exact (trimmed) query string `search.results` currently
     /// reflects, or that a still-in-flight search is answering -- `None`
-    /// until the first search ever runs. Compared against `query` by
+    /// until the first search ever runs. Compared, together with
+    /// `ran_options`, against the current `(query, search_options)` by
     /// `submit_or_open_search_result` to tell "Enter should search again"
     /// from "Enter should open the selected row" apart, since this crate
-    /// has only one key for both actions (§2.2's disambiguation).
+    /// has only one key for both actions (§2.2's disambiguation, extended
+    /// from T15 to also key on options).
     ran_query: Option<String>,
+    ran_options: Option<ide_core::PathSearchOptions>,
 }
 
 /// Go to File's typed query and list selection (`docs/features/
@@ -668,6 +723,17 @@ pub struct App {
     pub(crate) search: SearchPanel,
     pub(crate) search_state: SearchOverlayState,
     pub(crate) search_open: bool,
+    pub(crate) search_options: ide_core::PathSearchOptions,
+    /// Reveals `Replacement`/the four boolean fields in the Tab cycle
+    /// (`docs/features/tui-search-and-replace-in-path.md` §3.1) --
+    /// `trigger_replace_in_path` sets it `true` unconditionally;
+    /// `toggle_search_panel` never touches it either way.
+    pub(crate) search_replace_open: bool,
+    /// A true nested modal over the Search in Path popup, not merely a
+    /// visibility flag -- reset by `close_all_overlays` the same way
+    /// `pending_rename_preview` already is (`docs/features/
+    /// tui-search-and-replace-in-path.md` §3.1's revision notes).
+    pub(crate) pending_replace_in_path_preview: Option<ide_core::ReplaceInPathResult>,
     pub(crate) files_search: FilesSearchPanel,
     pub(crate) go_to_file: Option<GoToFileState>,
     pub(crate) go_to_symbol: Option<GoToSymbolState>,
@@ -866,6 +932,14 @@ impl App {
             search: SearchPanel::default(),
             search_state: SearchOverlayState::default(),
             search_open: false,
+            search_options: ide_core::PathSearchOptions {
+                search: ide_core::buffer_search::SearchOptions::default(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+                respect_gitignore: true,
+            },
+            search_replace_open: false,
+            pending_replace_in_path_preview: None,
             files_search: FilesSearchPanel::default(),
             go_to_file: None,
             go_to_symbol: None,
@@ -1079,6 +1153,13 @@ impl App {
     /// (`docs/features/tui-find-in-path.md` §3.1).
     pub fn poll_search(&mut self) {
         self.search.poll();
+        if self.search.poll_replace() {
+            if let Some(preview) = self.search.replace_preview.take() {
+                self.pending_replace_in_path_preview = Some(preview);
+            } else if let Some(err) = self.search.replace_error.take() {
+                self.notify(err.to_string());
+            }
+        }
         self.files_search.poll();
     }
 
@@ -1755,6 +1836,7 @@ impl App {
         self.notifications_open = false;
         self.hover_open = false;
         self.search_open = false;
+        self.pending_replace_in_path_preview = None;
         self.go_to_file = None;
         self.go_to_symbol = None;
         self.file_structure = None;
@@ -2225,25 +2307,42 @@ impl App {
         LoopSignal::Continue
     }
 
-    /// `Ctrl+Shift+F` command: opens/closes the Find in Path panel. Never
-    /// touches `self.search`/`self.search_state` -- closing hides the
-    /// panel; it never stops a running search or clears the typed query/
-    /// results, so reopening shows exactly what was last there
-    /// (`docs/features/tui-find-in-path.md` §3.1).
+    /// `Ctrl+Shift+F` command: opens/closes the Search in Path panel.
+    /// Never touches `self.search`/`self.search_state`/`self.
+    /// search_options`/`self.search_replace_open` -- closing hides the
+    /// panel; it never stops a running search/replace or clears any typed
+    /// field/option, so reopening shows exactly what was last there
+    /// (`docs/features/tui-search-and-replace-in-path.md` §3.1).
     fn toggle_search_panel(&mut self) {
         let opening = !self.search_open;
         self.close_all_overlays();
         self.search_open = opening;
     }
 
-    /// Handles every key while `search_open` (`docs/features/
-    /// tui-find-in-path.md` §2.2). Typing/Backspace edit the query freely
-    /// at any time; `Up`/`Down` move the row selection, clamped to
-    /// whatever `self.search.results` currently holds; `Enter` defers to
-    /// `submit_or_open_search_result`'s submit-vs-open disambiguation.
+    /// `Ctrl+Shift+R` command: opens the panel (same as `toggle_search_
+    /// panel`'s opening branch) and unconditionally reveals `Replacement`/
+    /// the four boolean fields -- the one asymmetry in an otherwise
+    /// symmetric pair (`docs/features/tui-search-and-replace-in-path.md`
+    /// §3.1): nothing ever un-reveals them short of process restart.
+    fn trigger_replace_in_path(&mut self) {
+        self.close_all_overlays();
+        self.search_open = true;
+        self.search_replace_open = true;
+    }
+
+    /// Handles every key while `search_open` and no replace preview is
+    /// pending (`docs/features/tui-search-and-replace-in-path.md` §2.2).
+    /// `Tab`/`BackTab` move `search_state.field`; `Backspace`/`Char` edit
+    /// whichever string field `field` names (no-op on a boolean field);
+    /// `Space` flips whichever boolean field `field` names (no-op on a
+    /// string field); `Up`/`Down` move the row selection, clamped to
+    /// whatever `self.search.results` currently holds; `Enter`'s meaning
+    /// depends on `field` (§3.2/§3.3).
     fn handle_search_key(&mut self, key: KeyEvent) -> LoopSignal {
         match key.code {
             KeyCode::Esc => self.search_open = false,
+            KeyCode::Tab => self.search_state.field = self.search_state.field.next(),
+            KeyCode::BackTab => self.search_state.field = self.search_state.field.prev(),
             KeyCode::Up => {
                 if self.search_state.selected > 0 {
                     self.search_state.selected -= 1;
@@ -2261,27 +2360,93 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                self.search_state.query.pop();
+                self.search_field_string_mut().map(String::pop);
             }
-            KeyCode::Enter => self.submit_or_open_search_result(),
+            KeyCode::Char(' ') => self.toggle_search_field_bool(),
+            KeyCode::Enter => match self.search_state.field {
+                SearchInPathField::Replacement => self.run_replace_preview(),
+                _ => self.submit_or_open_search_result(),
+            },
             // Any other `Ctrl`-held combo falls through to the wildcard
-            // arm below (ignored), never typed into the query -- same
-            // guard `handle_find_key`'s own query-typing arm uses.
+            // arm below (ignored), never typed into a field -- same guard
+            // `handle_find_key`'s own query-typing arm uses.
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.search_state.query.push(c);
+                if let Some(field) = self.search_field_string_mut() {
+                    field.push(c);
+                }
             }
             _ => {}
         }
         LoopSignal::Continue
     }
 
-    /// `Enter` while `search_open` (`docs/features/tui-find-in-path.md`
-    /// §2.2). No-op while a search is already in flight. Otherwise: an
-    /// empty (trimmed) query is a no-op, matching `ide-ui`'s own
-    /// `run_search` guard; a query that differs from `search_state.
-    /// ran_query` (or nothing has run yet) starts a fresh search and
-    /// resets the row selection; an unchanged query opens the currently
-    /// selected row (if any) and closes the panel.
+    /// `&mut` to whichever of `query`/`include`/`exclude`/`replacement`
+    /// `search_state.field` currently names, or `None` while it names one
+    /// of the four boolean fields.
+    fn search_field_string_mut(&mut self) -> Option<&mut String> {
+        match self.search_state.field {
+            SearchInPathField::Query => Some(&mut self.search_state.query),
+            SearchInPathField::Include => Some(&mut self.search_state.include),
+            SearchInPathField::Exclude => Some(&mut self.search_state.exclude),
+            SearchInPathField::Replacement => Some(&mut self.search_state.replacement),
+            SearchInPathField::CaseSensitive
+            | SearchInPathField::WholeWord
+            | SearchInPathField::Regex
+            | SearchInPathField::RespectGitignore => None,
+        }
+    }
+
+    /// Flips whichever of the four boolean options `search_state.field`
+    /// currently names; no-op while it names a string field.
+    fn toggle_search_field_bool(&mut self) {
+        let options = &mut self.search_options;
+        match self.search_state.field {
+            SearchInPathField::CaseSensitive => {
+                options.search.case_sensitive = !options.search.case_sensitive;
+            }
+            SearchInPathField::WholeWord => {
+                options.search.whole_word = !options.search.whole_word;
+            }
+            SearchInPathField::Regex => options.search.regex = !options.search.regex,
+            SearchInPathField::RespectGitignore => {
+                options.respect_gitignore = !options.respect_gitignore;
+            }
+            SearchInPathField::Query
+            | SearchInPathField::Include
+            | SearchInPathField::Exclude
+            | SearchInPathField::Replacement => {}
+        }
+    }
+
+    /// Parses `search_state.include`/`exclude` (comma-separated, trimmed,
+    /// blank entries dropped) into the glob-pattern lists `PathSearchOptions`
+    /// expects, and returns a full options snapshot combining them with
+    /// the four already-live boolean fields.
+    fn current_search_options(&self) -> ide_core::PathSearchOptions {
+        fn globs(field: &str) -> Vec<String> {
+            field
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+        ide_core::PathSearchOptions {
+            search: self.search_options.search,
+            include: globs(&self.search_state.include),
+            exclude: globs(&self.search_state.exclude),
+            respect_gitignore: self.search_options.respect_gitignore,
+        }
+    }
+
+    /// `Enter` while `search_state.field` is `Query`/`Include`/`Exclude`
+    /// (`docs/features/tui-search-and-replace-in-path.md` §3.2). No-op
+    /// while a search is already in flight. Otherwise: an empty (trimmed)
+    /// query is a no-op, matching `ide-ui`'s own `run_search` guard; a
+    /// `(query, options)` pair that differs from `search_state.
+    /// (ran_query, ran_options)` (or nothing has run yet) starts a fresh
+    /// search and resets the row selection; an unchanged pair opens the
+    /// currently selected row (if any) and closes the panel.
     fn submit_or_open_search_result(&mut self) {
         if self.search.searching {
             return;
@@ -2290,9 +2455,14 @@ impl App {
         if query.is_empty() {
             return;
         }
-        if Some(&query) != self.search_state.ran_query.as_ref() {
-            self.search.run(self.tree.clone(), query.clone());
+        let options = self.current_search_options();
+        if Some(&query) != self.search_state.ran_query.as_ref()
+            || Some(&options) != self.search_state.ran_options.as_ref()
+        {
+            self.search
+                .run(self.tree.clone(), query.clone(), options.clone());
             self.search_state.ran_query = Some(query);
+            self.search_state.ran_options = Some(options);
             self.search_state.selected = 0;
             return;
         }
@@ -2308,13 +2478,72 @@ impl App {
         self.search_open = false;
     }
 
+    /// `Enter` while `search_state.field` is `Replacement` (`docs/features/
+    /// tui-search-and-replace-in-path.md` §2.2/§3.3). No-op while a replace
+    /// is already in flight, or the (trimmed) query or replacement is
+    /// empty. (`search-in-path-v2.md`'s own `run_replace_preview` also
+    /// guards on "no project" -- inapplicable here, since `ide-tui`'s
+    /// `App` always has a project once constructed.)
+    fn run_replace_preview(&mut self) {
+        if self.search.replacing {
+            return;
+        }
+        let query = self.search_state.query.trim().to_string();
+        if query.is_empty() || self.search_state.replacement.is_empty() {
+            return;
+        }
+        let replacement = self.search_state.replacement.clone();
+        let options = self.current_search_options();
+        self.search
+            .run_replace(self.tree.clone(), query, replacement, options);
+    }
+
+    /// Handles every key while `pending_replace_in_path_preview` is
+    /// `Some`. Same shape as `handle_rename_preview_key`.
+    fn handle_replace_preview_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Enter => self.confirm_replace_in_path_preview(),
+            KeyCode::Esc => self.cancel_replace_in_path_preview(),
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Applies the pending preview's edits via `apply_file_edits` --
+    /// already `ide_core::FileEdit`s, no LSP conversion needed
+    /// (`docs/features/tui-search-and-replace-in-path.md` §2.2/§3.3).
+    /// Closes the whole Search in Path panel on success (the operation the
+    /// user opened it for is now done); leaves it open on failure so the
+    /// query/options context isn't lost mid-error.
+    fn confirm_replace_in_path_preview(&mut self) {
+        let Some(preview) = self.pending_replace_in_path_preview.take() else {
+            return;
+        };
+        match self.apply_file_edits(preview.edit.edits, "Replace in Path") {
+            Ok(count) => {
+                self.notify(format!(
+                    "Replace in Path: updated {count} file{}",
+                    if count == 1 { "" } else { "s" }
+                ));
+                self.search_open = false;
+            }
+            Err(err) => self.notify(err),
+        }
+    }
+
+    /// Drops the pending preview; no I/O has happened yet at that point
+    /// (`replace_in_path` never writes to disk).
+    fn cancel_replace_in_path_preview(&mut self) {
+        self.pending_replace_in_path_preview = None;
+    }
+
     /// Same shape as `open_location` but starting from an already-absolute
-    /// byte offset -- a `SearchMatch` carries one directly, unlike a
+    /// byte offset -- a `PathSearchMatch` carries one directly, unlike a
     /// `Location`'s LSP `Position`, so there's no `position_to_byte_offset`
-    /// conversion step (`docs/features/tui-find-in-path.md` §2.2).
-    /// `Selection::caret` clamps internally, so a `byte_offset` stale
-    /// against a file that changed on disk since the search ran can't
-    /// panic -- it just lands somewhere sane.
+    /// conversion step (`docs/features/tui-search-and-replace-in-path.md`
+    /// §2.2). `Selection::caret` clamps internally, so a `byte_offset`
+    /// stale against a file that changed on disk since the search ran
+    /// can't panic -- it just lands somewhere sane.
     fn open_search_result(&mut self, path: PathBuf, byte_offset: usize) {
         if let Err(err) = self.open_or_focus_tab(path) {
             self.notify(err.to_string());
@@ -4477,8 +4706,7 @@ impl App {
         edit: ide_lsp::WorkspaceEdit,
         what: &str,
     ) -> Result<usize, String> {
-        let mut disk_edits: Vec<ide_core::FileEdit> = Vec::new();
-        let mut buffer_edits: Vec<(usize, ide_core::Transaction)> = Vec::new();
+        let mut file_edits: Vec<ide_core::FileEdit> = Vec::new();
 
         for file_edit in &edit.edits {
             let open_tab = self.tabs.iter().position(|tab| tab.path == file_edit.path);
@@ -4502,14 +4730,41 @@ impl App {
                     file_edit.path.display()
                 ));
             };
+            file_edits.push(ide_core::FileEdit {
+                path: file_edit.path.clone(),
+                transaction,
+            });
+        }
+
+        self.apply_file_edits(file_edits, what)
+    }
+
+    /// Split out of `apply_workspace_edit` so `confirm_replace_in_path_
+    /// preview` can reuse the disk/buffer partition-and-apply logic
+    /// directly on an already-built `Vec<ide_core::FileEdit>` -- `replace_
+    /// in_path`'s `ReplaceInPathResult` has no `ide_lsp::WorkspaceEdit` to
+    /// convert from in the first place (`docs/features/
+    /// tui-search-and-replace-in-path.md` §2.2). Behavior-preserving for
+    /// every existing `apply_workspace_edit` caller: same disk/buffer
+    /// partition, same all-or-nothing disk-apply call, same buffer-apply
+    /// loop, same `Ok(file_count)`/`Err(String)` shape.
+    fn apply_file_edits(
+        &mut self,
+        edits: Vec<ide_core::FileEdit>,
+        what: &str,
+    ) -> Result<usize, String> {
+        let mut disk_edits: Vec<ide_core::FileEdit> = Vec::new();
+        let mut buffer_edits: Vec<(usize, ide_core::Transaction)> = Vec::new();
+
+        for file_edit in edits {
+            let open_tab = self.tabs.iter().position(|tab| tab.path == file_edit.path);
             match open_tab {
-                Some(idx) => buffer_edits.push((idx, transaction)),
-                None => disk_edits.push(ide_core::FileEdit {
-                    path: file_edit.path.clone(),
-                    transaction,
-                }),
+                Some(idx) => buffer_edits.push((idx, file_edit.transaction)),
+                None => disk_edits.push(file_edit),
             }
         }
+
+        let file_count = disk_edits.len() + buffer_edits.len();
 
         if !disk_edits.is_empty() {
             let workspace_edit = ide_core::WorkspaceEdit { edits: disk_edits };
@@ -4518,7 +4773,6 @@ impl App {
             }
         }
 
-        let file_count = edit.edits.len();
         for (idx, transaction) in buffer_edits {
             self.tabs[idx].buffer.apply(transaction);
         }
@@ -4911,6 +5165,9 @@ impl App {
         if self.hover_open {
             return self.handle_hover_key(key);
         }
+        if self.pending_replace_in_path_preview.is_some() {
+            return self.handle_replace_preview_key(key);
+        }
         if self.search_open {
             return self.handle_search_key(key);
         }
@@ -5014,6 +5271,7 @@ impl App {
             || self.notifications_open
             || self.hover_open
             || self.search_open
+            || self.pending_replace_in_path_preview.is_some()
             || self.go_to_file.is_some()
             || self.go_to_symbol.is_some()
             || self.file_structure.is_some()
@@ -5305,6 +5563,7 @@ impl App {
             Action::ToggleCargoPanel => self.toggle_cargo_panel(),
             Action::QuickDocumentation => self.trigger_quick_documentation(),
             Action::FindInPath => self.toggle_search_panel(),
+            Action::ReplaceInPath => self.trigger_replace_in_path(),
             Action::ShowIntentionActions => self.trigger_show_intention_actions(),
             Action::Rename => self.trigger_rename(),
             Action::ToggleGitPanel => self.toggle_git_panel(),
@@ -6333,11 +6592,19 @@ impl App {
     /// folding it into the char's case, unlike a plain typed keystroke).
     ///
     /// `Ctrl+Shift+R` (Replace All, `docs/features/tui-replace-all.md`
-    /// §2.2) is *never* also registered in `commands()`/`Action`, unlike
-    /// `Ctrl+R`: closing the bar drops `FindState` entirely, so a global
-    /// "fresh, bar closed" registration would always have an empty query
-    /// to act on -- the same no-op-or-unreachable shape that already
-    /// keeps `Ctrl+G`/`Ctrl+Shift+G` find-bar-local.
+    /// §2.2) is never registered in `commands()`/`Action` *for this
+    /// meaning*, unlike `Ctrl+R`: closing the bar drops `FindState`
+    /// entirely, so a global "fresh, bar closed" registration would always
+    /// have an empty query to act on -- the same no-op-or-unreachable
+    /// shape that already keeps `Ctrl+G`/`Ctrl+Shift+G` find-bar-local.
+    /// (`docs/features/tui-search-and-replace-in-path.md`'s `T37` later
+    /// claims this same chord in `commands()`/`Action` for its own,
+    /// unrelated `ReplaceInPath` command -- no collision, since `self.
+    /// find.is_some()` above returns from this function before `handle_
+    /// key`'s `keymap.action_for` dispatch is ever reached, so the two
+    /// meanings are mutually exclusive by construction: this arm only
+    /// fires with the find bar open, `ReplaceInPath` only resolves with it
+    /// closed.)
     ///
     /// `Ctrl+R` here (rather than only in `run_action`'s `Action::Replace`
     /// arm) is what makes "reveal the replace row on an already-open
@@ -9855,7 +10122,11 @@ mod tests {
     fn enter_while_a_search_is_in_flight_is_a_noop() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.search.run(app.tree.clone(), "hello".to_string());
+        app.search.run(
+            app.tree.clone(),
+            "hello".to_string(),
+            app.search_options.clone(),
+        );
         assert!(app.search.searching);
         app.search_open = true;
         app.search_state.query = "hello".to_string();
@@ -9874,16 +10145,16 @@ mod tests {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.search_open = true;
-        app.search.results = Some(ide_core::SearchResults {
+        app.search.results = Some(ide_core::PathSearchResults {
             matches: vec![
-                ide_core::SearchMatch {
+                ide_core::PathSearchMatch {
                     path: PathBuf::from("/a.txt"),
                     line: 0,
                     column: 0,
                     byte_offset: 0,
                     line_text: "a".to_string(),
                 },
-                ide_core::SearchMatch {
+                ide_core::PathSearchMatch {
                     path: PathBuf::from("/b.txt"),
                     line: 0,
                     column: 0,
@@ -9917,6 +10188,322 @@ mod tests {
 
         let buf = app.active_buffer().unwrap();
         assert_eq!(buf.buffer.text_buffer().selections().primary().start(), 6);
+    }
+
+    // -- T37: Search and Replace in Path
+    // (docs/features/tui-search-and-replace-in-path.md) --
+
+    #[test]
+    fn search_in_path_field_next_cycles_through_every_variant_and_wraps() {
+        let mut field = SearchInPathField::Query;
+        let order = [
+            SearchInPathField::Include,
+            SearchInPathField::Exclude,
+            SearchInPathField::Replacement,
+            SearchInPathField::CaseSensitive,
+            SearchInPathField::WholeWord,
+            SearchInPathField::Regex,
+            SearchInPathField::RespectGitignore,
+            SearchInPathField::Query,
+        ];
+        for expected in order {
+            field = field.next();
+            assert_eq!(field, expected);
+        }
+    }
+
+    #[test]
+    fn search_in_path_field_prev_is_the_exact_reverse_of_next() {
+        let fields = [
+            SearchInPathField::Query,
+            SearchInPathField::Include,
+            SearchInPathField::Exclude,
+            SearchInPathField::Replacement,
+            SearchInPathField::CaseSensitive,
+            SearchInPathField::WholeWord,
+            SearchInPathField::Regex,
+            SearchInPathField::RespectGitignore,
+        ];
+        for field in fields {
+            assert_eq!(field.next().prev(), field);
+        }
+    }
+
+    #[test]
+    fn tab_and_backtab_cycle_the_focused_field_while_search_is_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_open = true;
+        assert_eq!(app.search_state.field, SearchInPathField::Query);
+
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.search_state.field, SearchInPathField::Include);
+
+        app.handle_key(plain_key(KeyCode::BackTab));
+        assert_eq!(app.search_state.field, SearchInPathField::Query);
+    }
+
+    #[test]
+    fn typing_targets_whichever_field_is_focused() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_open = true;
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Include
+        app.handle_key(plain_key(KeyCode::Char('*')));
+        app.handle_key(plain_key(KeyCode::Char('.')));
+        app.handle_key(plain_key(KeyCode::Char('r')));
+        assert_eq!(app.search_state.include, "*.r");
+        assert_eq!(app.search_state.query, "");
+
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.search_state.include, "*.");
+    }
+
+    #[test]
+    fn space_toggles_the_focused_boolean_field_and_is_a_noop_on_a_string_field() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_open = true;
+
+        // `field` starts on `Query`, a string field -- Space is swallowed
+        // as a no-op, not typed into the query.
+        app.handle_key(plain_key(KeyCode::Char(' ')));
+        assert_eq!(app.search_state.query, "");
+
+        app.search_state.field = SearchInPathField::CaseSensitive;
+        assert!(!app.search_options.search.case_sensitive);
+        app.handle_key(plain_key(KeyCode::Char(' ')));
+        assert!(app.search_options.search.case_sensitive);
+        app.handle_key(plain_key(KeyCode::Char(' ')));
+        assert!(!app.search_options.search.case_sensitive);
+
+        app.search_state.field = SearchInPathField::RespectGitignore;
+        let before = app.search_options.respect_gitignore;
+        app.handle_key(plain_key(KeyCode::Char(' ')));
+        assert_eq!(app.search_options.respect_gitignore, !before);
+    }
+
+    #[test]
+    fn current_search_options_parses_comma_separated_globs_and_drops_blanks() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_state.include = " *.rs ,, *.toml".to_string();
+        app.search_state.exclude = "target".to_string();
+
+        let options = app.current_search_options();
+
+        assert_eq!(
+            options.include,
+            vec!["*.rs".to_string(), "*.toml".to_string()]
+        );
+        assert_eq!(options.exclude, vec!["target".to_string()]);
+    }
+
+    #[test]
+    fn enter_on_the_replacement_field_triggers_a_replace_preview_not_a_search() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_open = true;
+        app.search_state.query = "hello".to_string();
+        app.search_state.replacement = "HELLO".to_string();
+        app.search_state.field = SearchInPathField::Replacement;
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.search.replacing);
+        assert!(app.search_state.ran_query.is_none());
+    }
+
+    #[test]
+    fn ctrl_shift_r_opens_the_panel_and_reveals_the_replace_fields() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.run_action(Action::ReplaceInPath);
+
+        assert!(app.search_open);
+        assert!(app.search_replace_open);
+
+        // Idempotent: triggering again while already open changes nothing
+        // observable.
+        app.run_action(Action::ReplaceInPath);
+        assert!(app.search_open);
+        assert!(app.search_replace_open);
+    }
+
+    #[test]
+    fn run_replace_preview_is_a_noop_with_an_empty_query_or_replacement() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_state.query = "".to_string();
+        app.search_state.replacement = "x".to_string();
+        app.run_replace_preview();
+        assert!(!app.search.replacing);
+
+        app.search_state.query = "hello".to_string();
+        app.search_state.replacement = "".to_string();
+        app.run_replace_preview();
+        assert!(!app.search.replacing);
+    }
+
+    #[test]
+    fn run_replace_preview_while_already_replacing_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_state.query = "hello".to_string();
+        app.search_state.replacement = "HELLO".to_string();
+        app.run_replace_preview();
+        assert!(app.search.replacing);
+        let generation_marker = app.search.replacing;
+
+        // A second call while the first is still in flight must not spawn
+        // a second background run (mirrors `enter_while_a_search_is_in_
+        // flight_is_a_noop`'s reasoning for `run`/`submit_or_open_search_
+        // result`).
+        app.run_replace_preview();
+        assert_eq!(app.search.replacing, generation_marker);
+    }
+
+    #[test]
+    fn poll_search_moves_a_finished_replace_preview_onto_the_pending_field() {
+        let dir = sample_project(); // a.txt: "hello\nworld"
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_state.query = "hello".to_string();
+        app.search_state.replacement = "HELLO".to_string();
+        app.run_replace_preview();
+
+        wait_until(|| {
+            app.poll_search();
+            app.pending_replace_in_path_preview.is_some() || !app.search.replacing
+        });
+
+        let preview = app
+            .pending_replace_in_path_preview
+            .as_ref()
+            .expect("a valid query/replacement pair must produce a preview");
+        assert_eq!(preview.edit.edits.len(), 1);
+    }
+
+    fn dummy_replace_preview(path: PathBuf) -> ide_core::ReplaceInPathResult {
+        ide_core::ReplaceInPathResult {
+            edit: ide_core::WorkspaceEdit {
+                edits: vec![ide_core::FileEdit {
+                    path,
+                    transaction: ide_core::Transaction::replace(0..5, "HELLO"),
+                }],
+            },
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn handle_replace_preview_key_enter_confirms_and_esc_cancels() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_open = true;
+        app.pending_replace_in_path_preview = Some(dummy_replace_preview(a));
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(app.pending_replace_in_path_preview.is_none());
+        // Cancelling only drops the preview -- the panel underneath it
+        // stays open, same as `handle_rename_preview_key`'s own Esc.
+        assert!(app.search_open);
+    }
+
+    #[test]
+    fn confirm_replace_in_path_preview_applies_the_edit_and_closes_the_panel() {
+        let dir = sample_project(); // a.txt: "hello\nworld"
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_open = true;
+        app.pending_replace_in_path_preview = Some(dummy_replace_preview(a.clone()));
+
+        app.confirm_replace_in_path_preview();
+
+        assert!(app.pending_replace_in_path_preview.is_none());
+        assert!(!app.search_open);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "HELLO\nworld");
+    }
+
+    #[test]
+    fn confirm_replace_in_path_preview_leaves_the_panel_open_on_failure() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_open = true;
+        // A path that does not exist on disk and is not open in a tab --
+        // `apply_workspace_edit_to_disk` cannot read it, so this fails.
+        let missing = dir.path().join("does-not-exist.txt");
+        app.pending_replace_in_path_preview = Some(dummy_replace_preview(missing));
+
+        app.confirm_replace_in_path_preview();
+
+        assert!(app.pending_replace_in_path_preview.is_none());
+        assert!(app.search_open);
+        assert!(!app.notifications.is_empty());
+    }
+
+    #[test]
+    fn cancel_replace_in_path_preview_drops_the_preview_without_writing_anything() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.pending_replace_in_path_preview = Some(dummy_replace_preview(a.clone()));
+
+        app.cancel_replace_in_path_preview();
+
+        assert!(app.pending_replace_in_path_preview.is_none());
+        assert_eq!(fs::read_to_string(&a).unwrap(), "hello\nworld");
+    }
+
+    #[test]
+    fn close_all_overlays_resets_the_pending_replace_preview() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.pending_replace_in_path_preview = Some(dummy_replace_preview(a));
+
+        app.close_all_overlays();
+
+        assert!(app.pending_replace_in_path_preview.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_includes_a_pending_replace_preview() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.pending_replace_in_path_preview = Some(dummy_replace_preview(a));
+
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn handle_key_intercepts_the_replace_preview_before_the_plain_search_panel() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.search_open = true;
+        app.pending_replace_in_path_preview = Some(dummy_replace_preview(a));
+
+        // `Esc` while both are "open" must cancel the preview, not close
+        // the search panel underneath it.
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(app.pending_replace_in_path_preview.is_none());
+        assert!(app.search_open);
+    }
+
+    #[test]
+    fn replace_in_path_command_binds_to_ctrl_shift_r_with_no_collision() {
+        let action = binding_for(key(
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            KeyCode::Char('r'),
+        ));
+        assert_eq!(action, Some(Action::ReplaceInPath));
     }
 
     // -- T13: Code Actions + Rename

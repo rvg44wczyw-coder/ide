@@ -164,23 +164,31 @@ pub struct App {
 }
 ```
 
-`search_options`/`search_replace_open`/`pending_replace_in_path_preview`
-join `close_all_overlays`'s reset list (closing the Search in Path popup
-closes the replace-reveal state with it, same as today; **but** — mirroring
-`ClonePanel`'s/T34's "background op survives close" precedent, applied
-here to `search`/`search_state` exactly as `tui-find-in-path.md` §3.1
-already established for the plain-search case — `close_all_overlays`
-touches none of `search`/`search_state`/`search_options` themselves, only
-`search_open`/`search_replace_open`; reopening shows exactly what was left,
-including a completed replace preview if `pending_replace_in_path_preview`
-is separately still `Some` — see below) and `handle_key`'s interception
-chain; `pending_replace_in_path_preview.is_some()` is its own, higher-
-priority interception tier (a true nested modal *within* the Search in
-Path popup, the same "confirm popup on top of a non-modal panel" shape
-`tui-tool-window-docking.md` §2.4 already established for Docker's/K8s's
-own confirm popups) — checked **before** `search_open` in `handle_key` so
-`Enter`/`Esc` reach the preview first while it's showing, and joins
-`any_popup_open`.
+Only `pending_replace_in_path_preview` joins `close_all_overlays`'s reset
+list — mirroring `pending_rename_preview`'s own already-established
+precedent, not `ClonePanel`'s "background op survives close" one: a
+finished preview is a true modal waiting on a decision, not background
+state to preserve. This matters concretely because `pending_replace_in_
+path_preview.is_some()` is checked at a tier *above* every other overlay
+in `handle_key` (see below) — if it were left `Some` across a
+`close_all_overlays` call triggered by some *other* overlay opening (which
+also sets `search_open = false` but, before this correction, would have
+left the preview `Some`), that higher-priority check would keep
+intercepting every key indefinitely, permanently blocking the very overlay
+the user just tried to open. `search`/`search_state`/`search_options`/
+`search_replace_open` are not reset — mirroring `ClonePanel`'s/T34's
+"background op survives close" precedent, applied here to `search`/
+`search_state` exactly as `tui-find-in-path.md` §3.1 already established
+for the plain-search case: `close_all_overlays` touches only `search_open`
+and `pending_replace_in_path_preview`, never `search_replace_open` itself,
+so reopening still shows exactly what was left (query, options, and the
+replace-reveal state). `pending_replace_in_path_preview.is_some()` is its
+own, higher-priority interception tier (a true nested modal *within* the
+Search in Path popup, the same "confirm popup on top of a non-modal panel"
+shape `tui-tool-window-docking.md` §2.4 already established for Docker's/
+K8s's own confirm popups) — checked **before** `search_open` in
+`handle_key` so `Enter`/`Esc` reach the preview first while it's showing,
+and joins `any_popup_open`.
 
 New methods:
 
@@ -227,18 +235,23 @@ impl App {
   matter for these two keys either way; `Enter`'s behavior depends on
   `field` — see below.
 - `submit_or_open_search_result` — `Enter` while `field` is `Query`,
-  `Include`, or `Exclude`: T15's exact submit-vs-open disambiguation,
-  extended to key on `(query, options)` together, not `query` alone
-  (§3.2) — a field/option edit that leaves the query text itself unchanged
-  still counts as "the results shown no longer answer the current
-  request," a case T15 itself never had to handle since it had no options
-  to vary independently of the query string.
+  `Include`, `Exclude`, **or one of the four boolean fields** (`Enter`
+  has no separate meaning of its own on a boolean field, so it falls
+  through to the same submit-vs-open path as the three string fields):
+  T15's exact submit-vs-open disambiguation, extended to key on `(query,
+  options)` together, not `query` alone (§3.2) — a field/option edit that
+  leaves the query text itself unchanged still counts as "the results
+  shown no longer answer the current request," a case T15 itself never
+  had to handle since it had no options to vary independently of the
+  query string.
 - `run_replace_preview` — `Enter` while `field` is `Replacement`. No-op if
   `self.search.replacing`, or if `search_state.query.trim()`/
-  `search_state.replacement` is empty, or no project (mirrors
-  `search-in-path-v2.md` §2.2's own `run_replace_preview` guard); otherwise
-  calls `self.search.run_replace(self.tree.clone(), query, replacement,
-  self.search_options.clone())`.
+  `search_state.replacement` is empty; otherwise calls `self.search.
+  run_replace(self.tree.clone(), query, replacement, self.search_options.
+  clone())`. (`search-in-path-v2.md` §2.2's own `run_replace_preview` also
+  guards on "no project" — that clause doesn't carry over here: `ide-tui`'s
+  `App` always has a project once constructed, so there is no "no project"
+  state for this crate to check.)
 - `handle_replace_preview_key` — while `pending_replace_in_path_preview`
   is `Some`: `Enter` calls `confirm_replace_in_path_preview`, `Esc` calls
   `cancel_replace_in_path_preview`, every other key ignored (matches
@@ -349,10 +362,14 @@ asymmetry in an otherwise fully symmetric pair, matching `search-in-path-
 v2.md`'s own `trigger_replace_in_path` (it reveals, nothing un-reveals).
 Closing (`Esc`, or reopening via `Ctrl+Shift+F` while already open, which
 still just flips to closed the same as T15) never resets `search`/
-`search_state`/`search_options`/`search_replace_open`/`pending_replace_
-in_path_preview` — every one of them persists across a close/reopen cycle,
-extending T15's "nothing is reset by closing" rule uniformly to every new
-field this phase adds.
+`search_state`/`search_options`/`search_replace_open` — each persists
+across a close/reopen cycle, extending T15's "nothing is reset by closing"
+rule to every new field this phase adds *except* one:
+`pending_replace_in_path_preview` **is** reset by `close_all_overlays` (see
+§2.2's fuller rationale) — a pending preview is a decision still owed to
+the user, not state whose loss would be a regression, and leaving it set
+across an unrelated overlay open would otherwise wedge the whole overlay
+system.
 
 ### 3.2 Query/options lifecycle and re-run detection
 
@@ -445,6 +462,15 @@ search_in_path`'s own behavior, already merged, not re-described here.
 `search_options`'s default (`respect_gitignore: true`, everything else
 `Default::default()`/empty) matches `ide-ui`'s own default exactly.
 
+`search_state.include`/`exclude` are single free-text fields, not a list
+widget — `current_search_options` (§2.2) splits each on `,`, trims each
+piece, and drops blank pieces, identical to `ide-ui`'s already-shipped
+`split_glob_list` (`crates/ui/src/app.rs`). This means a glob that itself
+legitimately contains a comma — a brace-alternation pattern like
+`{*.rs,*.toml}` — gets shredded into `{*.rs` and `*.toml}` rather than
+kept whole. Pre-existing limitation inherited from `search-in-path-v2.md`
+(same algorithm, same gap), not a new regression introduced by this port.
+
 ## 4. Constraints & invariants
 
 - **No new `ide-core`/`ide-lsp` surface** — see §1.
@@ -523,3 +549,33 @@ preview`); nothing new enough in shape to warrant one.
   `clamp` directly to confirm it never panics, and confirmed `ide-ui`'s
   own equivalent path has the identical behavior already, so this is a
   documentation gap, not a new defect to design around.
+- §2.2/§3.1: fixed a self-contradiction found during implementation —
+  §2.2 originally said `pending_replace_in_path_preview` "joins
+  `close_all_overlays`'s reset list" while §3.1 simultaneously listed it
+  among the fields closing "never resets". Traced the actual runtime
+  consequence of *not* resetting it (a stuck modal: the preview's
+  higher-priority `handle_key` check would keep firing even after some
+  other overlay's own opening set `search_open = false`, permanently
+  blocking that overlay) and corrected both sections to match the
+  implemented, correct behavior — `pending_replace_in_path_preview` is the
+  one field in this group that *does* reset on `close_all_overlays`,
+  matching `pending_rename_preview`'s precedent; `search`/`search_state`/
+  `search_options`/`search_replace_open` still do not.
+- `rev`'s code-review pass found four Low-severity doc/comment-accuracy
+  gaps, all fixed: (1) §2.2's `run_replace_preview` description and its
+  matching rustdoc comment both claimed a "no project" guard that isn't
+  implemented and doesn't apply to `ide-tui` (this crate's `App` always
+  has a project once constructed) — the clause is removed and replaced
+  with an explanatory note; (2) §2.2 never stated what `Enter` does on one
+  of the four boolean fields — added a sentence confirming it falls
+  through to `submit_or_open_search_result`, the same as `Query`/
+  `Include`/`Exclude`; (3) §3.6 gained a note documenting `current_search_
+  options`'s comma-separated glob-list parsing and its brace-alternation-
+  glob edge case (a pre-existing limitation inherited from `search-in-
+  path-v2.md`'s `split_glob_list`, not a new regression); (4) `handle_find_
+  key`'s pre-existing doc comment in `app.rs` claimed `Ctrl+Shift+R` is
+  "never also registered in `commands()`/`Action`" — now false since this
+  phase registers exactly that chord for the unrelated `ReplaceInPath`
+  command — updated to acknowledge the new registration and explain why
+  the two don't collide (mutually exclusive by `self.find.is_some()`'s
+  early return ahead of keymap dispatch).
