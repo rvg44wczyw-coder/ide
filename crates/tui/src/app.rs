@@ -6248,7 +6248,13 @@ impl App {
         let Some(edit) = edit else {
             return;
         };
-        if self.apply_workspace_edit(edit, "Reformat Code").is_err() {
+        // Mirrors `handle_rename_ready`/the rename-preview `Enter` handler's
+        // own `Err(e) => self.status = Some(e)` convention -- a failed
+        // apply (e.g. the file changed on disk since the request was sent)
+        // must not disappear silently just because this call happens to
+        // originate from `poll_lsp` rather than a direct keypress.
+        if let Err(e) = self.apply_workspace_edit(edit, "Reformat Code") {
+            self.status = Some(e);
             return;
         }
         if is_format_on_save {
@@ -11589,6 +11595,45 @@ mod tests {
             app.format_on_save_target,
             Some(PathBuf::from("/some/other/file.rs"))
         );
+    }
+
+    #[test]
+    fn handle_format_ready_surfaces_an_apply_error_via_status() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.format_ready = true;
+        app.lsp.format_path = Some(a.clone());
+        // Line 99 does not exist in "hello\nworld" -- doesn't fit the
+        // buffer's current content, so `apply_workspace_edit` must fail.
+        app.lsp.format_edit = Some(workspace_edit(vec![ide_lsp::FileEdit {
+            path: a.clone(),
+            text_edits: vec![text_edit((99, 0), (99, 5), "HELLO")],
+        }]));
+
+        app.handle_format_ready();
+
+        assert!(app.status().is_some());
+        assert_eq!(fs::read_to_string(&a).unwrap(), "hello\nworld");
+    }
+
+    #[test]
+    fn handle_format_ready_clears_the_format_on_save_target_even_with_no_edit() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.format_on_save_target = Some(a.clone());
+        app.lsp.format_ready = true;
+        app.lsp.format_path = Some(a);
+        app.lsp.format_edit = None;
+
+        app.handle_format_ready();
+
+        assert!(app.format_on_save_target.is_none());
     }
 
     #[test]
