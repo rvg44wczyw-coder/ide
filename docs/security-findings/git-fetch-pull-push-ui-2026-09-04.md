@@ -201,7 +201,88 @@ itself, already captured) and have `poll_remote_op` compare it against the
 discarding (with perhaps a toast/log, not silence) a stale result whose
 project no longer matches.
 
+## Round 2 — re-verification pass (commit 12ef944)
+
+Re-verified both fixes independently, live, with fresh payloads not
+already in the regression-test suite (all against a fresh from-scratch
+git-receive-pack wire-protocol server on loopback, started and torn down
+myself; no process left running afterward).
+
+1. **Finding 1's fix, boundary-tested.** Built a new probe (`ide-core` as
+   a path dependency from a scratch Cargo project, same technique as
+   round 1) sending five distinct crafted payloads through a real
+   `ide_core::git::GitRepo::push` call, each capturing the raw
+   `GitError::PushRejected` text and applying the exact production
+   `strip_bidi_controls`/`truncate_display` pair (copied verbatim from
+   `crates/ui/src/editor/blame_gutter.rs`, since `RemoteOpState` itself is
+   crate-private and unreachable from outside `ide_ui` — confirmed this is
+   still the deepest externally-drivable point in the pipeline):
+   - A `U+2066` (LRI, an isolate code point distinct from round 1's
+     `U+202E`) — confirmed stripped.
+   - A reason producing an exactly-500-char total message (the
+     `push rejected by remote: ` prefix counted in) — confirmed **not**
+     truncated (500 chars out, no ellipsis).
+   - A reason producing an exactly-501-char total message — confirmed
+     truncated to exactly 500 chars with a trailing ellipsis.
+   - A reason with ten 4-byte-UTF-8 emoji straddling the exact 500-char
+     cut point — confirmed no panic and a valid 500-char (ellipsis-
+     terminated) result, proving the `.chars().take(n)` truncation is
+     char-boundary-safe at this specific call site, not just generically
+     (`truncate_display`'s own unit tests already cover the generic case).
+   - A `U+200B` (zero-width space) — confirmed **not** stripped, as
+     expected: `strip_bidi_controls`'s documented scope is the Trojan-
+     Source bidi character classes (`U+202A`-`U+202E`, `U+2066`-`U+2069`,
+     `U+200E`, `U+200F`, `U+061C`), not general zero-width/invisible
+     characters. This isn't a gap in the fix under review — it's
+     inherited, unchanged scope from the pre-existing, already-reviewed
+     helper (`docs/security-findings/git-branches-and-blame-ui-
+     2026-09-01.md`), reused correctly rather than re-invented here. Not
+     re-litigated as a new finding against this diff.
+
+   All five results matched the fix's intended behavior exactly. Verdict:
+   **holds.**
+
+2. **Finding 2's fix, uniformity across `RemoteOpKind`.** Re-read the
+   current (post-fix) `poll_remote_op` directly (not the diff) at
+   `crates/ui/src/app.rs:1686-1717`: the `if root == started_for` check
+   wraps the entire `match outcome { ... }` block as a single conditional,
+   including the `Ok(RemoteOpOutcome::FetchDone) | Ok(RemoteOpOutcome::
+   PushDone) => self.git.refresh(&root)` arm — structurally identical
+   treatment for all three `RemoteOpKind` variants, not something that
+   only happens to work for `Pull`'s conflict path. A live, Fetch-specific
+   repro of the exact regression test's shape wasn't independently
+   constructed this round: `RemoteOpState`/`IdeApp::poll_remote_op` are
+   private to the `ide_ui` crate, so the only way to drive them at all
+   (as round 1 also found) is through that crate's own `#[cfg(test)]`
+   module, which this skill's rules forbid editing. Given the gate is a
+   single boolean condition wrapping every arm uniformly, a Fetch-specific
+   live repro would exercise the identical branch already covered by the
+   existing `run_command_pull_ignores_a_stale_result_after_switching_
+   projects` test (re-run independently this round, still passing) — this
+   is a considered code-analysis conclusion, not a skipped test. Verdict:
+   **holds.**
+
+3. **New-gap check: false-negative risk from path representation.**
+   Read `crates/core/src/project.rs:52-61` (`Project::open`) directly:
+   every `project_root` reaching `RemoteOpState::start` and every
+   `self.project.root()` read later both come from `fs::canonicalize`,
+   which resolves symlinks, strips trailing slashes, and (on this
+   filesystem) normalizes to the actual on-disk casing — deterministic
+   for an unchanged directory. Two opens of the same directory (regardless
+   of input casing/trailing-slash differences) canonicalize to a
+   byte-identical `PathBuf`, so the `started_for`/`current_root`
+   comparison cannot spuriously mismatch for what is genuinely the same
+   project. The only way the two values could legitimately differ for
+   "the same" directory is the directory itself being renamed/replaced on
+   disk between `start()` and the completion poll — at which point
+   treating it as a different target is the *correct* call, not a false
+   negative. No gap found.
+
+**Round 2 verdict:** Both fixes hold under independent re-verification
+with new payloads; no new findings.
+
 ## Verdict
 
 Findings (highest severity: Medium — finding 1's Low-Medium is the
-ceiling; nothing Critical/High).
+ceiling; nothing Critical/High). **Round 2: both fixes confirmed holding,
+clean.**
