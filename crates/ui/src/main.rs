@@ -10,6 +10,22 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Process-wide libgit2 network-I/O timeout config (`docs/features/
+    // git-fetch-pull-push.md` Revision notes #10) -- must run exactly
+    // once, synchronously, before any thread that might call a `GitRepo`
+    // network operation (fetch/pull/push) is spawned. This is the single
+    // entry point for both the GUI's own `RemoteOpState` background
+    // threads and `ide --tui`'s dispatch below, so one call here covers
+    // both frontends. A failure here is not fatal -- it only means
+    // fetch/pull/push against a stalling remote could block indefinitely
+    // instead of erroring at a bounded deadline, not a correctness issue
+    // for anything else the app does.
+    unsafe {
+        if let Err(e) = ide_core::git::configure_network_timeouts(10_000, 30_000) {
+            eprintln!("ide: warning: failed to configure git network timeouts: {e}");
+        }
+    }
+
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("--tui") => {
