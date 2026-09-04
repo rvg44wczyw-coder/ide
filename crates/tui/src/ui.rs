@@ -24,6 +24,7 @@ use ratatui::Frame;
 use crate::app::{
     App, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView, DebugPanelFocus, FilterField,
     Focus, GitPanelFocus, GitPanelState, GitPanelView, LeftDockState, LeftDockTab,
+    SearchInPathField,
 };
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
@@ -145,7 +146,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.hover_open {
         render_hover_popup(frame, app, size);
     }
-    if app.search_open {
+    if app.pending_replace_in_path_preview.is_some() {
+        render_replace_in_path_preview(frame, app, size);
+    } else if app.search_open {
         render_search_panel(frame, app, size);
     }
     if app.code_actions.is_some() {
@@ -1789,53 +1792,143 @@ fn render_search_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(Clear, popup);
 
-    let items: Vec<ListItem> = if app.search.searching {
-        vec![ListItem::new(Line::from("Searching..."))]
+    let field_style = |field: SearchInPathField| {
+        if app.search_state.field == field {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        }
+    };
+    let checkbox = |on: bool| if on { "[x]" } else { "[ ]" };
+
+    let mut header = vec![
+        Line::from(Span::styled(
+            format!("Query: {}", app.search_state.query),
+            field_style(SearchInPathField::Query),
+        )),
+        Line::from(Span::styled(
+            format!("Include: {}", app.search_state.include),
+            field_style(SearchInPathField::Include),
+        )),
+        Line::from(Span::styled(
+            format!("Exclude: {}", app.search_state.exclude),
+            field_style(SearchInPathField::Exclude),
+        )),
+    ];
+    if app.search_replace_open {
+        header.push(Line::from(Span::styled(
+            format!("Replace with: {}", app.search_state.replacement),
+            field_style(SearchInPathField::Replacement),
+        )));
+    }
+    header.push(Line::from(Span::styled(
+        format!(
+            "{} Case sensitive  {} Whole word  {} Regex  {} Respect .gitignore",
+            checkbox(app.search_options.search.case_sensitive),
+            checkbox(app.search_options.search.whole_word),
+            checkbox(app.search_options.search.regex),
+            checkbox(app.search_options.respect_gitignore),
+        ),
+        Style::default(),
+    )));
+
+    let mut items: Vec<ListItem> = header.into_iter().map(ListItem::new).collect();
+
+    if app.search.searching {
+        items.push(ListItem::new(Line::from("Searching...")));
+    } else if let Some(err) = &app.search.error {
+        items.push(ListItem::new(Line::from(err.to_string())));
     } else if let Some(results) = &app.search.results {
         if results.matches.is_empty() {
-            vec![ListItem::new(Line::from("No results."))]
+            items.push(ListItem::new(Line::from("No results.")));
         } else {
-            let mut rows: Vec<ListItem> = results
-                .matches
-                .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    let style = if i == app.search_state.selected {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    ListItem::new(Line::from(Span::styled(
-                        format!(
-                            "{}:{}:{}  {}",
-                            m.path.display(),
-                            m.line + 1,
-                            m.column + 1,
-                            m.line_text
-                        ),
-                        style,
-                    )))
-                })
-                .collect();
+            items.extend(results.matches.iter().enumerate().map(|(i, m)| {
+                let style = if i == app.search_state.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(Span::styled(
+                    format!(
+                        "{}:{}:{}  {}",
+                        m.path.display(),
+                        m.line + 1,
+                        m.column + 1,
+                        m.line_text
+                    ),
+                    style,
+                )))
+            }));
             if results.truncated {
-                rows.push(ListItem::new(Line::from(format!(
+                items.push(ListItem::new(Line::from(format!(
                     "results truncated -- showing the first {} matches",
                     ide_core::MAX_SEARCH_RESULTS
                 ))));
             }
-            rows
         }
     } else {
-        vec![ListItem::new(Line::from(
+        items.push(ListItem::new(Line::from(
             "Type a query and press Enter to search.",
-        ))]
+        )));
+    }
+
+    let title = if app.search_replace_open {
+        "Replace in Path  (Tab: next field, Space: toggle, Enter: search/replace/open, Esc: close)"
+    } else {
+        "Find in Path  (Tab: next field, Space: toggle, Enter: search/open, Esc: close)"
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// The Replace in Path preview (`docs/features/
+/// tui-search-and-replace-in-path.md` §2.4/§3.3) -- a per-file occurrence-
+/// count summary, deliberately not a line-level diff, mirroring `render_
+/// rename_preview`'s exact shape (§1.2's scope cut).
+fn render_replace_in_path_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(preview) = app.pending_replace_in_path_preview.as_ref() else {
+        return;
+    };
+    let edit = &preview.edit;
+    let width = area.width.clamp(40, 90);
+    let height = (edit.edits.len() as u16 + 3).clamp(4, area.height.saturating_sub(2).max(4));
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     };
 
-    let title = format!(
-        "Find in Path: {}  (Enter: search/open, Esc: close)",
-        app.search_state.query
-    );
-    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(Clear, popup);
+
+    let occurrence_count: usize = edit
+        .edits
+        .iter()
+        .map(|f| f.transaction.changes().len())
+        .sum();
+    let file_count = edit.edits.len();
+    let mut items = vec![ListItem::new(Line::from(format!(
+        "Replace in Path: {occurrence_count} occurrence{} across {file_count} file{}{}",
+        if occurrence_count == 1 { "" } else { "s" },
+        if file_count == 1 { "" } else { "s" },
+        if preview.truncated {
+            " (truncated)"
+        } else {
+            ""
+        },
+    )))];
+    items.extend(edit.edits.iter().map(|file_edit| {
+        let n = file_edit.transaction.changes().len();
+        ListItem::new(Line::from(format!(
+            "{} -- {n} occurrence{}",
+            file_edit.path.display(),
+            if n == 1 { "" } else { "s" },
+        )))
+    }));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Replace in Path Preview  (Enter: apply, Esc: cancel)");
     frame.render_widget(List::new(items).block(block), popup);
 }
 

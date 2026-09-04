@@ -185,6 +185,7 @@ pub enum Action {
     ToggleCargoPanel,
     QuickDocumentation,
     FindInPath,
+    ReplaceInPath,
     ShowIntentionActions,
     Rename,
     ToggleGitPanel,
@@ -375,6 +376,19 @@ pub fn commands() -> &'static [Command] {
                 KeyCode::Char('f'),
             )),
             action: Action::FindInPath,
+        },
+        Command {
+            id: "ReplaceInPath",
+            title: "Replace in Path",
+            // `⌘⇧R` (`Ctrl+Shift+R` here) is the reference IDE's real
+            // "Replace in Files..." binding, confirmed live against the
+            // macOS keymap reference and unclaimed in this table
+            // (`docs/features/tui-search-and-replace-in-path.md` §1.2).
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+                KeyCode::Char('r'),
+            )),
+            action: Action::ReplaceInPath,
         },
         Command {
             id: "ShowIntentionActions",
