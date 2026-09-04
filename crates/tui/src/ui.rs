@@ -18,7 +18,7 @@ use ide_lsp::DiagnosticSeverity;
 use ratatui::layout::{Constraint, Direction as LayoutDirection, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{
@@ -645,12 +645,17 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text), area);
 }
 
+/// Fixed row budget for the popup body (excludes the top/bottom border),
+/// independent of `palette.filtered.len()` -- with many matches the list
+/// scrolls via `ListState` instead of growing the popup to fit them all.
+const PALETTE_VISIBLE_ROWS: u16 = 12;
+
 fn render_palette(frame: &mut Frame, app: &App, area: Rect) {
     let Some(palette) = app.palette.as_ref() else {
         return;
     };
     let width = area.width.clamp(20, 50);
-    let height = (palette.filtered.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let height = (PALETTE_VISIBLE_ROWS + 2).clamp(3, area.height.saturating_sub(2).max(3));
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -680,7 +685,10 @@ fn render_palette(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!("Find Action: {}", palette.query));
-    frame.render_widget(List::new(items).block(block), popup);
+    let list = List::new(items).block(block);
+    let mut state = ListState::default();
+    state.select(Some(palette.selected));
+    frame.render_stateful_widget(list, popup, &mut state);
 }
 
 fn render_goto_popup(frame: &mut Frame, app: &App, area: Rect) {
