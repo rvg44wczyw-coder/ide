@@ -242,18 +242,24 @@ impl LspBridge {
 - `handle_format_ready(&mut self)` — called once per frame from
   `poll_lsp`, immediately after the existing `handle_rename_ready()` call.
   No-op unless `self.lsp.format_ready` (cleared by `poll()` regardless).
-  Looks up the open tab whose path matches `self.lsp.format_path` (§4's
-  invariant guarantees one exists unless the tab was closed in the
-  interim — a TOCTOU race handled identically to `ide-ui`'s: no matching
-  tab is a complete no-op beyond clearing `format_on_save_target` if it
-  matched). On a match at index `idx` with `Some(edit)`: calls
+  Applies the response through `apply_workspace_edit`/`apply_file_edits`
+  without a separate open-tab pre-check of its own — §4's invariant
+  guarantees a matching tab exists unless it was closed in the interim, and
+  for that TOCTOU case `apply_workspace_edit`/`apply_file_edits` (§1.1/§4)
+  fail *safe*, not silent: with no open tab left for the response's path,
+  they route through the disk-write branch and write the file directly,
+  the same fail-safe behavior §4's Path provenance bullet already
+  describes. With `Some(edit)`, calls
   `self.apply_workspace_edit(edit, "Reformat Code")` (§1.1 — reuses T37's
-  existing partition-and-apply path rather than a direct `Buffer::apply`).
-  If `self.format_on_save_target == Some(path)` for that same `idx`,
-  additionally calls `self.save_tab_at(idx)` immediately afterward — by
-  index, never `trigger_save_active()`/`self.active_tab`, so a tab switch
-  between the original save and this response can never write the wrong
-  tab to disk. `format_on_save_target` is cleared whenever it matches this
+  existing partition-and-apply path rather than a direct `Buffer::apply`),
+  surfacing any `Err` through `self.status` exactly like
+  `handle_rename_ready`'s own apply call already does. On success, if
+  `self.format_on_save_target` matches the response's path, additionally
+  looks the tab back up by that path (indices can shift between the
+  original save and this response landing) and calls `self.save_tab_at(idx)`
+  on it — never `trigger_save_active()`/`self.active_tab`, so a tab switch
+  in the interim can never write the wrong tab to disk. `format_on_save_
+  target` is cleared whenever it matches this
   response's path, regardless of outcome (`Some`/`None`/apply error).
 
 `commands.rs` gains two entries:
@@ -278,11 +284,17 @@ Command {
 },
 ```
 
-`Action` gains `ReformatCode` and `ToggleFormatOnSave` variants.
-`is_command_enabled` gains: `ReformatCode => self.active_tab.is_some()`
-(simpler than `ide-ui`'s equivalent per §1.1 — no separate path check
-needed); `ToggleFormatOnSave => true` (always available, like every other
-session-wide toggle this crate already has no gating for).
+`Action` gains `ReformatCode` and `ToggleFormatOnSave` variants. Unlike
+`ide-ui`, `ide-tui` has no `is_command_enabled`-style command-gating
+mechanism at all — every command is always selectable from the palette,
+and an active-tab-scoped action simply no-ops internally when it doesn't
+apply. `Action::ReformatCode` follows that existing convention:
+`trigger_reformat_code` is a no-op when `self.active_tab.is_none()`, the
+same self-guard every other active-tab-scoped action in `app.rs` already
+uses, rather than this feature introducing a new palette-gating concept
+just for two commands. `Action::ToggleFormatOnSave` needs no gating either
+way — it's always available, like every other session-wide toggle this
+crate has.
 
 `state.rs`'s `PersistedState` gains:
 
@@ -528,3 +540,20 @@ duplicate it without adding information.
   as an assumption) — if the invariant is ever violated, the generic apply
   path degrades to a disk write through an already-hardened function
   rather than panicking on an invalid index.
+- §2.3: after implementation, `rev`'s code review (round 1) found this
+  section's own text self-contradicted §4 on the closed-tab TOCTOU case —
+  this section said "a complete no-op," §4 said the apply path writes to
+  disk directly. Corrected this section to match §4 (the code, following
+  §4, does write to disk in that case) rather than the reverse.
+- §2.3: dropped the `is_command_enabled` claim (`rev` code-review finding)
+  — `ide-tui` has no command-gating mechanism of any kind (verified: no
+  `is_command_enabled` function anywhere in `crates/tui/**`), unlike
+  `ide-ui` where this section's wording originated from. Replaced with an
+  explanation of the actual, already-established convention this feature
+  follows instead (an active-tab-scoped action self-guards internally).
+- Implementation note (not a doc change): `rev`'s code review also found
+  `handle_format_ready` silently discarded an `apply_workspace_edit`
+  failure instead of surfacing it via `self.status`, unlike
+  `handle_rename_ready`'s identical call. Fixed in the implementation
+  (`crates/tui/src/app.rs`), not here — this section's own text already
+  described the call correctly, it just wasn't implemented to match yet.
