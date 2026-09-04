@@ -97,6 +97,14 @@ impl GitRepo {
     // fires during that phase); see `MAX_ADVERTISED_REFS`'s own doc
     // comment for the honest scope of what this cap does and doesn't
     // cover.
+    // Hardened (Revision notes #11): `update_tips_cb` -- the trampoline
+    // `update_tips` above goes through -- has the same unguarded
+    // `str::from_utf8(...).unwrap()` on its refname parameter that
+    // `push_update_reference_cb` had before `push`'s Revision-notes-#9
+    // fix, newly reachable once this function started registering
+    // `update_tips` at all. `fetch` wraps the underlying `Remote::fetch`
+    // call in `std::panic::catch_unwind`, converting a caught panic into
+    // `Err(GitError::FetchFailed(_))`, mirroring `push`'s fix exactly.
 
     /// Resolves the current branch name *first* — `GitError::DetachedHead`
     /// if `HEAD` isn't on a branch — before doing anything else, so a
@@ -181,7 +189,7 @@ pub unsafe fn configure_network_timeouts(
 ) -> Result<(), GitError>;
 ```
 
-`GitError` gains four variants (all existing variants unchanged):
+`GitError` gains five variants (all existing variants unchanged):
 
 ```rust
 #[error("no remote named '{0}'")]
@@ -192,7 +200,14 @@ DetachedHead,
 NoUpstream(String),
 #[error("push rejected by remote: {0}")]
 PushRejected(String),
+#[error("fetch failed: {0}")]
+FetchFailed(String),
 ```
+
+`FetchFailed` (Revision notes #11) is `fetch`'s equivalent of `PushRejected`
+for the `update_tips_cb` panic-to-`Err` conversion above — the same
+"fixed, honest message, no attempt to recover the panic payload" rationale
+`PushRejected`'s own doc comment already gives.
 
 **Required refactor, not a behavior change:** `clone_repo`'s inline
 credentials closure (`git-remote.md` §3.3) is extracted into a private
@@ -804,3 +819,49 @@ day:**
     is CPU-bound between reads, not I/O-wait-shaped, and remains the one
     part of finding 2 this crate cannot close within `git2` 0.21.0's
     public API.
+
+**`hacker`'s round-2 re-verification pass on the above two fixes
+(same findings doc, "Round 2" section), fixed same day:**
+
+11. Re-verifying finding 9's own fix live surfaced a new, structurally
+    identical gap: `update_tips_cb` (the trampoline `fetch`'s
+    `update_tips` registration — added for `MAX_ADVERTISED_REFS` —
+    goes through) has the exact same unguarded
+    `str::from_utf8(...).unwrap()` on its *refname* parameter that
+    `push_update_reference_cb` had, and nothing wraps `fetch`'s
+    `Remote::fetch(...)` call the way `push`'s was wrapped. Traced in
+    libgit2 1.9.6's `remote.c` (`update_ref`, ~line 1755-1799): the local
+    tracking ref is fully written to disk via `git_reference_create`
+    *before* `update_tips` is ever invoked for it, so whether the panic
+    is reachable depends on whether the local filesystem accepts a ref
+    name containing the remote-supplied bytes. On this project's macOS
+    dev machine, APFS rejects an invalid-UTF-8 ref name outright
+    (`EILSEQ`) before the callback fires, live-confirmed; ext4 on Linux
+    (a target platform) does not enforce this and would very plausibly
+    reach the vulnerable `.unwrap()`. Fixed identically to finding 9:
+    `fetch`'s `Remote::fetch(...)` call is now wrapped in
+    `std::panic::catch_unwind`, converting a caught panic into the new
+    `Err(GitError::FetchFailed(_))` (§2.1). Regression coverage
+    (`fetch_recovers_as_an_err_instead_of_panicking_when_a_callback_
+    panics`) exercises the `catch_unwind` wiring itself via a
+    caller-supplied `on_progress` that panics, since the actual
+    byte-level trigger needs a platform this dev machine isn't.
+
+12. The same re-verification pass found the existing
+    `configure_network_timeouts_bounds_a_stalling_remote` regression test
+    (added in note 10) was a false positive on two counts: its fake
+    server drained only 1 byte of the client's request (leaving the rest
+    unread, which sends a TCP RST on close — the test passed via an
+    instant "connection reset" error, unrelated to the timeout), and even
+    after fixing that, the server's closure returned immediately after
+    the drain read, dropping the connection outright and producing an
+    instant clean EOF instead of a genuine stall. Both were live-observed
+    (each made the "fixed" fetch return in ~1ms, not ~2s) before being
+    fixed: the server now drains a generous 64KB buffer and then holds
+    the connection open past the configured timeout, and the test now
+    asserts the error message actually contains `"timed out"` (not just
+    "any `Err`") plus a minimum elapsed time, so a future regression back
+    to either false-positive shape would be caught. The underlying
+    production fix (`configure_network_timeouts` itself) was independently
+    re-verified live during this same investigation and is unaffected —
+    only its own regression test was wrong.

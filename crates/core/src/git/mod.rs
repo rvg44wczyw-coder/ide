@@ -46,7 +46,24 @@ pub enum GitError {
     WorktreeHasUncommittedChanges(PathBuf),
     #[error("worktree '{0}' is locked")]
     WorktreeLocked(PathBuf),
+    #[error("no remote named '{0}'")]
+    RemoteNotFound(String),
+    #[error("HEAD is not on a branch")]
+    DetachedHead,
+    #[error("current branch has no remote-tracking branch on '{0}'")]
+    NoUpstream(String),
+    #[error("push rejected by remote: {0}")]
+    PushRejected(String),
+    #[error("fetch failed: {0}")]
+    FetchFailed(String),
 }
+
+/// Default remote name assumed when the caller has no more specific one
+/// on hand -- `"origin"`, what `clone_repo`'s own `RepoBuilder` configures
+/// for a freshly cloned repo, and libgit2's own default target for a bare
+/// `git fetch`/`git pull` with no remote argument
+/// (`docs/features/git-fetch-pull-push.md` §1 -- no remote picker in v1).
+pub const DEFAULT_REMOTE: &str = "origin";
 
 /// Per-file line cap for `diff_file`/`diff_commit` output (context +
 /// added + removed lines combined). Chosen generously above what a human
@@ -72,6 +89,28 @@ pub const MAX_DIFF_FILES: usize = 2_000;
 /// every call. Same "bound the other unbounded axis" reasoning as
 /// `MAX_DIFF_FILES` above, for a different axis.
 pub const MAX_COMMITS_SCANNED: usize = 200_000;
+
+/// Safety bound on how many local remote-tracking refs `fetch` will accept
+/// updating in one call, enforced via `RemoteCallbacks::update_tips`
+/// (`docs/features/git-fetch-pull-push.md` §2.1). **Only a partial
+/// mitigation, documented honestly rather than oversold**: live testing
+/// (`docs/security-findings/git-fetch-pull-push-2026-09-04.md`, finding 2)
+/// confirmed `update_tips` fires once per ref *while applying already-
+/// negotiated updates to local tracking refs* -- i.e. after the remote's
+/// initial ref advertisement has already been fully received and parsed --
+/// not during the advertisement itself. A 2,000,000-fake-ref adversarial
+/// server that never got past the advertisement phase (connection dropped
+/// before any pack transfer) cost ~26s/~400MB with this cap in place and
+/// zero `update_tips` invocations, proving it does not bound that cost.
+/// No hook in `git2` 0.21.0's public API fires during ref-advertisement
+/// parsing itself, so that specific cost remains an open, upstream-level
+/// gap this crate cannot close without patching libgit2 or writing a
+/// custom transport -- flagged here rather than left undiscovered. What
+/// this cap *does* still protect: a fetch that clears the advertisement
+/// phase and negotiates a pack transfer, then tries to apply an
+/// unreasonable number of local ref updates -- a real, if narrower,
+/// amplification vector `update_tips` genuinely does intercept.
+pub const MAX_ADVERTISED_REFS: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
@@ -969,6 +1008,22 @@ impl GitRepo {
             .get()
             .target()
             .ok_or_else(|| git2::Error::from_str("branch has no target"))?;
+        let current = self.current_branch().unwrap_or_else(|| "HEAD".to_string());
+        let message = format!("Merge branch '{name}' into {current}");
+        self.merge_oid(their_oid, &message)
+    }
+
+    /// The fast-forward/real-merge/conflict decision `merge_branch`
+    /// originally made inline, extracted so `pull` can reuse it against a
+    /// different `their_oid` source (a remote-tracking ref instead of a
+    /// local branch lookup) -- one merge implementation, two ways to
+    /// arrive at the commit to merge (`docs/features/
+    /// git-fetch-pull-push.md` §3.2).
+    fn merge_oid(
+        &self,
+        their_oid: git2::Oid,
+        commit_message: &str,
+    ) -> Result<MergeOutcome, GitError> {
         let their_commit = self.repo.find_annotated_commit(their_oid)?;
         let (analysis, _) = self.repo.merge_analysis(&[&their_commit])?;
 
@@ -1003,10 +1058,219 @@ impl GitRepo {
         if index.has_conflicts() {
             return Ok(MergeOutcome::Conflicts(self.conflicts()?));
         }
-        let current = self.current_branch().unwrap_or_else(|| "HEAD".to_string());
-        let message = format!("Merge branch '{name}' into {current}");
-        let commit_id = self.commit(&message, false)?;
+        let commit_id = self.commit(commit_message, false)?;
         Ok(MergeOutcome::Merged { commit_id })
+    }
+
+    /// Resolves `HEAD`'s branch shorthand, erroring with
+    /// `GitError::DetachedHead` if `HEAD` isn't on a branch at all
+    /// (detached, or -- via `self.repo.head()`'s own `?` -- unborn, no
+    /// commits yet). Shared by `pull`/`push`, both of which need "the
+    /// current branch's name" rather than `current_branch()`'s more
+    /// permissive "`HEAD`'s shorthand, detached or not"
+    /// (`docs/features/git-fetch-pull-push.md` §2.1).
+    fn current_branch_name(&self) -> Result<String, GitError> {
+        let head = self.repo.head()?;
+        if !head.is_branch() {
+            return Err(GitError::DetachedHead);
+        }
+        Ok(head.shorthand()?.to_string())
+    }
+
+    /// Fetches every ref `remote_name`'s configured refspecs cover
+    /// (passing an empty refspec array to libgit2, which falls back to
+    /// the remote's own base refspecs -- typically
+    /// `+refs/heads/*:refs/remotes/<remote_name>/*`), updating this
+    /// repo's remote-tracking refs. Never touches the working tree, the
+    /// index, or any local branch. Explicitly suppresses tags
+    /// (`AutotagOption::None`) -- `git2::FetchOptions::default()`'s own
+    /// `download_tags` is `Unspecified`, which falls back to libgit2's
+    /// auto-tag-following default and would otherwise still bring in
+    /// tags despite this module's "branch refs only" scope
+    /// (`docs/features/git-fetch-pull-push.md` §2.1/Revision notes #1).
+    /// Caps local ref-update application at [`MAX_ADVERTISED_REFS`] via
+    /// `update_tips` -- see that constant's own doc comment for exactly
+    /// what this does and does not protect against.
+    pub fn fetch(
+        &self,
+        remote_name: &str,
+        on_progress: impl FnMut(TransferProgress),
+    ) -> Result<(), GitError> {
+        self.fetch_capped(remote_name, on_progress, MAX_ADVERTISED_REFS)
+    }
+
+    /// `fetch`'s actual implementation, parameterized by the ref-update cap
+    /// so tests can exercise the `update_tips` abort wiring itself without
+    /// needing to construct hundreds of thousands of real refs.
+    fn fetch_capped(
+        &self,
+        remote_name: &str,
+        mut on_progress: impl FnMut(TransferProgress),
+        max_refs: usize,
+    ) -> Result<(), GitError> {
+        let mut remote = self
+            .repo
+            .find_remote(remote_name)
+            .map_err(|_| GitError::RemoteNotFound(remote_name.to_string()))?;
+
+        let mut callbacks = git2::RemoteCallbacks::new();
+        credential_callback(&mut callbacks);
+        callbacks.transfer_progress(|progress| {
+            on_progress(TransferProgress::from(progress));
+            true
+        });
+        let updated_refs = std::cell::Cell::new(0usize);
+        callbacks.update_tips(move |_refname, _old, _new| {
+            updated_refs.set(updated_refs.get() + 1);
+            updated_refs.get() <= max_refs
+        });
+
+        let mut fetch_options = git2::FetchOptions::new();
+        fetch_options.remote_callbacks(callbacks);
+        fetch_options.download_tags(git2::AutotagOption::None);
+
+        // `update_tips_cb` (the C trampoline `update_tips` above registers)
+        // has the same unguarded `str::from_utf8(...).unwrap()` on its
+        // refname parameter that `push_update_reference_cb` had before
+        // `push`'s own `catch_unwind` fix -- a remote whose advertised ref
+        // name isn't valid UTF-8 panics deep inside `git2`-rs once that ref
+        // is actually applied locally. Mirrors `push`'s fix exactly.
+        let fetch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            remote.fetch(&[] as &[&str], Some(&mut fetch_options), None)
+        }));
+        match fetch_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(GitError::Git2(e)),
+            Err(_panic_payload) => Err(GitError::FetchFailed(
+                "remote sent a non-UTF-8 or otherwise malformed ref name".to_string(),
+            )),
+        }
+    }
+
+    /// Fetches from `remote_name` (as `fetch` does), then merges the
+    /// resulting remote-tracking branch for the *current* local branch
+    /// into `HEAD`, reusing `merge_oid` (`docs/features/
+    /// git-fetch-pull-push.md` §2.1/§3.2). `DetachedHead` is checked
+    /// *before* fetching -- no network I/O happens if there's nothing to
+    /// pull into, matching `clone_repo`'s own "validate locally before
+    /// touching the network" precedent. The remote-tracking ref looked up
+    /// is `refs/remotes/<remote_name>/<branch_name>` -- the standard name
+    /// a default `git fetch` refspec produces; this does not consult
+    /// `branch.<name>.remote`/`.merge` config for a differently-configured
+    /// upstream (v1 scope cut, §3.2).
+    pub fn pull(
+        &self,
+        remote_name: &str,
+        on_progress: impl FnMut(TransferProgress),
+    ) -> Result<MergeOutcome, GitError> {
+        let branch_name = self.current_branch_name()?;
+
+        self.fetch(remote_name, on_progress)?;
+
+        let remote_ref = format!("refs/remotes/{remote_name}/{branch_name}");
+        let their_oid = self
+            .repo
+            .find_reference(&remote_ref)
+            .map_err(|_| GitError::NoUpstream(remote_name.to_string()))?
+            .target()
+            .ok_or_else(|| git2::Error::from_str("remote-tracking ref has no target"))?;
+
+        let message = format!(
+            "Merge remote-tracking branch '{remote_name}/{branch_name}' into {branch_name}"
+        );
+        self.merge_oid(their_oid, &message)
+    }
+
+    /// Pushes the current local branch's tip to `refs/heads/<branch>` on
+    /// `remote_name`, using a plain (non-force) refspec so a
+    /// non-fast-forward push is rejected by the remote exactly as a plain
+    /// `git push` (without `--force`) would be (`docs/features/
+    /// git-fetch-pull-push.md` §2.1/§3.3). `Remote::push()` can return
+    /// `Ok(())` even when the remote rejected the ref update -- the real
+    /// per-ref result comes through `push_update_reference`'s `Option<&
+    /// str>` status (`None` = accepted, `Some(msg)` = rejected), captured
+    /// here and checked after `push()` returns.
+    ///
+    /// **Hardened against a malicious/misbehaving remote** (`docs/
+    /// security-findings/git-fetch-pull-push-2026-09-04.md`, finding 1):
+    /// `git2` 0.21.0's own FFI trampoline for `push_update_reference`
+    /// (`str::from_utf8(...).unwrap()` on the server-supplied rejection
+    /// reason, verified against its vendored source) panics instead of
+    /// erroring when a remote sends a non-UTF-8 rejection message -- a
+    /// capability entirely under the remote's control, not this crate's.
+    /// The `remote.push(...)` call itself is wrapped in
+    /// `std::panic::catch_unwind` so that panic surfaces to this
+    /// function's caller as `Err(GitError::PushRejected(_))`, same as any
+    /// other rejection, instead of unwinding out of a public `GitRepo`
+    /// method. The original panic payload is discarded rather than
+    /// reformatted into the error message -- by the time `catch_unwind`
+    /// sees it, `git2`-rs's own `panic::wrap` has already lost the raw
+    /// bytes at the FFI boundary (it only preserves an opaque
+    /// `Box<dyn Any>`), so there is nothing meaningful left to surface
+    /// beyond a fixed, honest description of what happened.
+    pub fn push(
+        &self,
+        remote_name: &str,
+        mut on_progress: impl FnMut(PushProgress),
+    ) -> Result<(), GitError> {
+        let branch_name = self.current_branch_name()?;
+        let mut remote = self
+            .repo
+            .find_remote(remote_name)
+            .map_err(|_| GitError::RemoteNotFound(remote_name.to_string()))?;
+
+        let rejection: RefCell<Option<String>> = RefCell::new(None);
+        let push_result = {
+            // Scoped so `callbacks`/`push_options` -- and the borrow of
+            // `rejection` their closures hold -- are dropped before
+            // `rejection.into_inner()` below tries to move out of it;
+            // both types carry a `Drop` impl (freeing the underlying
+            // libgit2 struct), so NLL can't otherwise end the borrow
+            // early even though `push_options` is never used again after
+            // `remote.push`.
+            let mut callbacks = git2::RemoteCallbacks::new();
+            credential_callback(&mut callbacks);
+            callbacks.push_transfer_progress(|current, total, bytes| {
+                on_progress(PushProgress {
+                    current,
+                    total,
+                    bytes,
+                });
+            });
+            callbacks.push_update_reference(|_refname, status| {
+                if let Some(msg) = status {
+                    *rejection.borrow_mut() = Some(msg.to_string());
+                }
+                Ok(())
+            });
+
+            let mut push_options = git2::PushOptions::new();
+            push_options.remote_callbacks(callbacks);
+
+            let refspec = format!("refs/heads/{branch_name}:refs/heads/{branch_name}");
+            // `&mut remote`/`&mut push_options` aren't `UnwindSafe` (a
+            // panic mid-call could leave either in an inconsistent state)
+            // -- `AssertUnwindSafe` is sound here because neither is used
+            // again after this call returns, panic or not.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                remote.push(&[refspec], Some(&mut push_options))
+            }))
+        };
+
+        match push_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(GitError::Git2(e)),
+            Err(_panic_payload) => {
+                return Err(GitError::PushRejected(
+                    "remote sent a non-UTF-8 or otherwise malformed rejection reason".to_string(),
+                ));
+            }
+        }
+
+        if let Some(msg) = rejection.into_inner() {
+            return Err(GitError::PushRejected(msg));
+        }
+        Ok(())
     }
 
     /// Full detail for one commit (by id or any revspec `revparse_single`
@@ -1346,6 +1610,24 @@ impl From<git2::Progress<'_>> for CloneProgress {
     }
 }
 
+/// Alias, not a rename -- `CloneProgress` is `git2::Progress`'s shape, not
+/// clone-specific, but `fetch`/`pull` naming their progress parameter
+/// after a type called `CloneProgress` would read as a copy-paste leftover
+/// (`docs/features/git-fetch-pull-push.md` §2.1). Zero cost: `clone_repo`
+/// keeps using `CloneProgress` unchanged.
+pub type TransferProgress = CloneProgress;
+
+/// `git2::RemoteCallbacks::push_transfer_progress`'s own three `usize`s
+/// (current object, total objects, bytes transferred) -- not the same
+/// shape as `git2::Progress`/`CloneProgress`, hence its own type rather
+/// than a reuse (`docs/features/git-fetch-pull-push.md` §3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PushProgress {
+    pub current: usize,
+    pub total: usize,
+    pub bytes: usize,
+}
+
 /// Clones `url` into `dest`, calling `on_progress` zero or more times
 /// during the transfer. Blocking, synchronous, like every other
 /// `GitRepo`/`git`-module function -- `ide-ui` is responsible for calling
@@ -1381,6 +1663,33 @@ pub fn clone_repo(
     }
 
     let mut callbacks = git2::RemoteCallbacks::new();
+    credential_callback(&mut callbacks);
+    callbacks.transfer_progress(|progress| {
+        on_progress(CloneProgress::from(progress));
+        true
+    });
+
+    let mut fetch_options = git2::FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+
+    git2::build::RepoBuilder::new()
+        .fetch_options(fetch_options)
+        .clone(url, dest)?;
+
+    let project = crate::project::Project::open(dest)
+        .map_err(|_| GitError::ClonedContentInvalid(dest.to_path_buf()))?;
+    project.scan_tree();
+
+    GitRepo::open(dest)
+}
+
+/// Shared by `clone_repo`, `GitRepo::fetch`, and `GitRepo::push`
+/// (`docs/features/git-fetch-pull-push.md` §2.1) -- delegates entirely to
+/// whatever the OS/git installation already has configured (SSH agent,
+/// git credential helper), same as `clone_repo`'s original inline closure
+/// this was extracted from verbatim. Never prompts for, stores, or logs a
+/// credential itself.
+fn credential_callback(callbacks: &mut git2::RemoteCallbacks) {
     callbacks.credentials(|url, username, allowed_types| {
         if allowed_types.contains(git2::CredentialType::SSH_KEY) {
             let agent_user = username.unwrap_or("git");
@@ -1399,23 +1708,50 @@ pub fn clone_repo(
             "no usable credential for the types this server accepts",
         ))
     });
-    callbacks.transfer_progress(|progress| {
-        on_progress(CloneProgress::from(progress));
-        true
-    });
+}
 
-    let mut fetch_options = git2::FetchOptions::new();
-    fetch_options.remote_callbacks(callbacks);
-
-    git2::build::RepoBuilder::new()
-        .fetch_options(fetch_options)
-        .clone(url, dest)?;
-
-    let project = crate::project::Project::open(dest)
-        .map_err(|_| GitError::ClonedContentInvalid(dest.to_path_buf()))?;
-    project.scan_tree();
-
-    GitRepo::open(dest)
+/// Configures libgit2's own global network-I/O timeouts. **Process-wide,
+/// call exactly once at startup**, before any concurrent `GitRepo` network
+/// operation begins (`docs/features/git-fetch-pull-push.md` §2.1/Revision
+/// notes #10). Added after a `hacker` pass found `fetch`/`pull`/`push` had
+/// *no* protection at all against a remote that accepts a connection and
+/// then never sends anything -- a "slowloris"-style stall, distinct from
+/// the fast-flood resource-exhaustion case [`MAX_ADVERTISED_REFS`]
+/// addresses. Verified live: with no timeout configured, a stalling remote
+/// blocks the calling thread indefinitely (no way to recover short of
+/// killing the process); with `configure_network_timeouts(3_000, 3_000)`
+/// active, the identical stalling-remote scenario returned a bounded `Err`
+/// at 3.00s elapsed.
+///
+/// **Does not help against a fast-flood attacker** (one that sends a huge
+/// amount of data quickly rather than stalling) -- verified live that the
+/// same 2,000,000-ref flood attack that motivated `MAX_ADVERTISED_REFS`
+/// still took its full ~26s/~400MB with a 3-second timeout configured,
+/// since data kept arriving continuously and no individual read call ever
+/// blocked long enough to trip it. That gap remains open; see
+/// `MAX_ADVERTISED_REFS`'s own doc comment.
+///
+/// # Safety
+/// Wraps `git2::opts::set_server_connect_timeout_in_milliseconds`/
+/// `set_server_timeout_in_milliseconds`, which libgit2 documents as
+/// process-global, non-thread-safe configuration state. The caller must
+/// ensure no other thread is concurrently calling into `git2`/libgit2
+/// (including any other `GitRepo` method in this crate) while this runs --
+/// call it once, at startup, before spawning any thread that might use
+/// `GitRepo`, never from inside `fetch`/`pull`/`push` themselves (which
+/// this doc's own §3.1 threading model allows to run concurrently with
+/// unrelated local `GitRepo` calls on another thread).
+pub unsafe fn configure_network_timeouts(
+    connect_timeout_ms: i32,
+    io_timeout_ms: i32,
+) -> Result<(), GitError> {
+    // SAFETY: forwarded to the caller via this function's own `unsafe`
+    // signature and doc comment above.
+    unsafe {
+        git2::opts::set_server_connect_timeout_in_milliseconds(connect_timeout_ms)?;
+        git2::opts::set_server_timeout_in_milliseconds(io_timeout_ms)?;
+    }
+    Ok(())
 }
 
 /// git always uses `/`-separated repo-relative paths internally; accept a
@@ -4058,5 +4394,551 @@ mod tests {
         };
         assert_eq!(p, p);
         assert_eq!(CloneProgress::default(), CloneProgress::default());
+    }
+
+    // -- Git Fetch/Pull/Push (`docs/features/git-fetch-pull-push.md`) --
+    //
+    // `git2`/libgit2 treats a local filesystem path as a valid remote
+    // transport, same precedent `clone_repo`'s own tests above already
+    // established -- no real network access needed anywhere below
+    // (`git-fetch-pull-push.md` §6).
+
+    /// A bare clone of `source`, standing in for "the remote" -- pushing
+    /// into a checked-out (non-bare) repository's current branch is a
+    /// different, non-fast-forward-related restriction real git servers
+    /// apply that libgit2's local transport doesn't model the same way, so
+    /// every push test targets a bare repo instead, same as a real git
+    /// server would be.
+    fn init_bare_remote_from(source: &Path) -> tempfile::TempDir {
+        let bare_dir = tempfile::tempdir().unwrap();
+        git2::build::RepoBuilder::new()
+            .bare(true)
+            .clone(&source.to_string_lossy(), bare_dir.path())
+            .unwrap();
+        bare_dir
+    }
+
+    #[test]
+    fn fetch_updates_the_remote_tracking_ref_without_touching_the_working_tree() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+        let branch = source_repo.head().unwrap().shorthand().unwrap().to_string();
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        let second = commit_file(&source_repo, "b.txt", "b", "second");
+
+        git.fetch(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        let remote_ref = format!("refs/remotes/{DEFAULT_REMOTE}/{branch}");
+        let repo = Repository::open(&dest_path).unwrap();
+        assert_eq!(
+            repo.find_reference(&remote_ref).unwrap().target(),
+            Some(second)
+        );
+        // Working tree/index untouched -- `b.txt` only exists after fetch
+        // if a later `pull`/checkout brings it in, never from `fetch` alone.
+        assert!(!dest_path.join("b.txt").exists());
+    }
+
+    #[test]
+    fn fetch_does_not_bring_in_tags() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        // Tag created *after* the initial clone -- only `fetch`'s own
+        // `download_tags(AutotagOption::None)` is under test here, not
+        // whatever tags a full `clone_repo` happened to bring in already.
+        let second = commit_file(&source_repo, "b.txt", "b", "second");
+        source_repo
+            .tag_lightweight("v1", &source_repo.find_object(second, None).unwrap(), false)
+            .unwrap();
+
+        git.fetch(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        let repo = Repository::open(&dest_path).unwrap();
+        assert!(repo.find_reference("refs/tags/v1").is_err());
+    }
+
+    #[test]
+    fn fetch_against_a_nonexistent_remote_returns_remote_not_found() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a", "init");
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let err = git.fetch("does-not-exist", |_| {});
+
+        assert!(matches!(err, Err(GitError::RemoteNotFound(name)) if name == "does-not-exist"));
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-2026-09-04.md`, finding
+    /// 2's `update_tips`-based defense-in-depth: exercises the *real*
+    /// `update_tips` abort wiring (via `fetch_capped`'s test-only cap
+    /// parameter, not by mocking the counting logic in isolation) against
+    /// more actually-changed refs than the cap allows.
+    #[test]
+    fn fetch_capped_aborts_once_more_refs_update_than_the_cap_allows() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        // Every one of these is a genuinely new remote-tracking ref for
+        // `dest` to create on the next fetch -- `update_tips` fires once
+        // per ref actually updated during that step, so this is real
+        // work for the cap to intercept, not a no-op it might skip.
+        for i in 0..9 {
+            source_repo
+                .branch(
+                    &format!("extra-{i}"),
+                    &source_repo.head().unwrap().peel_to_commit().unwrap(),
+                    false,
+                )
+                .unwrap();
+        }
+
+        let err = git.fetch_capped(DEFAULT_REMOTE, |_| {}, 2);
+
+        assert!(
+            err.is_err(),
+            "expected the update_tips abort to surface as an Err, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_capped_with_a_generous_cap_still_fetches_everything() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        commit_file(&source_repo, "b.txt", "b", "second");
+
+        git.fetch_capped(DEFAULT_REMOTE, |_| {}, MAX_ADVERTISED_REFS)
+            .unwrap();
+
+        let branch = source_repo.head().unwrap().shorthand().unwrap().to_string();
+        let remote_ref = format!("refs/remotes/{DEFAULT_REMOTE}/{branch}");
+        let repo = Repository::open(&dest_path).unwrap();
+        assert!(repo.find_reference(&remote_ref).is_ok());
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-2026-09-04.md`, round 2,
+    /// finding 3: `update_tips_cb` (the trampoline `fetch_capped`'s
+    /// `update_tips` registration goes through) has the identical
+    /// unguarded `str::from_utf8(...).unwrap()` on its refname parameter
+    /// that `push_update_reference_cb` had before `push`'s fix -- but
+    /// reproducing that exact byte-level trigger needs a locally-created
+    /// ref whose name isn't valid UTF-8, which this dev platform's
+    /// filesystem (macOS/APFS) refuses to create at all (`EILSEQ`,
+    /// confirmed live during the hacker pass), independently of anything
+    /// this crate controls. Since the vulnerable line is inside `git2`-rs's
+    /// C callback trampoline and never reachable from our own Rust
+    /// closure, the next best thing is exercising `catch_unwind`'s wiring
+    /// directly: any panic occurring during `remote.fetch(...)`'s
+    /// execution -- including one from the caller-supplied `on_progress`,
+    /// invoked through the same call -- must come back as
+    /// `Err(FetchFailed(_))`, never an unwind.
+    #[test]
+    fn fetch_recovers_as_an_err_instead_of_panicking_when_a_callback_panics() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        // A real object transfer, not a no-op fetch, so `transfer_progress`
+        // (and therefore the caller's `on_progress`) actually fires.
+        commit_file(&source_repo, "b.txt", "b", "second");
+
+        let result = git.fetch(DEFAULT_REMOTE, |_| panic!("boom from on_progress"));
+
+        assert!(
+            matches!(result, Err(GitError::FetchFailed(_))),
+            "expected a caught-panic Err(FetchFailed(_)), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn pull_fast_forwards_and_updates_the_working_tree() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        commit_file(&source_repo, "b.txt", "b", "second");
+
+        let outcome = git.pull(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        assert_eq!(outcome, MergeOutcome::FastForward);
+        assert!(dest_path.join("b.txt").exists());
+    }
+
+    #[test]
+    fn pull_is_up_to_date_when_nothing_changed() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        let outcome = git.pull(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        assert_eq!(outcome, MergeOutcome::UpToDate);
+    }
+
+    #[test]
+    fn pull_reports_conflicts_when_both_sides_changed_the_same_file() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "f.txt", "base\n", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        let dest_repo = Repository::open(&dest_path).unwrap();
+
+        commit_file(&source_repo, "f.txt", "from source\n", "source edits f");
+        commit_file(&dest_repo, "f.txt", "from dest\n", "dest edits f");
+
+        let outcome = git.pull(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        let paths = match outcome {
+            MergeOutcome::Conflicts(paths) => paths,
+            other => panic!("expected Conflicts, got {other:?}"),
+        };
+        assert_eq!(paths, vec![PathBuf::from("f.txt")]);
+    }
+
+    #[test]
+    fn pull_with_detached_head_fails_locally_before_any_fetch() {
+        let (source_dir, source_repo) = init_repo();
+        let head = commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        let dest_repo = Repository::open(&dest_path).unwrap();
+        dest_repo.set_head_detached(head).unwrap();
+
+        // A remote name that doesn't exist -- if `pull` checked
+        // `RemoteNotFound` before `DetachedHead`, this would come back
+        // `RemoteNotFound` instead, proving the check order the doc
+        // requires (§2.1/Revision notes #2): local preconditions before
+        // any network-shaped call.
+        let err = git.pull("does-not-exist", |_| {});
+
+        assert!(matches!(err, Err(GitError::DetachedHead)));
+    }
+
+    #[test]
+    fn pull_with_no_matching_remote_tracking_ref_returns_no_upstream() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        // A branch that only ever existed locally in `dest` -- `origin`
+        // exists (fetch succeeds) but `refs/remotes/origin/new-branch`
+        // never will.
+        git.create_branch("new-branch", None).unwrap();
+        let dest_repo = Repository::open(&dest_path).unwrap();
+        checkout_branch(&dest_repo, "new-branch");
+
+        let err = git.pull(DEFAULT_REMOTE, |_| {});
+
+        assert!(matches!(err, Err(GitError::NoUpstream(name)) if name == DEFAULT_REMOTE));
+    }
+
+    #[test]
+    fn push_succeeds_and_updates_the_remote_ref() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+        let branch = source_repo.head().unwrap().shorthand().unwrap().to_string();
+        let bare = init_bare_remote_from(source_dir.path());
+
+        let local_path = tempfile::tempdir().unwrap().path().join("local");
+        let git = clone_repo(&bare.path().to_string_lossy(), &local_path, |_| {}).unwrap();
+        let local_repo = Repository::open(&local_path).unwrap();
+        let second = commit_file(&local_repo, "b.txt", "b", "second");
+
+        let mut progress_calls = 0usize;
+        git.push(DEFAULT_REMOTE, |_| progress_calls += 1).unwrap();
+
+        let bare_repo = Repository::open_bare(bare.path()).unwrap();
+        let bare_ref = format!("refs/heads/{branch}");
+        assert_eq!(
+            bare_repo.find_reference(&bare_ref).unwrap().target(),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn push_rejected_on_a_destination_refname_conflict() {
+        // libgit2's local-transport push (`transports/local.c`, read
+        // directly from the vendored libgit2 C source rather than
+        // assumed) always force-updates the destination ref
+        // (`git_reference_create(..., force: true, ...)` unconditionally
+        // whenever the ref already exists) -- there is no server process
+        // enforcing non-fast-forward rejection for a `file://`-style
+        // local remote the way a real git server's `receive-pack` does.
+        // A local remote genuinely can't be made to reject a diverged
+        // push, so this test exercises the exact same `push_update_
+        // reference` rejection-detection wiring via a scenario local
+        // transport *does* reject instead: a ref-hierarchy collision
+        // (`refs/heads/foo` and `refs/heads/foo/bar` can't coexist,
+        // exactly like two files can't share one path with one also
+        // being a directory).
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+        let bare = init_bare_remote_from(source_dir.path());
+
+        let local_path = tempfile::tempdir().unwrap().path().join("local");
+        let git = clone_repo(&bare.path().to_string_lossy(), &local_path, |_| {}).unwrap();
+        let local_repo = Repository::open(&local_path).unwrap();
+        let main_name = local_repo.head().unwrap().shorthand().unwrap().to_string();
+
+        git.create_branch("foo", None).unwrap();
+        checkout_branch(&local_repo, "foo");
+        git.push(DEFAULT_REMOTE, |_| {}).unwrap();
+
+        // Free up local `refs/heads/foo` so `foo/bar` can be created
+        // locally (the same file/directory collision would otherwise
+        // block it here too) -- the bare remote keeps its own `foo`.
+        checkout_branch(&local_repo, &main_name);
+        local_repo
+            .find_branch("foo", BranchType::Local)
+            .unwrap()
+            .delete()
+            .unwrap();
+        git.create_branch("foo/bar", None).unwrap();
+        checkout_branch(&local_repo, "foo/bar");
+
+        let err = git.push(DEFAULT_REMOTE, |_| {});
+
+        assert!(matches!(err, Err(GitError::PushRejected(_))));
+    }
+
+    #[test]
+    fn push_against_a_nonexistent_remote_returns_remote_not_found() {
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a", "init");
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let err = git.push("does-not-exist", |_| {});
+
+        assert!(matches!(err, Err(GitError::RemoteNotFound(name)) if name == "does-not-exist"));
+    }
+
+    #[test]
+    fn push_with_detached_head_fails_locally_before_any_push_attempt() {
+        let (source_dir, source_repo) = init_repo();
+        let head = commit_file(&source_repo, "a.txt", "a", "init");
+        let bare = init_bare_remote_from(source_dir.path());
+
+        let local_path = tempfile::tempdir().unwrap().path().join("local");
+        let git = clone_repo(&bare.path().to_string_lossy(), &local_path, |_| {}).unwrap();
+        let local_repo = Repository::open(&local_path).unwrap();
+        local_repo.set_head_detached(head).unwrap();
+
+        let err = git.push("does-not-exist", |_| {});
+
+        assert!(matches!(err, Err(GitError::DetachedHead)));
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-2026-09-04.md`, finding
+    /// 1: `git2` 0.21.0's own FFI trampoline for `push_update_reference`
+    /// panics (`str::from_utf8(...).unwrap()`) when a remote's rejection
+    /// reason is invalid UTF-8 -- verified here with a from-scratch,
+    /// minimal git-wire-protocol server (real `git`/`git2` sanitizes hook
+    /// output away from this exact field, so a hostile hook alone can't
+    /// reach it; this bypasses `git` entirely and speaks just enough of
+    /// git-receive-pack's own wire format to control that field directly,
+    /// same technique the `hacker` pass that found this used live).
+    #[test]
+    fn push_with_a_non_utf8_rejection_reason_from_the_remote_is_an_err_not_a_panic() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn pkt_line(data: &[u8]) -> Vec<u8> {
+            if data.is_empty() {
+                return b"0000".to_vec();
+            }
+            let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+            out.extend_from_slice(data);
+            out
+        }
+
+        fn read_pkt_line(stream: &mut impl Read) -> Vec<u8> {
+            let mut hdr = [0u8; 4];
+            stream.read_exact(&mut hdr).unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&hdr).unwrap(), 16).unwrap();
+            if n == 0 {
+                return Vec::new();
+            }
+            let mut buf = vec![0u8; n - 4];
+            stream.read_exact(&mut buf).unwrap();
+            buf
+        }
+
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a", "init");
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let branch_for_server = branch.clone();
+
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _request_line = read_pkt_line(&mut conn);
+
+            // Unborn-repo ref advertisement, minimal capabilities.
+            let zero = "0".repeat(40);
+            let mut first = format!("{zero} capabilities^{{}}\0").into_bytes();
+            first.extend_from_slice(b"report-status delete-refs ofs-delta");
+            first.push(b'\n');
+            conn.write_all(&pkt_line(&first)).unwrap();
+            conn.write_all(&pkt_line(&[])).unwrap();
+
+            // Drain the client's command list, then whatever packfile
+            // bytes follow (a single-commit pack is a few hundred bytes,
+            // well inside the OS socket buffer -- no need to parse it).
+            loop {
+                if read_pkt_line(&mut conn).is_empty() {
+                    break;
+                }
+            }
+            conn.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .unwrap();
+            let mut sink = [0u8; 65536];
+            while matches!(conn.read(&mut sink), Ok(n) if n > 0) {}
+
+            // Attacker-controlled rejection reason: ANSI escape, then
+            // invalid UTF-8 bytes with no NUL before them (a NUL would
+            // truncate the C string before libgit2 ever sees the invalid
+            // bytes -- confirmed during the live `hacker` pass).
+            let mut reason = b"\x1b[31mFAKE\x1b[0m".to_vec();
+            reason.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+            reason.push(b'\r');
+            reason.extend(std::iter::repeat_n(b'A', 500));
+
+            conn.write_all(&pkt_line(b"unpack ok\n")).unwrap();
+            let mut ng = format!("ng refs/heads/{branch_for_server} ").into_bytes();
+            ng.extend_from_slice(&reason);
+            ng.push(b'\n');
+            conn.write_all(&pkt_line(&ng)).unwrap();
+            conn.write_all(&pkt_line(&[])).unwrap();
+        });
+
+        repo.remote("origin", &format!("git://127.0.0.1:{port}/repo.git"))
+            .unwrap();
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let result = git.push("origin", |_| {});
+        server.join().unwrap();
+
+        assert!(
+            matches!(result, Err(GitError::PushRejected(_))),
+            "expected Err(PushRejected(_)) instead of a panic, got {result:?}"
+        );
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-2026-09-04.md`'s
+    /// fix-round follow-up: `configure_network_timeouts` is the only test
+    /// in this suite that mutates libgit2's global timeout state
+    /// (`git2::opts::set_server_*_timeout_in_milliseconds`), which is
+    /// process-wide and, per its own doc comment, not safe to change
+    /// concurrently with other in-flight `git2` calls -- every other test
+    /// in this module talks to a local filesystem-path "remote" (untouched
+    /// by a *network*-server timeout) rather than a real socket, so this
+    /// is the only one where that global state is actually load-bearing.
+    #[test]
+    fn configure_network_timeouts_bounds_a_stalling_remote() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        unsafe {
+            configure_network_timeouts(2_000, 2_000).unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // Accept, then never send anything -- the connection must stay
+            // open until the client's own read times out. Two bugs round 2's
+            // hacker pass found here, both making this test pass for the
+            // wrong reason regardless of whether the timeout fix works at
+            // all (`docs/security-findings/git-fetch-pull-push-2026-09-04.md`,
+            // round 2, finding 4):
+            // (a) draining with only a 1-byte buffer left the rest of the
+            //     client's request unread in the kernel receive buffer;
+            //     closing a socket with unread bytes still pending sends a
+            //     TCP RST, so `fetch` failed in under a millisecond with
+            //     "Connection reset by peer" -- fixed by draining with a
+            //     generously-sized single read.
+            // (b) the closure returning right after that read dropped
+            //     `conn` immediately, closing the connection outright --
+            //     the client's *next* read then saw a clean EOF instantly
+            //     ("could not read refs from remote repository") rather
+            //     than actually blocking on anything the timeout could
+            //     bound. Fixed by holding the connection open (via a sleep
+            //     comfortably longer than the configured 2s timeout) so the
+            //     client's next read has something to genuinely stall on.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut sink = [0u8; 65536];
+            let _ = conn.read(&mut sink);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a", "init");
+        repo.remote("origin", &format!("git://127.0.0.1:{port}/repo.git"))
+            .unwrap();
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = git.fetch("origin", |_| {});
+        let elapsed = start.elapsed();
+        server.join().unwrap();
+
+        // Not just "any Err" -- specifically the timeout error, so a
+        // regression back to the connection-reset false pass (or any
+        // other unrelated fast failure) is caught rather than silently
+        // accepted.
+        let message = match &result {
+            Err(GitError::Git2(e)) => e.message().to_string(),
+            other => panic!("expected Err(Git2(_)), got {other:?}"),
+        };
+        assert!(
+            message.contains("timed out"),
+            "expected a socket-read-timeout error, got: {message}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_900),
+            "expected the read to actually block for ~2s before timing out, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "expected the configured 2s timeout to bound this, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn push_progress_has_expected_shape() {
+        // Same rationale as `clone_progress_from_git2_progress_field_names_
+        // match_expectations` above -- `push_transfer_progress`'s callback
+        // hands back three plain `usize`s libgit2 constructs internally,
+        // nothing this module can synthesize a real one from; this checks
+        // `PushProgress`'s own shape/derives instead.
+        let p = PushProgress {
+            current: 1,
+            total: 2,
+            bytes: 3,
+        };
+        assert_eq!(p, p);
+        assert_eq!(PushProgress::default(), PushProgress::default());
     }
 }
