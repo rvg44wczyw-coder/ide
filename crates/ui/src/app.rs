@@ -1672,29 +1672,44 @@ impl IdeApp {
     /// "Merge remote-tracking branch '<remote>/<branch>' into <current>"
     /// wording real `git pull` itself uses (§3.2). Returns `true` when a
     /// repaint is warranted, mirroring every other `poll_*` method's shape.
+    ///
+    /// Guards against a stale result: `remote_op.started_for` is the
+    /// project root the operation actually ran against, captured at
+    /// `start()` time, which can differ from `self.project`'s root by the
+    /// time this fires if the user switched projects while the operation
+    /// was still in flight. Applying a finished op's outcome (especially
+    /// `apply_merge_outcome`'s conflict-mode UI state) against whatever
+    /// project happens to be open *now* would attribute the wrong
+    /// project's git state to the user's current project (`docs/security-
+    /// findings/git-fetch-pull-push-ui-2026-09-04.md`, finding 3) -- so a
+    /// mismatch is dropped rather than applied.
     fn poll_remote_op(&mut self) -> bool {
+        let started_for = self.git.remote_op.started_for.clone();
         let Some(result) = self.git.remote_op.poll() else {
             return false;
         };
         if let RemoteOpPollResult::Done(outcome) = result {
-            if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
-                match outcome {
-                    Ok(RemoteOpOutcome::FetchDone) | Ok(RemoteOpOutcome::PushDone) => {
-                        self.git.refresh(&root);
+            let current_root = self.project.as_ref().map(|p| p.root().to_path_buf());
+            if let (Some(root), Some(started_for)) = (current_root, started_for) {
+                if root == started_for {
+                    match outcome {
+                        Ok(RemoteOpOutcome::FetchDone) | Ok(RemoteOpOutcome::PushDone) => {
+                            self.git.refresh(&root);
+                        }
+                        Ok(RemoteOpOutcome::Merged(merge_outcome)) => {
+                            let branch = self
+                                .git
+                                .current_branch
+                                .clone()
+                                .unwrap_or_else(|| "HEAD".to_string());
+                            let message = format!(
+                                "Merge remote-tracking branch '{}/{branch}' into {branch}",
+                                ide_core::git::DEFAULT_REMOTE
+                            );
+                            self.git.apply_merge_outcome(&root, merge_outcome, &message);
+                        }
+                        Err(_) => {}
                     }
-                    Ok(RemoteOpOutcome::Merged(merge_outcome)) => {
-                        let branch = self
-                            .git
-                            .current_branch
-                            .clone()
-                            .unwrap_or_else(|| "HEAD".to_string());
-                        let message = format!(
-                            "Merge remote-tracking branch '{}/{branch}' into {branch}",
-                            ide_core::git::DEFAULT_REMOTE
-                        );
-                        self.git.apply_merge_outcome(&root, merge_outcome, &message);
-                    }
-                    Err(_) => {}
                 }
             }
         }
@@ -6206,6 +6221,70 @@ c
         .trim()
         .to_string();
         assert_eq!(summary, "commit");
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-ui-2026-09-04.md`,
+    /// finding 3: switching to a different project while a Pull is still
+    /// in flight must not apply the eventual result -- especially not
+    /// `apply_merge_outcome`'s conflict-mode UI state -- to the newly
+    /// opened project. The switch happens between `run_command` (which
+    /// captures `dest_path` into `remote_op.started_for`) and the first
+    /// `poll_remote_op` call, so the mismatch is deterministically hit on
+    /// the very first poll regardless of how fast the background thread
+    /// actually finishes.
+    #[test]
+    fn run_command_pull_ignores_a_stale_result_after_switching_projects() {
+        let source = git_init_repo();
+        git_commit(source.path(), "f.txt", "a\n");
+        let dest = git_clone_repo(source.path());
+        let dest_path = dest.path().join("dest");
+
+        // Diverge the same file on both sides so the pull that follows
+        // resolves to a real merge conflict, not a fast-forward.
+        git_commit(&dest_path, "f.txt", "from dest\n");
+        git_commit(source.path(), "f.txt", "from source\n");
+
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(&dest_path).unwrap());
+        app.git.refresh(&dest_path);
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::Pull, &ctx);
+        assert!(app.git.remote_op.is_running());
+
+        // Switch to an unrelated project before ever polling -- the
+        // in-flight Pull keeps running against `dest_path` regardless
+        // (`RemoteOpState::start` already captured it by value), only the
+        // UI's notion of "current project" changes here.
+        let other = git_init_repo();
+        git_commit(other.path(), "g.txt", "x\n");
+        app.project = Some(ide_core::Project::open(other.path()).unwrap());
+        app.git.refresh(other.path());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.git.remote_op.is_running() {
+            app.poll_remote_op();
+            assert!(std::time::Instant::now() < deadline, "pull never completed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // The stale result must not have flipped the UI into
+        // conflict-resolution mode for `other`, which has no conflicts.
+        assert!(!app.git.merging);
+        assert_eq!(
+            app.project.as_ref().unwrap().root(),
+            other.path().canonicalize().unwrap(),
+            "the open project should still be `other`"
+        );
+
+        // The actual pull did run to completion against `dest_path` on
+        // disk -- it just shouldn't have been reflected into `other`'s UI
+        // state. Confirm the real conflict landed where it should have.
+        let f_contents = std::fs::read_to_string(dest_path.join("f.txt")).unwrap();
+        assert!(
+            f_contents.contains("<<<<<<<"),
+            "expected a real merge conflict in dest_path's working tree, got: {f_contents:?}"
+        );
     }
 
     #[test]

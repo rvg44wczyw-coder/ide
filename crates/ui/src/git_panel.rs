@@ -92,6 +92,15 @@ pub struct RemoteOpState {
     pub kind: Option<RemoteOpKind>,
     pub progress: Option<RemoteOpProgress>,
     pub error: Option<String>,
+    /// The project root `start()` was actually called against -- kept
+    /// around (independent of whatever project happens to be open by the
+    /// time `poll()` observes a `Done` result) so `IdeApp::poll_remote_op`
+    /// can refuse to apply a stale result's UI side effects (a repo
+    /// refresh, or worse, `apply_merge_outcome`'s conflict-mode UI state)
+    /// against a *different* project the user has since switched to
+    /// (`docs/security-findings/git-fetch-pull-push-ui-2026-09-04.md`,
+    /// finding 3).
+    pub started_for: Option<PathBuf>,
     rx: Option<Receiver<RemoteOpEvent>>,
 }
 
@@ -117,6 +126,7 @@ impl RemoteOpState {
         self.error = None;
         self.progress = None;
         self.kind = Some(kind);
+        self.started_for = Some(project_root.clone());
 
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
@@ -175,8 +185,22 @@ impl RemoteOpState {
                 Ok(RemoteOpEvent::Done(Err(e))) => {
                     self.rx = None;
                     self.progress = None;
-                    self.error = Some(e.clone());
-                    return Some(RemoteOpPollResult::Done(Err(e)));
+                    // `e` can carry a remote-supplied string verbatim
+                    // (`GitError::PushRejected`'s rejection reason, sourced
+                    // from `push_update_reference`'s server-controlled
+                    // status message -- live-confirmed exploitable by a
+                    // from-scratch hostile git server, `docs/security-
+                    // findings/git-fetch-pull-push-ui-2026-09-04.md`
+                    // finding 1) -- same bidi-spoofing/unbounded-length
+                    // untrusted-content shape `commit_detail` above
+                    // already guards against, so apply the same treatment
+                    // before it ever reaches `RemoteOpState.error` (and
+                    // from there, `render_remote_op_toolbar`'s
+                    // `colored_label`).
+                    let sanitized =
+                        truncate_display(&strip_bidi_controls(&e), MAX_REMOTE_OP_ERROR_CHARS);
+                    self.error = Some(sanitized.clone());
+                    return Some(RemoteOpPollResult::Done(Err(sanitized)));
                 }
                 Err(_) => break,
             }
@@ -968,6 +992,15 @@ impl GitPanel {
 const MAX_COMMIT_DETAIL_SUMMARY_CHARS: usize = 200;
 const MAX_COMMIT_DETAIL_BODY_CHARS: usize = 4000;
 const MAX_COMMIT_DETAIL_NAME_CHARS: usize = 200;
+
+/// Display cap for `RemoteOpState.error` -- same rationale as the
+/// `MAX_COMMIT_DETAIL_*` caps above, applied to `GitError`'s `Display`
+/// text (which can itself echo a remote-supplied string verbatim, e.g.
+/// `PushRejected`'s rejection reason) before `render_remote_op_toolbar`
+/// renders it (`docs/security-findings/git-fetch-pull-push-ui-
+/// 2026-09-04.md`, finding 1). An inline toolbar banner, not a detail
+/// pane, so a shorter cap than `MAX_COMMIT_DETAIL_BODY_CHARS` fits.
+const MAX_REMOTE_OP_ERROR_CHARS: usize = 500;
 
 /// Assigns each commit in `graph` (newest-first, as returned by
 /// `commit_graph`) a display lane so parallel branches render in separate
@@ -2862,5 +2895,129 @@ mod tests {
         .trim()
         .to_string();
         assert_eq!(summary, "on dest");
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-ui-2026-09-04.md`,
+    /// finding 1: a hostile remote (here, a from-scratch minimal
+    /// git-receive-pack wire-protocol responder -- the same technique
+    /// `ide-core`'s own `push_with_a_non_utf8_rejection_reason_...` test
+    /// uses, live-confirmed against a real `git daemon` during that
+    /// hacker pass that a stock `git`/hooks setup can't reach this field
+    /// with attacker-chosen text, only a from-scratch server can) can put
+    /// an arbitrary, valid-UTF-8 rejection reason -- including a Unicode
+    /// bidi-override control character and a long tail -- into
+    /// `GitError::PushRejected`. `RemoteOpState.error` must strip the
+    /// bidi control and cap the length before it ever reaches
+    /// `render_remote_op_toolbar`'s `colored_label`.
+    #[test]
+    fn remote_op_error_from_a_malicious_push_rejection_is_sanitized_and_bounded() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn pkt_line(data: &[u8]) -> Vec<u8> {
+            if data.is_empty() {
+                return b"0000".to_vec();
+            }
+            let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+            out.extend_from_slice(data);
+            out
+        }
+
+        fn read_pkt_line(stream: &mut impl Read) -> Vec<u8> {
+            let mut hdr = [0u8; 4];
+            stream.read_exact(&mut hdr).unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&hdr).unwrap(), 16).unwrap();
+            if n == 0 {
+                return Vec::new();
+            }
+            let mut buf = vec![0u8; n - 4];
+            stream.read_exact(&mut buf).unwrap();
+            buf
+        }
+
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "init");
+        let branch = String::from_utf8(
+            Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let branch_for_server = branch.clone();
+
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _request_line = read_pkt_line(&mut conn);
+
+            let zero = "0".repeat(40);
+            let mut first = format!("{zero} capabilities^{{}}\0").into_bytes();
+            first.extend_from_slice(b"report-status delete-refs ofs-delta");
+            first.push(b'\n');
+            conn.write_all(&pkt_line(&first)).unwrap();
+            conn.write_all(&pkt_line(&[])).unwrap();
+
+            loop {
+                if read_pkt_line(&mut conn).is_empty() {
+                    break;
+                }
+            }
+            conn.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .unwrap();
+            let mut sink = [0u8; 65536];
+            while matches!(conn.read(&mut sink), Ok(n) if n > 0) {}
+
+            // Valid UTF-8 throughout: a bidi-override control character
+            // plus a long repeated tail, nothing invalid that would trip
+            // the (separate, already-hardened) panic-on-non-UTF-8 path.
+            let reason = format!(
+                "gnp.tsoh\u{202e} :desufer eb dluow siht ,kcatta laer a nI {}",
+                "A".repeat(2000)
+            );
+
+            conn.write_all(&pkt_line(b"unpack ok\n")).unwrap();
+            let mut ng = format!("ng refs/heads/{branch_for_server} ").into_bytes();
+            ng.extend_from_slice(reason.as_bytes());
+            ng.push(b'\n');
+            conn.write_all(&pkt_line(&ng)).unwrap();
+            conn.write_all(&pkt_line(&[])).unwrap();
+        });
+
+        run(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("git://127.0.0.1:{port}/repo.git"),
+            ],
+        );
+
+        let mut state = RemoteOpState::default();
+        state.start(RemoteOpKind::Push, dir.path().to_path_buf());
+        let result = poll_until_done(&mut state);
+        server.join().unwrap();
+
+        assert!(
+            matches!(result, RemoteOpPollResult::Done(Err(_))),
+            "expected Done(Err(_)), got {result:?}"
+        );
+        let error = state.error.expect("error should be set on rejection");
+        assert!(
+            !error.contains('\u{202e}'),
+            "bidi override control character leaked into the rendered error: {error:?}"
+        );
+        assert!(
+            error.chars().count() <= MAX_REMOTE_OP_ERROR_CHARS,
+            "error text exceeds the display cap ({} chars): {error:?}",
+            error.chars().count()
+        );
     }
 }
