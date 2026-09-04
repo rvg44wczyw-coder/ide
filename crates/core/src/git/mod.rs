@@ -88,6 +88,28 @@ pub const MAX_DIFF_FILES: usize = 2_000;
 /// `MAX_DIFF_FILES` above, for a different axis.
 pub const MAX_COMMITS_SCANNED: usize = 200_000;
 
+/// Safety bound on how many local remote-tracking refs `fetch` will accept
+/// updating in one call, enforced via `RemoteCallbacks::update_tips`
+/// (`docs/features/git-fetch-pull-push.md` §2.1). **Only a partial
+/// mitigation, documented honestly rather than oversold**: live testing
+/// (`docs/security-findings/git-fetch-pull-push-2026-09-04.md`, finding 2)
+/// confirmed `update_tips` fires once per ref *while applying already-
+/// negotiated updates to local tracking refs* -- i.e. after the remote's
+/// initial ref advertisement has already been fully received and parsed --
+/// not during the advertisement itself. A 2,000,000-fake-ref adversarial
+/// server that never got past the advertisement phase (connection dropped
+/// before any pack transfer) cost ~26s/~400MB with this cap in place and
+/// zero `update_tips` invocations, proving it does not bound that cost.
+/// No hook in `git2` 0.21.0's public API fires during ref-advertisement
+/// parsing itself, so that specific cost remains an open, upstream-level
+/// gap this crate cannot close without patching libgit2 or writing a
+/// custom transport -- flagged here rather than left undiscovered. What
+/// this cap *does* still protect: a fetch that clears the advertisement
+/// phase and negotiates a pack transfer, then tries to apply an
+/// unreasonable number of local ref updates -- a real, if narrower,
+/// amplification vector `update_tips` genuinely does intercept.
+pub const MAX_ADVERTISED_REFS: usize = 100_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     pub old_path: Option<PathBuf>,
@@ -1064,10 +1086,25 @@ impl GitRepo {
     /// auto-tag-following default and would otherwise still bring in
     /// tags despite this module's "branch refs only" scope
     /// (`docs/features/git-fetch-pull-push.md` §2.1/Revision notes #1).
+    /// Caps local ref-update application at [`MAX_ADVERTISED_REFS`] via
+    /// `update_tips` -- see that constant's own doc comment for exactly
+    /// what this does and does not protect against.
     pub fn fetch(
         &self,
         remote_name: &str,
+        on_progress: impl FnMut(TransferProgress),
+    ) -> Result<(), GitError> {
+        self.fetch_capped(remote_name, on_progress, MAX_ADVERTISED_REFS)
+    }
+
+    /// `fetch`'s actual implementation, parameterized by the ref-update cap
+    /// so tests can exercise the `update_tips` abort wiring itself without
+    /// needing to construct hundreds of thousands of real refs.
+    fn fetch_capped(
+        &self,
+        remote_name: &str,
         mut on_progress: impl FnMut(TransferProgress),
+        max_refs: usize,
     ) -> Result<(), GitError> {
         let mut remote = self
             .repo
@@ -1079,6 +1116,11 @@ impl GitRepo {
         callbacks.transfer_progress(|progress| {
             on_progress(TransferProgress::from(progress));
             true
+        });
+        let updated_refs = std::cell::Cell::new(0usize);
+        callbacks.update_tips(move |_refname, _old, _new| {
+            updated_refs.set(updated_refs.get() + 1);
+            updated_refs.get() <= max_refs
         });
 
         let mut fetch_options = git2::FetchOptions::new();
@@ -1132,6 +1174,24 @@ impl GitRepo {
     /// per-ref result comes through `push_update_reference`'s `Option<&
     /// str>` status (`None` = accepted, `Some(msg)` = rejected), captured
     /// here and checked after `push()` returns.
+    ///
+    /// **Hardened against a malicious/misbehaving remote** (`docs/
+    /// security-findings/git-fetch-pull-push-2026-09-04.md`, finding 1):
+    /// `git2` 0.21.0's own FFI trampoline for `push_update_reference`
+    /// (`str::from_utf8(...).unwrap()` on the server-supplied rejection
+    /// reason, verified against its vendored source) panics instead of
+    /// erroring when a remote sends a non-UTF-8 rejection message -- a
+    /// capability entirely under the remote's control, not this crate's.
+    /// The `remote.push(...)` call itself is wrapped in
+    /// `std::panic::catch_unwind` so that panic surfaces to this
+    /// function's caller as `Err(GitError::PushRejected(_))`, same as any
+    /// other rejection, instead of unwinding out of a public `GitRepo`
+    /// method. The original panic payload is discarded rather than
+    /// reformatted into the error message -- by the time `catch_unwind`
+    /// sees it, `git2`-rs's own `panic::wrap` has already lost the raw
+    /// bytes at the FFI boundary (it only preserves an opaque
+    /// `Box<dyn Any>`), so there is nothing meaningful left to surface
+    /// beyond a fixed, honest description of what happened.
     pub fn push(
         &self,
         remote_name: &str,
@@ -1144,7 +1204,7 @@ impl GitRepo {
             .map_err(|_| GitError::RemoteNotFound(remote_name.to_string()))?;
 
         let rejection: RefCell<Option<String>> = RefCell::new(None);
-        {
+        let push_result = {
             // Scoped so `callbacks`/`push_options` -- and the borrow of
             // `rejection` their closures hold -- are dropped before
             // `rejection.into_inner()` below tries to move out of it;
@@ -1172,7 +1232,23 @@ impl GitRepo {
             push_options.remote_callbacks(callbacks);
 
             let refspec = format!("refs/heads/{branch_name}:refs/heads/{branch_name}");
-            remote.push(&[refspec], Some(&mut push_options))?;
+            // `&mut remote`/`&mut push_options` aren't `UnwindSafe` (a
+            // panic mid-call could leave either in an inconsistent state)
+            // -- `AssertUnwindSafe` is sound here because neither is used
+            // again after this call returns, panic or not.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                remote.push(&[refspec], Some(&mut push_options))
+            }))
+        };
+
+        match push_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(GitError::Git2(e)),
+            Err(_panic_payload) => {
+                return Err(GitError::PushRejected(
+                    "remote sent a non-UTF-8 or otherwise malformed rejection reason".to_string(),
+                ));
+            }
         }
 
         if let Some(msg) = rejection.into_inner() {
@@ -4339,6 +4415,59 @@ mod tests {
         assert!(matches!(err, Err(GitError::RemoteNotFound(name)) if name == "does-not-exist"));
     }
 
+    /// `docs/security-findings/git-fetch-pull-push-2026-09-04.md`, finding
+    /// 2's `update_tips`-based defense-in-depth: exercises the *real*
+    /// `update_tips` abort wiring (via `fetch_capped`'s test-only cap
+    /// parameter, not by mocking the counting logic in isolation) against
+    /// more actually-changed refs than the cap allows.
+    #[test]
+    fn fetch_capped_aborts_once_more_refs_update_than_the_cap_allows() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+
+        // Every one of these is a genuinely new remote-tracking ref for
+        // `dest` to create on the next fetch -- `update_tips` fires once
+        // per ref actually updated during that step, so this is real
+        // work for the cap to intercept, not a no-op it might skip.
+        for i in 0..9 {
+            source_repo
+                .branch(
+                    &format!("extra-{i}"),
+                    &source_repo.head().unwrap().peel_to_commit().unwrap(),
+                    false,
+                )
+                .unwrap();
+        }
+
+        let err = git.fetch_capped(DEFAULT_REMOTE, |_| {}, 2);
+
+        assert!(
+            err.is_err(),
+            "expected the update_tips abort to surface as an Err, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_capped_with_a_generous_cap_still_fetches_everything() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        commit_file(&source_repo, "b.txt", "b", "second");
+
+        git.fetch_capped(DEFAULT_REMOTE, |_| {}, MAX_ADVERTISED_REFS)
+            .unwrap();
+
+        let branch = source_repo.head().unwrap().shorthand().unwrap().to_string();
+        let remote_ref = format!("refs/remotes/{DEFAULT_REMOTE}/{branch}");
+        let repo = Repository::open(&dest_path).unwrap();
+        assert!(repo.find_reference(&remote_ref).is_ok());
+    }
+
     #[test]
     fn pull_fast_forwards_and_updates_the_working_tree() {
         let (source_dir, source_repo) = init_repo();
@@ -4522,6 +4651,104 @@ mod tests {
         let err = git.push("does-not-exist", |_| {});
 
         assert!(matches!(err, Err(GitError::DetachedHead)));
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-2026-09-04.md`, finding
+    /// 1: `git2` 0.21.0's own FFI trampoline for `push_update_reference`
+    /// panics (`str::from_utf8(...).unwrap()`) when a remote's rejection
+    /// reason is invalid UTF-8 -- verified here with a from-scratch,
+    /// minimal git-wire-protocol server (real `git`/`git2` sanitizes hook
+    /// output away from this exact field, so a hostile hook alone can't
+    /// reach it; this bypasses `git` entirely and speaks just enough of
+    /// git-receive-pack's own wire format to control that field directly,
+    /// same technique the `hacker` pass that found this used live).
+    #[test]
+    fn push_with_a_non_utf8_rejection_reason_from_the_remote_is_an_err_not_a_panic() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn pkt_line(data: &[u8]) -> Vec<u8> {
+            if data.is_empty() {
+                return b"0000".to_vec();
+            }
+            let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+            out.extend_from_slice(data);
+            out
+        }
+
+        fn read_pkt_line(stream: &mut impl Read) -> Vec<u8> {
+            let mut hdr = [0u8; 4];
+            stream.read_exact(&mut hdr).unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&hdr).unwrap(), 16).unwrap();
+            if n == 0 {
+                return Vec::new();
+            }
+            let mut buf = vec![0u8; n - 4];
+            stream.read_exact(&mut buf).unwrap();
+            buf
+        }
+
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a", "init");
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let branch_for_server = branch.clone();
+
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _request_line = read_pkt_line(&mut conn);
+
+            // Unborn-repo ref advertisement, minimal capabilities.
+            let zero = "0".repeat(40);
+            let mut first = format!("{zero} capabilities^{{}}\0").into_bytes();
+            first.extend_from_slice(b"report-status delete-refs ofs-delta");
+            first.push(b'\n');
+            conn.write_all(&pkt_line(&first)).unwrap();
+            conn.write_all(&pkt_line(&[])).unwrap();
+
+            // Drain the client's command list, then whatever packfile
+            // bytes follow (a single-commit pack is a few hundred bytes,
+            // well inside the OS socket buffer -- no need to parse it).
+            loop {
+                if read_pkt_line(&mut conn).is_empty() {
+                    break;
+                }
+            }
+            conn.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .unwrap();
+            let mut sink = [0u8; 65536];
+            while matches!(conn.read(&mut sink), Ok(n) if n > 0) {}
+
+            // Attacker-controlled rejection reason: ANSI escape, then
+            // invalid UTF-8 bytes with no NUL before them (a NUL would
+            // truncate the C string before libgit2 ever sees the invalid
+            // bytes -- confirmed during the live `hacker` pass).
+            let mut reason = b"\x1b[31mFAKE\x1b[0m".to_vec();
+            reason.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+            reason.push(b'\r');
+            reason.extend(std::iter::repeat_n(b'A', 500));
+
+            conn.write_all(&pkt_line(b"unpack ok\n")).unwrap();
+            let mut ng = format!("ng refs/heads/{branch_for_server} ").into_bytes();
+            ng.extend_from_slice(&reason);
+            ng.push(b'\n');
+            conn.write_all(&pkt_line(&ng)).unwrap();
+            conn.write_all(&pkt_line(&[])).unwrap();
+        });
+
+        repo.remote("origin", &format!("git://127.0.0.1:{port}/repo.git"))
+            .unwrap();
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let result = git.push("origin", |_| {});
+        server.join().unwrap();
+
+        assert!(
+            matches!(result, Err(GitError::PushRejected(_))),
+            "expected Err(PushRejected(_)) instead of a panic, got {result:?}"
+        );
     }
 
     #[test]
