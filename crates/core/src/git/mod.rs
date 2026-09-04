@@ -54,6 +54,8 @@ pub enum GitError {
     NoUpstream(String),
     #[error("push rejected by remote: {0}")]
     PushRejected(String),
+    #[error("fetch failed: {0}")]
+    FetchFailed(String),
 }
 
 /// Default remote name assumed when the caller has no more specific one
@@ -1127,8 +1129,22 @@ impl GitRepo {
         fetch_options.remote_callbacks(callbacks);
         fetch_options.download_tags(git2::AutotagOption::None);
 
-        remote.fetch(&[] as &[&str], Some(&mut fetch_options), None)?;
-        Ok(())
+        // `update_tips_cb` (the C trampoline `update_tips` above registers)
+        // has the same unguarded `str::from_utf8(...).unwrap()` on its
+        // refname parameter that `push_update_reference_cb` had before
+        // `push`'s own `catch_unwind` fix -- a remote whose advertised ref
+        // name isn't valid UTF-8 panics deep inside `git2`-rs once that ref
+        // is actually applied locally. Mirrors `push`'s fix exactly.
+        let fetch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            remote.fetch(&[] as &[&str], Some(&mut fetch_options), None)
+        }));
+        match fetch_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(GitError::Git2(e)),
+            Err(_panic_payload) => Err(GitError::FetchFailed(
+                "remote sent a non-UTF-8 or otherwise malformed ref name".to_string(),
+            )),
+        }
     }
 
     /// Fetches from `remote_name` (as `fetch` does), then merges the
@@ -4512,6 +4528,41 @@ mod tests {
         assert!(repo.find_reference(&remote_ref).is_ok());
     }
 
+    /// `docs/security-findings/git-fetch-pull-push-2026-09-04.md`, round 2,
+    /// finding 3: `update_tips_cb` (the trampoline `fetch_capped`'s
+    /// `update_tips` registration goes through) has the identical
+    /// unguarded `str::from_utf8(...).unwrap()` on its refname parameter
+    /// that `push_update_reference_cb` had before `push`'s fix -- but
+    /// reproducing that exact byte-level trigger needs a locally-created
+    /// ref whose name isn't valid UTF-8, which this dev platform's
+    /// filesystem (macOS/APFS) refuses to create at all (`EILSEQ`,
+    /// confirmed live during the hacker pass), independently of anything
+    /// this crate controls. Since the vulnerable line is inside `git2`-rs's
+    /// C callback trampoline and never reachable from our own Rust
+    /// closure, the next best thing is exercising `catch_unwind`'s wiring
+    /// directly: any panic occurring during `remote.fetch(...)`'s
+    /// execution -- including one from the caller-supplied `on_progress`,
+    /// invoked through the same call -- must come back as
+    /// `Err(FetchFailed(_))`, never an unwind.
+    #[test]
+    fn fetch_recovers_as_an_err_instead_of_panicking_when_a_callback_panics() {
+        let (source_dir, source_repo) = init_repo();
+        commit_file(&source_repo, "a.txt", "a", "init");
+
+        let dest_path = tempfile::tempdir().unwrap().path().join("dest");
+        let git = clone_repo(&source_dir.path().to_string_lossy(), &dest_path, |_| {}).unwrap();
+        // A real object transfer, not a no-op fetch, so `transfer_progress`
+        // (and therefore the caller's `on_progress`) actually fires.
+        commit_file(&source_repo, "b.txt", "b", "second");
+
+        let result = git.fetch(DEFAULT_REMOTE, |_| panic!("boom from on_progress"));
+
+        assert!(
+            matches!(result, Err(GitError::FetchFailed(_))),
+            "expected a caught-panic Err(FetchFailed(_)), got {result:?}"
+        );
+    }
+
     #[test]
     fn pull_fast_forwards_and_updates_the_working_tree() {
         let (source_dir, source_repo) = init_repo();
@@ -4816,11 +4867,30 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
-            // Accept, then never send anything -- the connection just
-            // sits open until the client's own read times out.
+            // Accept, then never send anything -- the connection must stay
+            // open until the client's own read times out. Two bugs round 2's
+            // hacker pass found here, both making this test pass for the
+            // wrong reason regardless of whether the timeout fix works at
+            // all (`docs/security-findings/git-fetch-pull-push-2026-09-04.md`,
+            // round 2, finding 4):
+            // (a) draining with only a 1-byte buffer left the rest of the
+            //     client's request unread in the kernel receive buffer;
+            //     closing a socket with unread bytes still pending sends a
+            //     TCP RST, so `fetch` failed in under a millisecond with
+            //     "Connection reset by peer" -- fixed by draining with a
+            //     generously-sized single read.
+            // (b) the closure returning right after that read dropped
+            //     `conn` immediately, closing the connection outright --
+            //     the client's *next* read then saw a clean EOF instantly
+            //     ("could not read refs from remote repository") rather
+            //     than actually blocking on anything the timeout could
+            //     bound. Fixed by holding the connection open (via a sleep
+            //     comfortably longer than the configured 2s timeout) so the
+            //     client's next read has something to genuinely stall on.
             let (mut conn, _) = listener.accept().unwrap();
-            let mut sink = [0u8; 1];
+            let mut sink = [0u8; 65536];
             let _ = conn.read(&mut sink);
+            std::thread::sleep(std::time::Duration::from_secs(5));
         });
 
         let (dir, repo) = init_repo();
@@ -4834,7 +4904,22 @@ mod tests {
         let elapsed = start.elapsed();
         server.join().unwrap();
 
-        assert!(result.is_err(), "expected a timeout Err, got {result:?}");
+        // Not just "any Err" -- specifically the timeout error, so a
+        // regression back to the connection-reset false pass (or any
+        // other unrelated fast failure) is caught rather than silently
+        // accepted.
+        let message = match &result {
+            Err(GitError::Git2(e)) => e.message().to_string(),
+            other => panic!("expected Err(Git2(_)), got {other:?}"),
+        };
+        assert!(
+            message.contains("timed out"),
+            "expected a socket-read-timeout error, got: {message}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_900),
+            "expected the read to actually block for ~2s before timing out, took {elapsed:?}"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "expected the configured 2s timeout to bound this, took {elapsed:?}"
