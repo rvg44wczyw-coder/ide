@@ -389,6 +389,23 @@ nothing `apply_workspace_edit_to_disk`-then-buffer-apply sequence every
 other multi-file apply path in this crate already uses (§2.2). **Cancel**
 just drops the preview; no I/O has happened yet either way.
 
+Each `FileEdit`'s `Transaction` was computed off-thread against a
+search-time disk snapshot, not against whatever text is live at Apply
+time. For the disk-write branch this is safe by construction —
+`apply_workspace_edit_to_disk` re-reads each file fresh immediately before
+writing and rejects a `Transaction` that no longer fits
+(`WorkspaceEditError::OffsetOutOfRange`), rolling back every file already
+written. For the open-tab branch, `Buffer::apply` → `TextBuffer::edit`
+instead **clamps** an out-of-range offset to the nearest valid position
+(`crates/core/src/text/mod.rs`'s own `clamp`, this crate's established "a
+caller got an offset slightly wrong" convention) rather than rejecting it —
+never panics, but a tab with unsaved edits made since the search ran could
+receive the replacement at a shifted position instead of a clean error.
+This is not a new risk this port introduces: `ide-ui`'s own `confirm_
+replace_in_path_preview` applies `preview.edit.edits` the same direct way,
+with the identical buffer-side behavior. Documented here rather than
+silently inherited.
+
 A file rewritten on disk by Replace in Path that's *also* open in a tab
 elsewhere and *wasn't* matched (so it went through the disk path, not the
 buffer path) is picked up by this crate's existing file-watcher/external-
@@ -497,3 +514,12 @@ preview`); nothing new enough in shape to warrant one.
   scope note — the reference IDE itself only exposes these as clickable
   checkboxes, matching `search-in-path-v2.md` §2.2's own description of
   `ide-ui`'s identical checkboxes).
+
+## Revision notes
+
+- §3.3: added an explicit note on the clamp-vs-reject asymmetry between
+  the disk-apply and open-tab-apply branches for a stale off-thread
+  `Transaction` (`rev`'s doc-review finding) — traced `TextBuffer::edit`'s
+  `clamp` directly to confirm it never panics, and confirmed `ide-ui`'s
+  own equivalent path has the identical behavior already, so this is a
+  documentation gap, not a new defect to design around.
