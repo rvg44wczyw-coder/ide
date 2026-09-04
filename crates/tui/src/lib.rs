@@ -90,6 +90,26 @@ use app::{App, LoopSignal};
 /// both callers used to duplicate individually before this phase
 /// centralized it here.
 pub fn main(root: Option<PathBuf>) -> ExitCode {
+    // Process-wide libgit2 network-I/O timeout config (`docs/features/
+    // git-fetch-pull-push.md` Revision notes #10) -- must run exactly once,
+    // synchronously, before any thread that might call a `GitRepo` network
+    // operation (fetch/pull/push) is spawned. This is the standalone
+    // `ide-tui` binary's own entry point (via `crates/tui/src/main.rs`), so
+    // it needs its own call here rather than relying on `ide-ui`'s
+    // `main.rs` -- that binary never runs for a user who only ever invokes
+    // `ide-tui` directly. When reached via the unified `ide --tui` binary
+    // instead, `ide-ui`'s `main.rs` already made this same call before
+    // dispatching here; the duplicate is harmless since the function just
+    // sets two process-global `i32`s via `git2::opts` setters. A failure
+    // here is not fatal -- it only means fetch/pull/push against a
+    // stalling remote could block indefinitely instead of erroring at a
+    // bounded deadline.
+    unsafe {
+        if let Err(e) = ide_core::git::configure_network_timeouts(10_000, 30_000) {
+            eprintln!("ide-tui: warning: failed to configure git network timeouts: {e}");
+        }
+    }
+
     let remembered = state::load().last_project;
     let resolved_root = resolve_root(root, remembered, current_dir());
 
@@ -246,6 +266,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // guards on `is_running()` (`docs/features/tui-git-clone.md` §2.4,
         // T34).
         app.poll_clone();
+        // Same reasoning, for an in-flight Fetch/Pull/Push -- `poll_remote_op`
+        // itself guards on `is_running()` (`docs/features/
+        // git-fetch-pull-push.md` §2.3).
+        app.poll_remote_op();
         // Same reasoning, for external file-system changes (tree refresh,
         // a tab's file modified/deleted on disk) delivered by the
         // background file watcher (`docs/features/tui-file-watcher.md`

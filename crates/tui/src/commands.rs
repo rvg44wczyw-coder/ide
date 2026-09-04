@@ -240,6 +240,9 @@ pub enum Action {
     ShowFileHistory,
     ToggleBlameAnnotations,
     ShowBlameForCurrentLine,
+    Fetch,
+    Pull,
+    Push,
     NavigateBack,
     NavigateForward,
     ToggleClonePanel,
@@ -896,6 +899,36 @@ pub fn commands() -> &'static [Command] {
             // Commit Details popup for a mouse-hostile terminal session).
             binding: None,
             action: Action::ShowBlameForCurrentLine,
+        },
+        Command {
+            id: "Fetch",
+            title: "Fetch",
+            // No default binding -- matches `ide-ui`, which also has no
+            // JetBrains default for a bare Fetch (`git-fetch-pull-push.md`
+            // §2.3/§3.5).
+            binding: None,
+            action: Action::Fetch,
+        },
+        Command {
+            id: "Pull",
+            title: "Update Project",
+            // No default binding: the JetBrains binding this would
+            // otherwise translate (`Ctrl+T`) is already
+            // `ToggleProjectToolWindow` in this crate's keymap
+            // (`git-fetch-pull-push.md` §2.3/§3.5) -- `CLAUDE.md`'s "never
+            // invent a binding" rule leaves this palette-only rather than
+            // picking an unrelated key.
+            binding: None,
+            action: Action::Pull,
+        },
+        Command {
+            id: "Push",
+            title: "Push",
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+                KeyCode::Char('k'),
+            )),
+            action: Action::Push,
         },
         Command {
             id: "NavigateBack",

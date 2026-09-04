@@ -15,8 +15,9 @@ use crossterm::event::{
 use ide_core::{
     all_occurrences, detect_language, editorconfig, fuzzy_score, newline_indent, next_occurrence,
     splits_a_pair, syntax_for_path, word_at, Buffer, BufferError, Change, Charset, DirEntry,
-    EditorConfig, FileWatcher, IndentUnit, LanguageConfig, LineDirection, Project, ProjectError,
-    ReplaceResult, Selection, Selections, SyntaxRules, TextBuffer, Transaction, WatchEvent,
+    EditorConfig, FileWatcher, IndentUnit, LanguageConfig, LineDirection, MergeOutcome, Project,
+    ProjectError, ReplaceResult, Selection, Selections, SyntaxRules, TextBuffer, Transaction,
+    WatchEvent,
 };
 use ide_lsp::{Diagnostic, Location, LspRequest, Position, Symbol};
 
@@ -36,7 +37,9 @@ use crate::editor::{
 use crate::files_search::FilesSearchPanel;
 use crate::find::{FindField, FindState};
 use crate::folding::{self, VisualLines};
-use crate::git_panel::{GitPanel, WorktreeAddField};
+use crate::git_panel::{
+    GitPanel, RemoteOpKind, RemoteOpOutcome, RemoteOpPollResult, WorktreeAddField,
+};
 use crate::k8s_panel::{K8sPanel, K8sPicker, K8sTab};
 use crate::keymap::{self, KeymapOverlay};
 use crate::lsp_bridge::LspBridge;
@@ -983,6 +986,77 @@ impl App {
                 }
             }
             Some(ClonePollResult::Progress) | None => {}
+        }
+    }
+
+    /// Fetch/Pull/Push's per-frame completion handling (`docs/features/
+    /// git-fetch-pull-push.md` §2.3). No-op while nothing is running, same
+    /// guard `poll_clone` above uses. `FetchDone`/`PushDone` just
+    /// `refresh()` and `notify()` a one-line result; `Merged` dispatches
+    /// on the specific `MergeOutcome` for its own wording (`"Already up to
+    /// date"`/`"Fast-forwarded to <short-id>"`, the latter read off
+    /// `self.git.graph`'s new head-of-list entry once `apply_merge_outcome`
+    /// has refreshed it) except `Conflicts`, which -- like the manual
+    /// merge path in `handle_git_branches_popup_key` -- switches the Git
+    /// Panel to the Log view focused on Conflicts instead of `notify()`ing,
+    /// opening the panel first if it wasn't already (unlike that manual
+    /// path, this one isn't guaranteed to already be running with the
+    /// panel open, since Fetch/Pull/Push work from anywhere).
+    pub fn poll_remote_op(&mut self) {
+        if !self.git.remote_op.is_running() {
+            return;
+        }
+        match self.git.remote_op.poll() {
+            Some(RemoteOpPollResult::Done(Ok(outcome))) => {
+                let root = self.project_root.clone();
+                match outcome {
+                    RemoteOpOutcome::FetchDone => {
+                        self.git.refresh(&root);
+                        self.notify("Fetched");
+                    }
+                    RemoteOpOutcome::PushDone => {
+                        self.git.refresh(&root);
+                        self.notify("Pushed");
+                    }
+                    RemoteOpOutcome::Merged(merge_outcome) => {
+                        let is_conflicts = matches!(merge_outcome, MergeOutcome::Conflicts(_));
+                        let is_fast_forward = matches!(merge_outcome, MergeOutcome::FastForward);
+                        let branch = self
+                            .git
+                            .current_branch
+                            .clone()
+                            .unwrap_or_else(|| "HEAD".to_string());
+                        let message = format!(
+                            "Merge remote-tracking branch '{}/{branch}' into {branch}",
+                            ide_core::git::DEFAULT_REMOTE
+                        );
+                        self.git.apply_merge_outcome(&root, merge_outcome, &message);
+                        if is_conflicts {
+                            if self.git_panel.is_none() {
+                                self.toggle_git_panel();
+                            }
+                            if let Some(state) = self.git_panel.as_mut() {
+                                state.view = GitPanelView::Log;
+                                state.focus = GitPanelFocus::Conflicts;
+                            }
+                        } else if is_fast_forward {
+                            let short_id = self
+                                .git
+                                .graph
+                                .first()
+                                .map(|c| c.short_id.clone())
+                                .unwrap_or_default();
+                            self.notify(format!("Fast-forwarded to {short_id}"));
+                        } else {
+                            self.notify("Already up to date");
+                        }
+                    }
+                }
+            }
+            Some(RemoteOpPollResult::Done(Err(e))) => {
+                self.notify(e);
+            }
+            Some(RemoteOpPollResult::Progress) | None => {}
         }
     }
 
@@ -3926,6 +4000,43 @@ impl App {
         }
     }
 
+    /// `Fetch` command (`docs/features/git-fetch-pull-push.md` §2.3):
+    /// silent no-op with no open repository, the same missing-precondition
+    /// shape `trigger_show_file_history` above already establishes. Unlike
+    /// `GitBranches`/`GitWorktrees`/`ShowFileHistory`, this doesn't open
+    /// the Git Panel itself -- the operation doesn't need any panel UI to
+    /// run (only its in-flight status line does, which is
+    /// `render_git_panel`'s own concern once the panel happens to be
+    /// open), matching `ide-ui`'s identical command working from the
+    /// palette/keybinding regardless of whether the Source Control panel
+    /// is currently visible.
+    fn trigger_fetch(&mut self) {
+        if !self.git.is_repo() {
+            return;
+        }
+        let root = self.project_root.clone();
+        self.git.remote_op.start(RemoteOpKind::Fetch, root);
+    }
+
+    /// `Pull` command ("Update Project" in the palette/menu) -- same
+    /// guard/shape as `trigger_fetch`.
+    fn trigger_pull(&mut self) {
+        if !self.git.is_repo() {
+            return;
+        }
+        let root = self.project_root.clone();
+        self.git.remote_op.start(RemoteOpKind::Pull, root);
+    }
+
+    /// `Push` command -- same guard/shape as `trigger_fetch`.
+    fn trigger_push(&mut self) {
+        if !self.git.is_repo() {
+            return;
+        }
+        let root = self.project_root.clone();
+        self.git.remote_op.start(RemoteOpKind::Push, root);
+    }
+
     /// Handles every key while `BottomDockTab::Docker` is the bottom
     /// dock's active tab and it has focus (`handle_bottom_dock_key`'s
     /// delegation) -- `docs/features/tui-docker-and-kubernetes.md` §3.3.
@@ -5061,6 +5172,9 @@ impl App {
             Action::ShowFileHistory => self.trigger_show_file_history(),
             Action::ToggleBlameAnnotations => self.toggle_blame_annotations(),
             Action::ShowBlameForCurrentLine => self.show_blame_for_current_line(),
+            Action::Fetch => self.trigger_fetch(),
+            Action::Pull => self.trigger_pull(),
+            Action::Push => self.trigger_push(),
             Action::ToggleDockerPanel => self.toggle_docker_panel(),
             Action::ToggleK8sPanel => self.toggle_k8s_panel(),
             Action::JumpToMatchingBracket => self.trigger_jump_to_matching_bracket(),
@@ -10799,6 +10913,169 @@ mod tests {
             .notifications
             .iter()
             .any(|n| n.message.starts_with("Cloned to ")));
+    }
+
+    /// `fetch`/`pull`/`push` all resolve `git::DEFAULT_REMOTE` ("origin")
+    /// by name -- mirrors `git_panel.rs`'s own test helper of the same
+    /// name.
+    fn clone_repo_dir(source: &std::path::Path) -> tempfile::TempDir {
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("dest");
+        run_git(
+            parent.path(),
+            &[
+                "clone",
+                "-q",
+                &source.to_string_lossy(),
+                &dest.to_string_lossy(),
+            ],
+        );
+        run_git(&dest, &["config", "user.name", "Test User"]);
+        run_git(&dest, &["config", "user.email", "test@example.com"]);
+        parent
+    }
+
+    fn poll_remote_op_until_idle(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.git.remote_op.is_running() {
+            app.poll_remote_op();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "remote op never reported a terminal result"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // One more poll: the background thread's terminal `Done` event may
+        // still be sitting in the channel on the same tick `is_running()`
+        // last read `true` (the check happens before `poll()` drains it).
+        app.poll_remote_op();
+    }
+
+    #[test]
+    fn trigger_fetch_is_a_noop_on_a_non_repo_project() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.trigger_fetch();
+        assert!(!app.git.remote_op.is_running());
+    }
+
+    #[test]
+    fn trigger_fetch_refreshes_and_notifies() {
+        let source = sample_git_project();
+        let dest = clone_repo_dir(source.path());
+        let dest_path = dest.path().join("dest");
+        git_commit(source.path(), "g.txt", "b\n", "second");
+
+        let mut app = App::new(dest_path).unwrap();
+        app.trigger_fetch();
+        assert!(app.git.remote_op.is_running());
+        poll_remote_op_until_idle(&mut app);
+
+        assert!(app.notifications.iter().any(|n| n.message == "Fetched"));
+    }
+
+    #[test]
+    fn trigger_pull_fast_forwards_and_notifies() {
+        let source = sample_git_project();
+        let dest = clone_repo_dir(source.path());
+        let dest_path = dest.path().join("dest");
+        git_commit(source.path(), "g.txt", "b\n", "second");
+
+        let mut app = App::new(dest_path.clone()).unwrap();
+        app.trigger_pull();
+        poll_remote_op_until_idle(&mut app);
+
+        assert!(dest_path.join("g.txt").exists());
+        assert!(!app.git.merging);
+        assert!(app
+            .notifications
+            .iter()
+            .any(|n| n.message.starts_with("Fast-forwarded to ")));
+    }
+
+    #[test]
+    fn trigger_push_pushes_local_commits_and_notifies() {
+        let source = sample_git_project();
+        // libgit2's local transport can't push to a non-bare repo
+        // (`GIT_ERROR_BAREREPO`) -- same requirement `git_panel.rs`'s own
+        // push test establishes. The "remote" here is a bare clone of
+        // `source`; `dest` clones from *that* bare repo.
+        let bare_parent = tempfile::tempdir().unwrap();
+        let bare_path = bare_parent.path().join("bare.git");
+        run_git(
+            bare_parent.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &source.path().to_string_lossy(),
+                &bare_path.to_string_lossy(),
+            ],
+        );
+        let dest = clone_repo_dir(&bare_path);
+        let dest_path = dest.path().join("dest");
+        git_commit(&dest_path, "g.txt", "b\n", "on dest");
+
+        let mut app = App::new(dest_path).unwrap();
+        app.trigger_push();
+        poll_remote_op_until_idle(&mut app);
+
+        assert!(app.notifications.iter().any(|n| n.message == "Pushed"));
+        let summary = String::from_utf8(
+            std::process::Command::new("git")
+                .args([
+                    "--git-dir",
+                    &bare_path.to_string_lossy(),
+                    "log",
+                    "-1",
+                    "--format=%s",
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(summary, "on dest");
+    }
+
+    /// `docs/features/git-fetch-pull-push.md` §2.3: a `Pull` that lands in
+    /// real conflicts opens the Git Panel (if not already open) and
+    /// switches it to the Log view focused on Conflicts, instead of
+    /// `notify()`ing a one-line result.
+    #[test]
+    fn trigger_pull_with_conflicts_opens_the_panel_on_the_conflicts_view() {
+        let source = sample_git_project();
+        let dest = clone_repo_dir(source.path());
+        let dest_path = dest.path().join("dest");
+        // Divergent edits to the same file on both sides -- the same
+        // conflict setup `git_panel.rs`'s own merge-conflict tests use.
+        git_commit(source.path(), "a.txt", "hello\nremote", "remote edit");
+        git_commit(&dest_path, "a.txt", "hello\nlocal", "local edit");
+
+        let mut app = App::new(dest_path).unwrap();
+        assert!(app.git_panel.is_none());
+        app.trigger_pull();
+        poll_remote_op_until_idle(&mut app);
+
+        assert!(app.git.merging);
+        let state = app.git_panel.as_ref().expect("panel should have opened");
+        assert_eq!(state.view, GitPanelView::Log);
+        assert_eq!(state.focus, GitPanelFocus::Conflicts);
+    }
+
+    #[test]
+    fn run_action_fetch_dispatches_to_trigger_fetch() {
+        let source = sample_git_project();
+        let dest = clone_repo_dir(source.path());
+        let dest_path = dest.path().join("dest");
+        let mut app = App::new(dest_path).unwrap();
+
+        app.run_action(Action::Fetch);
+
+        assert!(app.git.remote_op.is_running());
+        poll_remote_op_until_idle(&mut app);
     }
 
     #[test]
