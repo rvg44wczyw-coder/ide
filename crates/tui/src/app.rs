@@ -2585,7 +2585,6 @@ impl App {
             KeyCode::Enter => self.confirm_file_structure(),
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.query.push(c);
-                let state = self.file_structure.as_mut().unwrap();
                 state.selected = 0;
             }
             _ => {}
