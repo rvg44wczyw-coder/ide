@@ -40,6 +40,7 @@ mod debug_config;
 mod debug_panel;
 mod docker_panel;
 mod editor;
+mod file_structure;
 mod files_search;
 mod find;
 mod folding;

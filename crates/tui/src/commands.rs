@@ -211,6 +211,7 @@ pub enum Action {
     CollapseSelections,
     GoToFile,
     GoToSymbol,
+    FileStructure,
     RecentFiles,
     ToggleBookmark,
     ShowBookmarks,
@@ -636,6 +637,18 @@ pub fn commands() -> &'static [Command] {
                 KeyCode::Char('n'),
             )),
             action: Action::GoToSymbol,
+        },
+        Command {
+            id: "FileStructure",
+            title: "File Structure",
+            // Literal `F12`, not a `Ctrl`-translated letter -- same
+            // reasoning as `QuickDocumentation`'s literal `F1`
+            // (`docs/features/tui-file-structure-and-breadcrumbs.md`
+            // §2.3): JetBrains' own default is already a bare function
+            // key, no mac/other split to translate, and `F12` isn't bound
+            // to anything else in this file.
+            binding: Some((KeyModifiers::NONE, KeyCode::F(12))),
+            action: Action::FileStructure,
         },
         Command {
             id: "RecentFiles",
@@ -1262,6 +1275,12 @@ mod tests {
             KeyCode::Char('n'),
         ));
         assert_eq!(action, Some(Action::GoToSymbol));
+    }
+
+    #[test]
+    fn bare_f12_maps_to_file_structure() {
+        let action = binding_for(key(KeyModifiers::NONE, KeyCode::F(12)));
+        assert_eq!(action, Some(Action::FileStructure));
     }
 
     #[test]

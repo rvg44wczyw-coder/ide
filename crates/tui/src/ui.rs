@@ -39,7 +39,9 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 
 /// Non-text rows around the editor's visible buffer content: the status
 /// bar (`render`'s own vertical split, 1 row) plus `render_editor`'s
-/// `Block`'s top/bottom borders (2 rows) plus the tab strip (1 row). This
+/// `Block`'s top/bottom borders (2 rows) plus the tab strip (1 row) plus
+/// the breadcrumbs strip (1 row, `docs/features/
+/// tui-file-structure-and-breadcrumbs.md` §3.4). This
 /// crate has no scroll-follows-cursor logic inside this file (this file
 /// mutates nothing, per its own doc comment above) -- `app.rs`'s
 /// `handle_editor_key` needs to know how many text rows are actually
@@ -49,8 +51,14 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// change with it -- there is no single source of truth to keep them in
 /// sync automatically, so a `Layout` change here is also a reason to grep
 /// for this constant's uses (`main.rs`) before merging (`docs/features/
-/// tui-scroll-follows-cursor.md` §2.1).
-pub const EDITOR_CHROME_ROWS: u16 = 4;
+/// tui-scroll-follows-cursor.md` §2.1). The breadcrumbs row is *always*
+/// reserved, whether or not `App::active_breadcrumbs()` is non-empty on
+/// any given frame -- a content-conditional row would desync this
+/// precomputed count from `render_editor`'s actual drawn layout on any
+/// frame where the caret enters/leaves a symbol, since this constant is
+/// read before any `Layout` pass runs (`tui-file-structure-and-
+/// breadcrumbs.md` §3.4 spells out why).
+pub const EDITOR_CHROME_ROWS: u16 = 5;
 
 /// Right-margin guide column (`docs/features/right-margin-guide.md` §1) --
 /// always this literal value in `ide-tui`, unlike `ide-ui` where it's
@@ -166,6 +174,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     if app.go_to_symbol.is_some() {
         render_go_to_symbol_popup(frame, app, size);
+    }
+    if app.file_structure.is_some() {
+        render_file_structure_popup(frame, app, size);
     }
     if app.recent_files.is_some() {
         render_recent_files_popup(frame, app, size);
@@ -368,18 +379,28 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // One row for the tab strip, the rest for the buffer text
-    // (`docs/features/tui-multi-buffer-tabs.md` §2.3) -- every cursor/
+    // One row for the tab strip, one for breadcrumbs, the rest for the
+    // buffer text (`docs/features/tui-multi-buffer-tabs.md` §2.3,
+    // `tui-file-structure-and-breadcrumbs.md` §3.4) -- every cursor/
     // scroll computation below is relative to `text_area`, not `inner`,
-    // since the strip now occupies `inner`'s first row.
+    // since the strip/breadcrumbs now occupy `inner`'s first two rows.
+    // The breadcrumbs row is unconditionally reserved even when empty --
+    // see `EDITOR_CHROME_ROWS`'s own doc comment for why a content
+    // -conditional row isn't safe here.
     let sections = Layout::default()
         .direction(LayoutDirection::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(inner);
     let strip_area = sections[0];
-    let text_area = sections[1];
+    let breadcrumbs_area = sections[1];
+    let text_area = sections[2];
 
     render_tab_strip(frame, app, strip_area, hits);
+    render_breadcrumbs(frame, app, breadcrumbs_area);
     hits.editor_text_area = Some(text_area);
 
     let Some(buf) = app.active_buffer() else {
@@ -613,6 +634,28 @@ fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap)
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// The always-reserved 1-row strip under the tab strip (`docs/features/
+/// tui-file-structure-and-breadcrumbs.md` §3.2/§3.4) -- read-only, no
+/// click-to-jump (§1.2's scope cut: the File Structure popup already
+/// reaches every symbol a breadcrumb segment could, via the keyboard).
+/// Renders a blank row (not a placeholder) when `active_breadcrumbs()` is
+/// empty, matching `render_git_gutter`'s existing "nothing to show today"
+/// convention.
+fn render_breadcrumbs(frame: &mut Frame, app: &App, area: Rect) {
+    let crumbs = app.active_breadcrumbs();
+    if crumbs.is_empty() {
+        return;
+    }
+    let mut spans = Vec::new();
+    for (i, symbol) in crumbs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" \u{203a} "));
+        }
+        spans.push(Span::raw(symbol.name.clone()));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     // While the find bar is open it's the active modal context, so it
     // takes priority over `app.status()` -- the same priority the
@@ -830,6 +873,52 @@ fn render_go_to_symbol_popup(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let title = format!("Go to Symbol: {}  (Enter: jump, Esc: close)", state.query);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// `F12`'s popup (`docs/features/tui-file-structure-and-breadcrumbs.md`
+/// §2.5/§3.1). Same centered-`Rect`-plus-bordered-`List` shape as
+/// `render_go_to_symbol_popup`, one row per `App::file_structure_rows`
+/// entry, indented by `depth * 2` spaces (no real tree lines, per that
+/// doc's §1.2/§3.1 scope cuts).
+fn render_file_structure_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.file_structure.as_ref() else {
+        return;
+    };
+    let rows = app.file_structure_rows();
+    let width = area.width.saturating_sub(4).max(20);
+    let height = area.height.saturating_sub(4).max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = if rows.is_empty() {
+        vec![ListItem::new(Line::from("No symbols."))]
+    } else {
+        rows.iter()
+            .enumerate()
+            .map(|(i, (symbol, depth))| {
+                let style = if i == state.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let indent = "  ".repeat(*depth);
+                ListItem::new(Line::from(Span::styled(
+                    format!("{indent}{} ({:?})", symbol.name, symbol.kind),
+                    style,
+                )))
+            })
+            .collect()
+    };
+
+    let title = format!("File Structure: {}  (Enter: jump, Esc: close)", state.query);
     let block = Block::default().borders(Borders::ALL).title(title);
     frame.render_widget(List::new(items).block(block), popup);
 }
