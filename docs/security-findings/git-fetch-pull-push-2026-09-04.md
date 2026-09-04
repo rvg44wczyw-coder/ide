@@ -442,3 +442,75 @@ actually proves what it claims). Recommend a third fix round: `catch_unwind`
 around `fetch_capped`'s `remote.fetch(...)` call (mirroring finding 1's
 fix) and correcting the stalling-server test's fake server to drain the
 request fully before stalling.
+
+## Round 3 — final re-verification pass (2026-09-04, same day), commit `b58cd69`
+
+Re-verified round 2's own fixes live (not just via the unit tests) and did
+a closing sanity pass over the whole fetch/push/pull surface before merge.
+
+1. **Full suite re-run:** `cargo test -p ide-core --lib git::` — 151/151
+   green, `finished in 5.78s` (consistent with the corrected timeout
+   test's added ~5s hold — confirms it's genuinely exercising the stall,
+   not passing instantly).
+
+2. **Finding 3's `catch_unwind` soundness:** re-read `fetch_capped`'s
+   final form — `remote`/`fetch_options` are both function-local and
+   dropped at function end regardless of which `match` arm executes; no
+   code path reuses either after a caught panic. The existing regression
+   test triggers the panic via a caller-supplied `on_progress` (invoked
+   synchronously inside the same `remote.fetch(...)` call the real
+   `update_tips_cb` bug would panic from) rather than the literal
+   non-UTF-8-refname trigger, which still isn't reproducible on this
+   platform for the same `EILSEQ`/APFS reason documented in round 2 — a
+   reasonable, disclosed proxy, not a live repro of the exact bug.
+
+3. **Finding 4's fix, independently re-verified by reverting each of the
+   two original bugs separately** (via standalone probes, not by editing
+   the actual test):
+   - Bug (a) alone (1-byte drain, connection still held open afterward):
+     genuinely times out correctly at `2.000864959s` — holding the
+     connection open prevents the RST regardless of drain completeness,
+     so this bug alone would NOT have caused the original false pass.
+   - Bug (b) alone (full 64KB drain, but the server closure returns
+     immediately afterward with no hold): fails in `943.084µs` with
+     `"could not read refs from remote repository"` — passes the old
+     `result.is_err()` assertion but fails the new
+     `message.contains("timed out")` + `elapsed >= 1.9s` assertions.
+   - Conclusion: bug (b) — the immediate connection close — was the
+     actually load-bearing defect for the original false pass; bug (a)
+     alone wouldn't have caused it. The shipped fix correctly addresses
+     both, and the new assertions would catch a regression to either.
+
+4. **Findings 1/2 unregressed:** `git diff 925f3cb..b58cd69` touches only
+   `GitError::FetchFailed`, `fetch_capped`'s new `catch_unwind` wrap, one
+   new test, and the timeout test's fix — `push`'s existing
+   `catch_unwind`/`PushRejected` code and `MAX_ADVERTISED_REFS`/
+   `update_tips` counting logic are untouched, and their own regression
+   tests (`push_with_a_non_utf8_rejection_reason_from_the_remote_is_an_
+   err_not_a_panic`, `fetch_capped_aborts_once_more_refs_update_than_the_
+   cap_allows`) are both still green in the 151-test run above.
+
+5. **Other callback surfaces:** this file registers exactly
+   `transfer_progress`/`push_transfer_progress` (both plain numeric
+   fields, no UTF-8 conversion involved), `update_tips` (fixed, this
+   round), `push_update_reference` (fixed, round 1), and `credentials`
+   (via `credential_callback`, shared by `clone_repo`/`fetch`/`push`).
+   Checked git2-0.21.0's `credentials_cb` trampoline directly: both its
+   `url` and `username_from_url` parameters use
+   `str::from_utf8(...).map_err(|_| GIT_PASSTHROUGH)?` — a clean passthrough
+   error, not `.unwrap()` — so this one is already correctly guarded
+   upstream. `sideband_progress`/`certificate_check`/`push_negotiation`/
+   `pack_progress` are not registered anywhere in this file (grep-confirmed,
+   zero occurrences) — no silent exposure through those.
+
+All harnesses (standalone probes in a separate scratchpad crate, never
+touching this worktree's own test files) were one-shot processes with no
+lingering listeners; verified via `ps`/`lsof` that nothing was left
+running.
+
+## Round 3 verdict
+
+Clean. Both round-2 fixes are live-reconfirmed correct and sound; findings
+1 and 2 remain fixed and unregressed; no new finding surfaced in the
+callback surface sanity pass. This closes the hacker findings loop for
+`rust-core-dev`'s git-fetch-pull-push implementation — ready to merge.
