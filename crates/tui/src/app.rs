@@ -34,6 +34,7 @@ use crate::editor::{
     may_open_pair, move_cursor, offset_for_line_column, scroll_to_keep_visible, word_end_after,
     word_range_at, word_start_before, Direction,
 };
+use crate::file_structure;
 use crate::files_search::FilesSearchPanel;
 use crate::find::{FindField, FindState};
 use crate::folding::{self, VisualLines};
@@ -234,6 +235,18 @@ pub(crate) struct GoToSymbolState {
     /// request every single frame for the whole duration a slow server
     /// takes to answer.
     requested_for: Option<PathBuf>,
+}
+
+/// File Structure popup's typed query and list selection (`docs/features/
+/// tui-file-structure-and-breadcrumbs.md` §2.3). Unlike `GoToSymbolState`,
+/// no `requested_for` gate is needed here -- `document_symbols` is kept
+/// continuously fresh for the active file by `open_or_focus_tab`/
+/// `sync_lsp_did_change` (§3.3), not lazily requested when this popup
+/// opens.
+#[derive(Default)]
+pub(crate) struct FileStructureState {
+    pub(crate) query: String,
+    pub(crate) selected: usize,
 }
 
 /// Show Intention Actions' list-selection state (`docs/features/
@@ -658,6 +671,7 @@ pub struct App {
     pub(crate) files_search: FilesSearchPanel,
     pub(crate) go_to_file: Option<GoToFileState>,
     pub(crate) go_to_symbol: Option<GoToSymbolState>,
+    pub(crate) file_structure: Option<FileStructureState>,
     pub(crate) nav_state: ProjectNavigationState,
     /// Back/forward jump history (`docs/features/
     /// tui-back-forward-navigation.md`, T31) -- an unrelated concept from
@@ -855,6 +869,7 @@ impl App {
             files_search: FilesSearchPanel::default(),
             go_to_file: None,
             go_to_symbol: None,
+            file_structure: None,
             nav_state: project_state::load(project.root()),
             nav_history: NavHistory::default(),
             recent_files: None,
@@ -1742,6 +1757,7 @@ impl App {
         self.search_open = false;
         self.go_to_file = None;
         self.go_to_symbol = None;
+        self.file_structure = None;
         self.code_actions = None;
         self.rename_popup = None;
         self.pending_rename_preview = None;
@@ -2524,6 +2540,126 @@ impl App {
             state.selected = 0;
             self.lsp.query_workspace_symbols(&query);
         }
+    }
+
+    /// `F12` entry point (`docs/features/tui-file-structure-and-
+    /// breadcrumbs.md` §3.1). No-op with no active tab -- there is nothing
+    /// to show an outline of.
+    fn toggle_file_structure(&mut self) {
+        if self.active_buffer().is_none() {
+            return;
+        }
+        let opening = self.file_structure.is_none();
+        self.close_all_overlays();
+        if opening {
+            self.file_structure = Some(FileStructureState::default());
+        }
+    }
+
+    /// Handles every key while `file_structure.is_some()` (§3.2). Same
+    /// shape as `handle_go_to_symbol_key`, but a single always-fresh row
+    /// source (`file_structure_rows`) instead of an empty-vs-non-empty
+    /// query branch between two different `lsp` fields.
+    fn handle_file_structure_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.file_structure.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => self.file_structure = None,
+            KeyCode::Up => {
+                if state.selected > 0 {
+                    state.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                let len = self.file_structure_rows().len();
+                let state = self.file_structure.as_mut().unwrap();
+                if state.selected + 1 < len {
+                    state.selected += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                state.selected = 0;
+            }
+            KeyCode::Enter => self.confirm_file_structure(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.query.push(c);
+                state.selected = 0;
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// The active tab's own outline, or `&[]` with no active tab or no
+    /// entry yet -- same shape as `active_semantic_tokens`/
+    /// `active_inlay_hints`, but a single-slot comparison against
+    /// `lsp.document_symbols_path` rather than a `HashMap` lookup, since
+    /// `document_symbols` (unlike semantic tokens/inlay hints) only ever
+    /// holds one file's worth of data at a time (`docs/features/
+    /// tui-file-structure-and-breadcrumbs.md` §2.2).
+    pub(crate) fn active_document_symbols(&self) -> &[Symbol] {
+        let Some(buf) = self.active_buffer() else {
+            return &[];
+        };
+        if self.lsp.document_symbols_path.as_deref() == Some(buf.path.as_path()) {
+            &self.lsp.document_symbols
+        } else {
+            &[]
+        }
+    }
+
+    /// The breadcrumb trail for the active tab's current caret position
+    /// (§2.2/§3.1) -- every symbol whose range contains the caret,
+    /// outermost first. Empty with no active tab, no fresh outline yet, or
+    /// a caret offset that doesn't convert to a `Position` (never actually
+    /// happens for any buffer this crate can load, see `byte_offset_to_
+    /// position`'s own callers elsewhere in this file, but the fallback
+    /// costs nothing).
+    pub(crate) fn active_breadcrumbs(&self) -> Vec<&Symbol> {
+        let Some(buf) = self.active_buffer() else {
+            return Vec::new();
+        };
+        let offset = self.active_caret_offset();
+        let Some(position) = ide_lsp::byte_offset_to_position(buf.buffer.text(), offset) else {
+            return Vec::new();
+        };
+        ide_lsp::symbols_containing(self.active_document_symbols(), position)
+    }
+
+    /// The rows the File Structure popup currently has to show (§3.1):
+    /// `file_structure::visible_rows` over the active tab's outline,
+    /// mapped back to the actual `Symbol`s and their depths.
+    pub(crate) fn file_structure_rows(&self) -> Vec<(&Symbol, usize)> {
+        let query = self
+            .file_structure
+            .as_ref()
+            .map(|s| s.query.trim())
+            .unwrap_or("");
+        let symbols = self.active_document_symbols();
+        file_structure::visible_rows(symbols, query)
+            .into_iter()
+            .map(|row| (&symbols[row.symbol_index], row.depth))
+            .collect()
+    }
+
+    /// Jumps to the selected row's symbol location via `open_location` --
+    /// same helper `confirm_go_to_symbol` uses (§3.2).
+    fn confirm_file_structure(&mut self) {
+        let Some(state) = self.file_structure.as_ref() else {
+            return;
+        };
+        let selected = state.selected;
+        let Some(location) = self
+            .file_structure_rows()
+            .get(selected)
+            .map(|(symbol, _)| symbol.location.clone())
+        else {
+            return;
+        };
+        self.open_location(location);
+        self.file_structure = None;
     }
 
     /// `Ctrl+E` entry point (`docs/features/
@@ -4647,6 +4783,7 @@ impl App {
         if let Some(range) = whole_document {
             self.lsp.request_inlay_hints(&path, range);
         }
+        self.lsp.request_document_symbols(&path);
     }
 
     /// Called once per frame by `main.rs`, before `handle_key`, with the
@@ -4783,6 +4920,9 @@ impl App {
         if self.go_to_symbol.is_some() {
             return self.handle_go_to_symbol_key(key);
         }
+        if self.file_structure.is_some() {
+            return self.handle_file_structure_key(key);
+        }
         if self.recent_files.is_some() {
             return self.handle_recent_files_key(key);
         }
@@ -4876,6 +5016,7 @@ impl App {
             || self.search_open
             || self.go_to_file.is_some()
             || self.go_to_symbol.is_some()
+            || self.file_structure.is_some()
             || self.recent_files.is_some()
             || self.bookmarks_popup.is_some()
             || self.code_actions.is_some()
@@ -5208,6 +5349,7 @@ impl App {
             Action::CollapseSelections => self.trigger_collapse_selections(),
             Action::GoToFile => self.toggle_go_to_file(),
             Action::GoToSymbol => self.toggle_go_to_symbol(),
+            Action::FileStructure => self.toggle_file_structure(),
             Action::RecentFiles => self.toggle_recent_files(),
             Action::ToggleBookmark => self.toggle_bookmark_at_cursor(),
             Action::ShowBookmarks => self.toggle_bookmarks_popup(),
@@ -5423,6 +5565,7 @@ impl App {
         if let Some(range) = whole_document_range(&text) {
             self.lsp.request_inlay_hints(&path, range);
         }
+        self.lsp.request_document_symbols(&path);
         self.lsp.send(LspRequest::DidOpen { path, text });
         Ok(())
     }
@@ -13198,6 +13341,333 @@ mod tests {
         app.run_action(Action::GoToSymbol);
         assert!(app.go_to_symbol.is_some());
         assert!(app.go_to_file.is_none());
+    }
+
+    // -- T36: File Structure / Breadcrumbs (`tui-file-structure-and-
+    // breadcrumbs.md`) --
+
+    #[test]
+    fn toggle_file_structure_with_no_active_tab_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.active_buffer().is_none());
+
+        app.run_action(Action::FileStructure);
+
+        assert!(app.file_structure.is_none());
+    }
+
+    #[test]
+    fn toggle_file_structure_opens_with_a_reset_state_and_closes() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(app.file_structure.is_none());
+
+        app.run_action(Action::FileStructure);
+        assert!(app.file_structure.is_some());
+        app.file_structure.as_mut().unwrap().query = "x".to_string();
+        app.file_structure.as_mut().unwrap().selected = 3;
+
+        app.run_action(Action::FileStructure);
+        assert!(app.file_structure.is_none());
+
+        app.run_action(Action::FileStructure);
+        let state = app.file_structure.as_ref().unwrap();
+        assert_eq!(state.query, "");
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn f12_opens_file_structure() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        app.handle_key(plain_key(KeyCode::F(12)));
+
+        assert!(app.file_structure.is_some());
+    }
+
+    #[test]
+    fn opening_file_structure_closes_other_overlays() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.search_open = true;
+
+        app.run_action(Action::FileStructure);
+
+        assert!(!app.search_open);
+        assert!(app.file_structure.is_some());
+    }
+
+    #[test]
+    fn go_to_symbol_and_file_structure_are_mutually_exclusive() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        app.run_action(Action::GoToSymbol);
+        assert!(app.go_to_symbol.is_some());
+        assert!(app.file_structure.is_none());
+
+        app.run_action(Action::FileStructure);
+        assert!(app.file_structure.is_some());
+        assert!(app.go_to_symbol.is_none());
+    }
+
+    #[test]
+    fn file_structure_typing_and_backspace_edit_the_query_and_reset_selection() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.document_symbols = vec![symbol("Outline", a.clone())];
+        app.lsp.document_symbols_path = Some(a);
+        app.file_structure = Some(FileStructureState {
+            selected: 1,
+            ..Default::default()
+        });
+
+        app.handle_file_structure_key(plain_key(KeyCode::Char('x')));
+        assert_eq!(app.file_structure.as_ref().unwrap().query, "x");
+        assert_eq!(app.file_structure.as_ref().unwrap().selected, 0);
+
+        app.file_structure.as_mut().unwrap().selected = 1;
+        app.handle_file_structure_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.file_structure.as_ref().unwrap().query, "");
+        assert_eq!(app.file_structure.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn file_structure_up_and_down_move_the_selection_and_clamp() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.document_symbols = vec![symbol("One", a.clone()), symbol("Two", a.clone())];
+        app.lsp.document_symbols_path = Some(a);
+        app.file_structure = Some(FileStructureState::default());
+
+        app.handle_file_structure_key(plain_key(KeyCode::Up));
+        assert_eq!(app.file_structure.as_ref().unwrap().selected, 0);
+
+        app.handle_file_structure_key(plain_key(KeyCode::Down));
+        assert_eq!(app.file_structure.as_ref().unwrap().selected, 1);
+
+        app.handle_file_structure_key(plain_key(KeyCode::Down));
+        assert_eq!(app.file_structure.as_ref().unwrap().selected, 1);
+
+        app.handle_file_structure_key(plain_key(KeyCode::Up));
+        assert_eq!(app.file_structure.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn file_structure_esc_closes() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.file_structure = Some(FileStructureState::default());
+
+        app.handle_file_structure_key(plain_key(KeyCode::Esc));
+
+        assert!(app.file_structure.is_none());
+    }
+
+    #[test]
+    fn active_document_symbols_with_no_active_tab_is_empty() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.document_symbols = vec![symbol("Outline", PathBuf::from("/other"))];
+        app.lsp.document_symbols_path = Some(PathBuf::from("/other"));
+
+        assert!(app.active_document_symbols().is_empty());
+    }
+
+    #[test]
+    fn active_document_symbols_with_a_path_mismatch_is_empty() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.document_symbols = vec![symbol("Outline", PathBuf::from("/other"))];
+        app.lsp.document_symbols_path = Some(PathBuf::from("/other"));
+
+        assert!(app.active_document_symbols().is_empty());
+    }
+
+    #[test]
+    fn active_document_symbols_returns_the_active_tabs_outline() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.document_symbols = vec![symbol("Outline", a.clone())];
+        app.lsp.document_symbols_path = Some(a);
+
+        let symbols = app.active_document_symbols();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Outline");
+    }
+
+    #[test]
+    fn active_breadcrumbs_with_no_active_tab_is_empty() {
+        let dir = sample_project();
+        let app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.active_breadcrumbs().is_empty());
+    }
+
+    #[test]
+    fn active_breadcrumbs_with_empty_document_symbols_is_empty() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.active_breadcrumbs().is_empty());
+    }
+
+    #[test]
+    fn active_breadcrumbs_returns_the_chain_containing_the_caret() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        // Caret starts at offset 0 (position 0,0) -- a symbol whose zero-
+        // width range sits exactly there contains it.
+        app.lsp.document_symbols = vec![symbol("Outline", a.clone())];
+        app.lsp.document_symbols_path = Some(a);
+
+        let crumbs = app.active_breadcrumbs();
+        assert_eq!(crumbs.len(), 1);
+        assert_eq!(crumbs[0].name, "Outline");
+    }
+
+    #[test]
+    fn active_breadcrumbs_excludes_symbols_that_dont_contain_the_caret() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.document_symbols = vec![Symbol {
+            name: "Elsewhere".to_string(),
+            kind: ide_lsp::SymbolKind::Function,
+            container_name: None,
+            location: location(a.clone(), 5, 0),
+        }];
+        app.lsp.document_symbols_path = Some(a);
+
+        assert!(app.active_breadcrumbs().is_empty());
+    }
+
+    #[test]
+    fn file_structure_rows_maps_visible_rows_back_to_symbols_and_depths() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.document_symbols = vec![symbol("Outline", a.clone())];
+        app.lsp.document_symbols_path = Some(a);
+        app.file_structure = Some(FileStructureState::default());
+
+        let rows = app.file_structure_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.name, "Outline");
+        assert_eq!(rows[0].1, 0);
+    }
+
+    #[test]
+    fn confirm_file_structure_jumps_to_the_selected_symbols_location_and_closes() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.document_symbols = vec![symbol("Outline", a.clone())];
+        app.lsp.document_symbols_path = Some(a.clone());
+        app.file_structure = Some(FileStructureState::default());
+
+        app.confirm_file_structure();
+
+        assert!(app.file_structure.is_none());
+        assert_eq!(app.active_buffer().unwrap().path, a);
+    }
+
+    #[test]
+    fn confirm_file_structure_with_no_rows_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.file_structure = Some(FileStructureState::default());
+
+        app.confirm_file_structure();
+
+        assert!(app.file_structure.is_some());
+    }
+
+    #[test]
+    fn open_or_focus_tab_requests_document_symbols_for_the_new_tab() {
+        // No running language server -- `request_document_symbols` is a
+        // no-op past `lsp.is_running()`'s own gating, so this only proves
+        // the call site doesn't panic on a real newly-opened file.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn sync_lsp_did_change_requests_document_symbols() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.handle_key(ctrl('t'));
+        app.handle_key(plain_key(KeyCode::Char('!')));
+        // No running language server, so `request_document_symbols` no-ops
+        // -- this proves `sync_lsp_did_change` (called via the edit above)
+        // doesn't panic requesting a fresh outline for real text.
+        assert!(app.active_buffer().unwrap().buffer.is_dirty());
+    }
+
+    #[test]
+    fn close_all_overlays_closes_the_file_structure_popup() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.file_structure = Some(FileStructureState::default());
+
+        app.close_all_overlays();
+
+        assert!(app.file_structure.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_file_structure_popup() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(!app.any_popup_open());
+
+        app.file_structure = Some(FileStructureState::default());
+
+        assert!(app.any_popup_open());
     }
 
     // -- T17: Recent Files / Bookmarks (`tui-recent-files-and-bookmarks.md`) --
