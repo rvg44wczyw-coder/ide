@@ -547,3 +547,69 @@ follow-up-note precedent).
   nothing at all, which would block `ReplaceInPathResult`'s derive line —
   added a small, additive, behavior-preserving derive addition to both
   types to this doc's core-role scope to unblock it.
+- §2.2's `build_matchers`: fixed a `hacker` finding surfaced during a
+  later, unrelated port of this feature into `ide-tui`
+  (`docs/security-findings/tui-search-and-replace-in-path-2026-09-04.md`,
+  finding 1 — pre-existing in this module, reachable from both frontends'
+  Exclude field, not introduced by that port). `build_matchers` forces
+  every exclude pattern through `format!("!{pattern}")` to make it a
+  blacklist entry for `OverrideBuilder`; an exclude pattern that itself
+  already started with `!` (natural gitignore muscle memory, where `!`
+  means "un-ignore") produced a doubled `!!pattern`, which `ignore`'s glob
+  parser treats as *cancelling* the forced negation outright — the
+  pattern silently stopped excluding anything at all, with no error.
+  Live-verified: `exclude: vec!["!drop.rs".to_string()]` against a project
+  containing `drop.rs`/`keep.rs` matched both files, not just `keep.rs`.
+  On a write path (Replace in Path), this meant a user typing e.g.
+  `!vendor` into Exclude, believing it protects `vendor/`, would get
+  `vendor/`'s files rewritten anyway. Fixed by rejecting any exclude
+  pattern starting with `!` outright, via the same `PathSearchError::
+  InvalidGlob` variant already used for a malformed glob (using `ignore::
+  Error::Glob`'s public constructor to build a synthetic source error) —
+  fails closed instead of silently succeeding with the wrong semantics.
+  New regression test: `exclude_pattern_starting_with_bang_is_rejected_
+  not_silently_ineffective`.
+- §2.2's `build_matchers`, follow-up to the fix above: the reject-outright
+  fix is deliberately broader than strictly necessary — it also blocks the
+  (rarer) legitimate case of excluding a real file literally named with a
+  leading `!` (e.g. `!important.txt`), a tradeoff the code comment already
+  disclosed but didn't give the user a way out of. `OverrideBuilder::add`
+  (via `ignore::gitignore`'s parser, `backslash_escape(true)`) already
+  treats a backslash as an escape character in glob patterns, so
+  backslash-escaping the leading `!` (`\!important.txt`) reaches
+  `build_matchers` without tripping the bare-`!` check (it starts with
+  `\`, not `!`) and, after the forced `!` prefix, parses as one negation
+  marker followed by the literal escaped filename — excluding exactly
+  `!important.txt`, nothing more. Live-verified with a throwaway probe
+  binary against this exact code path, including ruling out the bracket-
+  class alternative `[!]important.txt`, which `ignore`'s glob parser
+  rejects outright as an unclosed character class once the forced `!`
+  prefix is prepended — backslash-escaping is the only supported escape
+  hatch, not merely the first one tried. Documented in `build_matchers`'s
+  own rustdoc and folded into the `PathSearchError::InvalidGlob` message
+  itself, so a user who hits the rejection sees the escape hatch inline
+  rather than needing to find this doc. New regression test:
+  `backslash_escaped_bang_excludes_the_literal_filename`.
+- §2.2's `build_matchers`, a second, closely-related finding surfaced by a
+  `hacker` adversarial pass over this same fix (bypass/edge-case testing of
+  the `!`-rejection above, not a re-run of the earlier broader review): an
+  *empty-string* exclude pattern reaches `format!("!{pattern}")` untouched
+  by the leading-`!` check (an empty string doesn't start with anything),
+  producing the bare string `"!"` — which `ignore::gitignore`'s parser
+  treats exactly like the leading-`!` case, consuming it as a negation
+  marker with an empty remainder that compiles to a glob matching *every*
+  path. Live-verified: `exclude: vec!["".to_string()]` against a
+  two-file project returned zero matches, not two — every file silently
+  excluded. Same root mechanism, same silent-misfire-on-a-write-path
+  concern as the leading-`!` bug, just reached through a different input
+  shape the first fix didn't cover. Fixed by skipping (not erroring on) an
+  empty pattern in both the include and exclude loops — a blank pattern is
+  a no-op, matching how an empty include pattern already behaved by
+  accident (verified: empty include left results unaffected, unlike empty
+  exclude). Both frontends already filter blank glob-list entries out
+  before they reach `PathSearchOptions` (comma-split, trimmed, non-empty
+  only per `current_search_options`/`split_glob_list`), so this was
+  unreachable through the shipped UI — the fix is `ide_core`'s own
+  public-API robustness, not a user-facing regression fix. New regression
+  tests: `empty_exclude_pattern_is_ignored_not_treated_as_exclude_
+  everything`, `empty_include_pattern_is_ignored`.

@@ -83,6 +83,54 @@ pub enum PathSearchError {
 /// `.gitignore` is silently treated as "no extra rules" (same skip-on-I/O
 /// -failure convention `crate::search::search_file` already uses for
 /// unreadable files), not a hard error.
+///
+/// An exclude pattern that itself starts with an *unescaped* `!` is
+/// rejected outright
+/// (`docs/security-findings/tui-search-and-replace-in-path-2026-09-04.md`,
+/// finding 1) rather than passed through: every exclude pattern is already
+/// forced through `format!("!{pattern}")` below to make it a blacklist
+/// entry for `OverrideBuilder`, so a user-typed leading `!` (natural
+/// gitignore muscle memory, where `!` means "un-ignore") produces a
+/// doubled `!!pattern` that `ignore`'s glob parser treats as *cancelling*
+/// the forced negation -- the pattern would silently stop excluding
+/// anything at all, with no error, on a path (Replace in Path) that writes
+/// to disk. Failing closed here is deliberately more restrictive than
+/// necessary for the (rarer) literal-filename-starting-with-`!` case, in
+/// exchange for never silently defeating a user's exclude intent.
+///
+/// A pattern only starting with a *literal* `!` is not actually
+/// unreachable: `OverrideBuilder::add` (via `ignore::gitignore`'s parser,
+/// `backslash_escape(true)`) already treats a backslash as an escape
+/// character in glob patterns, so a user who types `\!important.txt` gets
+/// the forced prefix (`!\!important.txt`) parsed as one negation marker
+/// (`!`, consumed as the forced blacklist marker) followed by the literal,
+/// escaped filename `\!important.txt` -- excluding exactly the file
+/// literally named `!important.txt`, nothing more. Only a *bare* leading
+/// `!` (the doubled-negation footgun) is rejected; `starts_with('!')`
+/// correctly leaves a leading `\` alone. This is called out in this
+/// module's `PathSearchError::InvalidGlob` message so a user who hits the
+/// rejection has a documented way to still express the literal exclude.
+/// (The bracket-class alternative, `[!]important.txt`, does **not** work
+/// here -- verified live: `ignore`'s glob parser reports it as an unclosed
+/// character class once the forced `!` prefix is prepended, so backslash
+/// escaping is the only supported escape hatch.)
+///
+/// An empty-string pattern is skipped entirely in both loops, rather than
+/// handed to `OverrideBuilder::add`, for the same "never silently misfire
+/// on a write path" reason as the leading-`!` rejection above -- and
+/// specifically for `exclude`, this isn't a hypothetical: `format!("!{}",
+/// "")` produces the bare string `"!"`, which the underlying
+/// `ignore::gitignore` parser treats exactly like the leading-`!` case
+/// above (consumes the forced `!` as its own negation marker, leaving an
+/// empty remainder that compiles to a `**/`-prefixed glob matching *every*
+/// path) -- silently excluding everything, verified live. Unlike the
+/// leading-`!` case this can't be caught by `starts_with('!')` (an empty
+/// string doesn't start with anything), so it needs its own guard. Both
+/// frontends already filter blank glob-list entries out of the `Vec`
+/// before it reaches `PathSearchOptions` (comma-split, trimmed, non-empty
+/// only), so this is unreachable through the shipped UI today; the guard
+/// exists for `ide_core::search_in_path`'s own public-API robustness, the
+/// same reasoning already applied to the leading-`!` case.
 fn build_matchers(
     root: &Path,
     options: &PathSearchOptions,
@@ -97,6 +145,9 @@ fn build_matchers(
 
     let mut override_builder = OverrideBuilder::new(root);
     for pattern in &options.include {
+        if pattern.is_empty() {
+            continue;
+        }
         override_builder
             .add(pattern)
             .map_err(|source| PathSearchError::InvalidGlob {
@@ -105,6 +156,22 @@ fn build_matchers(
             })?;
     }
     for pattern in &options.exclude {
+        if pattern.is_empty() {
+            continue;
+        }
+        if pattern.starts_with('!') {
+            return Err(PathSearchError::InvalidGlob {
+                glob: pattern.clone(),
+                source: ignore::Error::Glob {
+                    glob: Some(pattern.clone()),
+                    err: "exclude patterns may not start with '!' -- it would cancel \
+                          the implicit exclusion and silently stop excluding anything; \
+                          to exclude a file literally named with a leading '!', escape \
+                          it as '\\!' (e.g. '\\!important.txt')"
+                        .to_string(),
+                },
+            });
+        }
         override_builder
             .add(&format!("!{pattern}"))
             .map_err(|source| PathSearchError::InvalidGlob {
@@ -488,6 +555,87 @@ mod tests {
             results.matches[0].path,
             stdfs::canonicalize(dir.path()).unwrap().join("a.rs")
         );
+    }
+
+    #[test]
+    fn exclude_pattern_starting_with_bang_is_rejected_not_silently_ineffective() {
+        let dir = tempfile::tempdir().unwrap();
+        stdfs::write(dir.path().join("keep.rs"), "needle").unwrap();
+        stdfs::write(dir.path().join("drop.rs"), "needle").unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let tree = project.scan_tree();
+
+        // Before the fix, this exclude pattern was silently cancelled by
+        // the forced `!` prefix `build_matchers` already applies (a
+        // doubled `!!drop.rs`), so `drop.rs` was never actually excluded.
+        let options = PathSearchOptions {
+            exclude: vec!["!drop.rs".to_string()],
+            ..opts()
+        };
+        let err = search_tree_advanced(&tree, "needle", &options).unwrap_err();
+        assert!(matches!(err, PathSearchError::InvalidGlob { .. }));
+    }
+
+    #[test]
+    fn backslash_escaped_bang_excludes_the_literal_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        stdfs::write(dir.path().join("keep.rs"), "needle").unwrap();
+        stdfs::write(dir.path().join("!drop.rs"), "needle").unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let tree = project.scan_tree();
+
+        // The documented escape hatch for a file literally named with a
+        // leading '!': backslash-escape it. Must not be rejected by the
+        // bare-'!' check above (it doesn't start with '!', it starts with
+        // '\'), and must actually exclude only the literal filename.
+        let options = PathSearchOptions {
+            exclude: vec!["\\!drop.rs".to_string()],
+            ..opts()
+        };
+        let results = search_tree_advanced(&tree, "needle", &options).unwrap();
+        let names: Vec<_> = results
+            .matches
+            .iter()
+            .map(|m| m.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["keep.rs".to_string()]);
+    }
+
+    #[test]
+    fn empty_exclude_pattern_is_ignored_not_treated_as_exclude_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        stdfs::write(dir.path().join("keep.rs"), "needle").unwrap();
+        stdfs::write(dir.path().join("drop.rs"), "needle").unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let tree = project.scan_tree();
+
+        // Before this fix, `format!("!{pattern}")` on an empty pattern
+        // produced the bare string "!", which the `ignore` crate's parser
+        // treats as a negation marker with an empty remainder -- compiling
+        // to a glob that matches every path, silently excluding
+        // everything. An empty pattern must be a no-op, not a blanket
+        // exclude.
+        let options = PathSearchOptions {
+            exclude: vec!["".to_string()],
+            ..opts()
+        };
+        let results = search_tree_advanced(&tree, "needle", &options).unwrap();
+        assert_eq!(results.matches.len(), 2);
+    }
+
+    #[test]
+    fn empty_include_pattern_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        stdfs::write(dir.path().join("keep.rs"), "needle").unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let tree = project.scan_tree();
+
+        let options = PathSearchOptions {
+            include: vec!["".to_string()],
+            ..opts()
+        };
+        let results = search_tree_advanced(&tree, "needle", &options).unwrap();
+        assert_eq!(results.matches.len(), 1);
     }
 
     #[test]
