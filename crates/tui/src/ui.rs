@@ -31,7 +31,7 @@ use crate::clone_panel::ClonePanelField;
 use crate::docker_panel::DockerTab;
 use crate::editor::cursor_line_column;
 use crate::folding::VisualLines;
-use crate::git_panel::{assign_lanes, WorktreeAddField};
+use crate::git_panel::{assign_lanes, RemoteOpKind, WorktreeAddField};
 use crate::highlight::{
     document_highlight_marks, inlay_hint_chips, semantic_token_marks, styled_line, LineOverlays,
 };
@@ -1900,9 +1900,20 @@ fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let content_area = if app.git.remote_op.is_running() {
+        let rows = Layout::default()
+            .direction(LayoutDirection::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(3)])
+            .split(popup);
+        render_remote_op_status_line(frame, app, rows[0]);
+        rows[1]
+    } else {
+        popup
+    };
+
     match state.view {
-        GitPanelView::Log => render_git_log_view(frame, app, state, popup),
-        GitPanelView::Changes => render_git_changes(frame, app, state, popup),
+        GitPanelView::Log => render_git_log_view(frame, app, state, content_area),
+        GitPanelView::Changes => render_git_changes(frame, app, state, content_area),
     }
 
     if app.git.branches_popup.open {
@@ -1911,6 +1922,29 @@ fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
     if app.git.worktrees_popup.open {
         render_git_worktrees_popup(frame, app, popup);
     }
+}
+
+/// A one-line status strip carved off the top of the Git Panel while a
+/// Fetch/Pull/Push is running (`docs/features/git-fetch-pull-push.md`
+/// §2.3) -- this crate's stand-in for `ide-ui`'s toolbar spinner/progress
+/// bar, since the Git Panel has no toolbar row of its own. Completion
+/// (success or error) is reported via `notify()` instead (`App::
+/// poll_remote_op`), never here -- this line only ever renders while
+/// `remote_op.is_running()` is true, so it never needs its own dismissal.
+fn render_remote_op_status_line(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(kind) = app.git.remote_op.kind else {
+        return;
+    };
+    let verb = match kind {
+        RemoteOpKind::Fetch => "Fetching…",
+        RemoteOpKind::Pull => "Pulling…",
+        RemoteOpKind::Push => "Pushing…",
+    };
+    let text = match app.git.remote_op.progress {
+        Some(p) if p.total > 0 => format!("{verb} ({}/{} objects)", p.current, p.total),
+        _ => verb.to_string(),
+    };
+    frame.render_widget(Paragraph::new(text), area);
 }
 
 fn render_git_log_view(

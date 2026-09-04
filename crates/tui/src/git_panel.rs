@@ -11,16 +11,206 @@
 //! ported near-verbatim from `crates/ui/src/git_panel.rs`, which has zero
 //! `egui`/`eframe` dependency itself.
 
+use ide_core::git;
 use ide_core::{
     BranchInfo, CommitLogFilter, CommitNode, ConflictSides, FileDiff, GitError, GitRepo,
     MergeOutcome, WorkingTreeStatus, WorktreeInfo,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 /// Matches `docs/features/git-support.md` §3's "up to a fixed cap (e.g.
 /// 500)" commit-graph size.
 pub const COMMIT_GRAPH_LIMIT: usize = 500;
+
+/// Background-thread-plus-`mpsc`-channel state for Fetch/Pull/Push
+/// (`docs/features/git-fetch-pull-push.md` §2.3) -- duplicated from
+/// `crates/ui/src/git_panel.rs`'s identical block rather than shared,
+/// since this crate has no dependency on `ide-ui` (`clone_panel.rs`'s own
+/// doc comment already establishes this precedent for `ClonePanel`/
+/// `CloneState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOpKind {
+    Fetch,
+    Pull,
+    Push,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RemoteOpProgress {
+    pub current: usize,
+    pub total: usize,
+}
+
+impl From<git::TransferProgress> for RemoteOpProgress {
+    fn from(p: git::TransferProgress) -> Self {
+        Self {
+            current: p.received_objects,
+            total: p.total_objects,
+        }
+    }
+}
+
+impl From<git::PushProgress> for RemoteOpProgress {
+    fn from(p: git::PushProgress) -> Self {
+        Self {
+            current: p.current,
+            total: p.total,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum RemoteOpOutcome {
+    FetchDone,
+    Merged(MergeOutcome),
+    PushDone,
+}
+
+/// `RemoteOpState::poll`'s own return type -- deliberately **not** the
+/// same type the background thread sends over the channel
+/// (`RemoteOpEvent`, below, stays private), same split `ClonePanel`'s
+/// `CloneEvent`/`ClonePollResult` already establish and `ide-ui`'s own
+/// `RemoteOpState` mirrors.
+#[derive(Debug)]
+pub enum RemoteOpPollResult {
+    Progress,
+    Done(Result<RemoteOpOutcome, String>),
+}
+
+/// Private: the background thread's own channel payload. Never leaves
+/// `RemoteOpState::poll`, which translates it into `RemoteOpPollResult`
+/// before returning.
+enum RemoteOpEvent {
+    Progress(RemoteOpProgress),
+    Done(Result<RemoteOpOutcome, String>),
+}
+
+/// Display cap for `RemoteOpState.error`, same rationale as `crates/ui/
+/// src/git_panel.rs`'s identical constant: an error can carry a remote-
+/// supplied string verbatim (`GitError::PushRejected`'s rejection reason)
+/// -- live-confirmed exploitable there via a from-scratch hostile git
+/// server (`docs/security-findings/git-fetch-pull-push-ui-2026-09-04.md`,
+/// finding 1) -- so `RemoteOpState::poll` strips bidi controls and caps
+/// the length before this crate's own equivalent sink (the Git Panel's
+/// status line) ever renders it, applying the fix from the start here
+/// rather than needing its own hacker round to rediscover it.
+const MAX_REMOTE_OP_ERROR_CHARS: usize = 500;
+
+#[derive(Default)]
+pub struct RemoteOpState {
+    pub kind: Option<RemoteOpKind>,
+    pub progress: Option<RemoteOpProgress>,
+    pub error: Option<String>,
+    rx: Option<Receiver<RemoteOpEvent>>,
+}
+
+impl RemoteOpState {
+    pub fn is_running(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    /// No-op if already running (same single-in-flight convention
+    /// `ClonePanel` already uses). Otherwise clears `self.error`/
+    /// `self.progress` from any previous run before spawning. Opens a
+    /// **second, independent** `GitRepo::open(project_root)` handle
+    /// inside the spawned thread rather than moving `GitPanel::repo`
+    /// there -- same reasoning `ide-ui`'s identical `RemoteOpState::start`
+    /// doc comment gives (`git2::Repository` isn't `Sync`; write
+    /// contention falls back to git's own lock-file protocol; the
+    /// completion handler's `refresh()` closes the read-staleness gap).
+    /// Always targets `DEFAULT_REMOTE` in v1 (no remote picker).
+    ///
+    /// Unlike `ide-ui`'s `RemoteOpState`, there is deliberately no
+    /// `started_for` field here: `ide-tui`'s `App::project_root` is set
+    /// once at startup and never reassigned (`docs/features/
+    /// unified-binary.md` -- this crate has no "open a different project"
+    /// action at all, unlike `ide-ui`'s Project menu), so the stale-
+    /// result-after-switching-projects class of bug `ide-ui`'s own hacker
+    /// pass found (`docs/security-findings/git-fetch-pull-push-ui-
+    /// 2026-09-04.md`, finding 3) has no way to occur in this crate --
+    /// adding the guard here would be dead code solving a problem this
+    /// crate's architecture doesn't have.
+    pub fn start(&mut self, kind: RemoteOpKind, project_root: PathBuf) {
+        if self.rx.is_some() {
+            return;
+        }
+        self.error = None;
+        self.progress = None;
+        self.kind = Some(kind);
+
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        thread::spawn(move || {
+            let repo = match GitRepo::open(&project_root) {
+                Ok(repo) => repo,
+                Err(e) => {
+                    let _ = tx.send(RemoteOpEvent::Done(Err(e.to_string())));
+                    return;
+                }
+            };
+            let progress_tx = tx.clone();
+            let done: Result<RemoteOpOutcome, String> = match kind {
+                RemoteOpKind::Fetch => repo
+                    .fetch(git::DEFAULT_REMOTE, |p| {
+                        let _ = progress_tx.send(RemoteOpEvent::Progress(p.into()));
+                    })
+                    .map(|()| RemoteOpOutcome::FetchDone)
+                    .map_err(|e| e.to_string()),
+                RemoteOpKind::Pull => repo
+                    .pull(git::DEFAULT_REMOTE, |p| {
+                        let _ = progress_tx.send(RemoteOpEvent::Progress(p.into()));
+                    })
+                    .map(RemoteOpOutcome::Merged)
+                    .map_err(|e| e.to_string()),
+                RemoteOpKind::Push => repo
+                    .push(git::DEFAULT_REMOTE, |p| {
+                        let _ = progress_tx.send(RemoteOpEvent::Progress(p.into()));
+                    })
+                    .map(|()| RemoteOpOutcome::PushDone)
+                    .map_err(|e| e.to_string()),
+            };
+            let _ = tx.send(RemoteOpEvent::Done(done));
+        });
+    }
+
+    /// Same drain-with-`try_recv`-in-a-loop shape as `ClonePanel::poll`,
+    /// translating each drained `RemoteOpEvent` into the public
+    /// `RemoteOpPollResult`. A `Done(Err(_))` is sanitized (bidi-stripped,
+    /// length-capped) before it's stored in `self.error` or returned --
+    /// see `MAX_REMOTE_OP_ERROR_CHARS` above.
+    pub fn poll(&mut self) -> Option<RemoteOpPollResult> {
+        let rx = self.rx.as_ref()?;
+        let mut result = None;
+        loop {
+            match rx.try_recv() {
+                Ok(RemoteOpEvent::Progress(p)) => {
+                    self.progress = Some(p);
+                    result = Some(RemoteOpPollResult::Progress);
+                }
+                Ok(RemoteOpEvent::Done(Ok(outcome))) => {
+                    self.rx = None;
+                    self.progress = None;
+                    return Some(RemoteOpPollResult::Done(Ok(outcome)));
+                }
+                Ok(RemoteOpEvent::Done(Err(e))) => {
+                    self.rx = None;
+                    self.progress = None;
+                    let sanitized = crate::blame_gutter::truncate_display(
+                        &crate::blame_gutter::strip_bidi_controls(&e),
+                        MAX_REMOTE_OP_ERROR_CHARS,
+                    );
+                    self.error = Some(sanitized.clone());
+                    return Some(RemoteOpPollResult::Done(Err(sanitized)));
+                }
+                Err(_) => break,
+            }
+        }
+        result
+    }
+}
 
 pub struct ConflictResolutionState {
     pub path: PathBuf,
@@ -201,6 +391,9 @@ pub struct GitPanel {
     /// `pending_discard`.
     pub merging: bool,
     pub log_filter: LogFilterState,
+    /// Fetch/Pull/Push's background-thread state (`docs/features/
+    /// git-fetch-pull-push.md` §2.3).
+    pub remote_op: RemoteOpState,
 }
 
 impl GitPanel {
@@ -211,10 +404,13 @@ impl GitPanel {
     /// (Re-)opens the repository at `project_root` and reloads the graph
     /// and conflicts list. Not being a repo is not an error -- it just
     /// clears all git state (doc §3's "not a repository" message). Called
-    /// exactly once, from `App::new` -- `ide-tui` has no refresh/reload
-    /// action of any kind (`docs/features/tui-git-panel.md` §1), unlike
-    /// `ide-ui`'s equivalent, which re-runs this on its own tree-refresh
-    /// action.
+    /// once at startup from `App::new`, and again from `merge_branch`
+    /// (via `apply_merge_outcome`) and `RemoteOpState`'s Fetch/Pull/Push
+    /// completion handling whenever one of those mutates the repository --
+    /// `ide-tui` still has no *user-facing* manual refresh/reload action
+    /// of any kind (`docs/features/tui-git-panel.md` §1), unlike
+    /// `ide-ui`'s equivalent, which additionally re-runs this on its own
+    /// tree-refresh action.
     pub fn refresh(&mut self, project_root: &Path) {
         match GitRepo::open(project_root) {
             Ok(repo) => {
@@ -746,19 +942,44 @@ impl GitPanel {
             return Ok(());
         };
         let outcome = repo.merge_branch(name).map_err(|e| e.to_string())?;
+        let current = self
+            .current_branch
+            .clone()
+            .unwrap_or_else(|| "HEAD".to_string());
+        let message = format!("Merge branch '{name}' into {current}");
+        self.apply_merge_outcome(project_root, outcome, &message);
+        Ok(())
+    }
+
+    /// Shared post-merge state update for both the synchronous
+    /// `merge_branch` above and Pull's async completion handler
+    /// (`docs/features/git-fetch-pull-push.md` §2.3/§3.2) -- refreshes and
+    /// reloads branches on any outcome, then either sets `merging` and
+    /// pre-fills `commit_message` with `message` (on `Conflicts`) or
+    /// closes the branches popup (on `Merged`/`FastForward`/`UpToDate`; a
+    /// no-op if it wasn't open, which is always the case when called from
+    /// Pull). Unlike `merge_branch`'s own caller in `app.rs` (which
+    /// additionally switches the Git Panel's view/focus to the conflict
+    /// view on `Conflicts` -- a deliberate `ide-tui`-side deviation from
+    /// `ide-ui`'s "leave it open" behaviour, `tui-git-staging-branches-
+    /// and-log-filters.md` §3.4), this method itself stays UI-focus-
+    /// agnostic; `App::poll_remote_op` performs that switch itself for
+    /// Pull, the same way `merge_branch`'s own caller does for the manual
+    /// path.
+    pub fn apply_merge_outcome(
+        &mut self,
+        project_root: &Path,
+        outcome: MergeOutcome,
+        message: &str,
+    ) {
         self.refresh(project_root);
         self.reload_branches();
         if matches!(outcome, MergeOutcome::Conflicts(_)) {
             self.merging = true;
-            let current = self
-                .current_branch
-                .clone()
-                .unwrap_or_else(|| "HEAD".to_string());
-            self.commit_message = format!("Merge branch '{name}' into {current}");
+            self.commit_message = message.to_string();
         } else {
             self.close_branches_popup();
         }
-        Ok(())
     }
 
     /// Canonicalizes `absolute_path`, strips the repo's workdir prefix,
@@ -2044,5 +2265,337 @@ mod tests {
 
         assert!(detail.summary.chars().count() <= MAX_COMMIT_DETAIL_SUMMARY_CHARS);
         assert!(detail.body.chars().count() <= MAX_COMMIT_DETAIL_BODY_CHARS);
+    }
+
+    /// `fetch`/`pull`/`push` all resolve `git::DEFAULT_REMOTE` ("origin")
+    /// by name -- mirrors `crates/ui/src/git_panel.rs`'s identical helper.
+    fn clone_repo_dir(source: &Path) -> tempfile::TempDir {
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("dest");
+        run(
+            parent.path(),
+            &[
+                "clone",
+                "-q",
+                &source.to_string_lossy(),
+                &dest.to_string_lossy(),
+            ],
+        );
+        run(&dest, &["config", "user.name", "Test User"]);
+        run(&dest, &["config", "user.email", "test@example.com"]);
+        parent
+    }
+
+    fn poll_until_done(state: &mut RemoteOpState) -> RemoteOpPollResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(result @ RemoteOpPollResult::Done(_)) = state.poll() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no terminal event arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn remote_op_poll_with_nothing_started_is_a_noop() {
+        let mut state = RemoteOpState::default();
+        assert!(state.poll().is_none());
+    }
+
+    #[test]
+    fn remote_op_start_is_a_noop_while_already_running() {
+        let dir = init_repo();
+        commit(dir.path(), "f.txt", "a\n", "init");
+        let mut state = RemoteOpState::default();
+        // No `origin` remote configured -- `fetch` fails fast with
+        // `RemoteNotFound`, but the guard under test (`self.rx.is_some()`)
+        // runs before either background thread is ever spawned, so a
+        // second `start` call while the first is still in flight is what's
+        // actually being tested here, not the failure itself.
+        state.start(RemoteOpKind::Fetch, dir.path().to_path_buf());
+        assert!(state.is_running());
+        state.start(RemoteOpKind::Push, dir.path().to_path_buf());
+        assert!(state.is_running());
+
+        let result = poll_until_done(&mut state);
+        assert!(matches!(result, RemoteOpPollResult::Done(Err(_))));
+        assert!(!state.is_running());
+        for _ in 0..5 {
+            assert!(state.poll().is_none());
+        }
+    }
+
+    #[test]
+    fn remote_op_progress_from_transfer_progress_converts_relevant_fields() {
+        let core = git::TransferProgress {
+            received_objects: 3,
+            total_objects: 10,
+            indexed_objects: 2,
+            indexed_deltas: 1,
+            total_deltas: 4,
+            received_bytes: 999,
+        };
+        let ui: RemoteOpProgress = core.into();
+        assert_eq!(ui.current, 3);
+        assert_eq!(ui.total, 10);
+    }
+
+    #[test]
+    fn remote_op_progress_from_push_progress_converts_relevant_fields() {
+        let core = git::PushProgress {
+            current: 1,
+            total: 2,
+            bytes: 3,
+        };
+        let ui: RemoteOpProgress = core.into();
+        assert_eq!(ui.current, 1);
+        assert_eq!(ui.total, 2);
+    }
+
+    #[test]
+    fn remote_op_fetch_updates_the_remote_tracking_ref() {
+        let source = init_repo();
+        commit(source.path(), "f.txt", "a\n", "init");
+        let dest = clone_repo_dir(source.path());
+        let dest_path = dest.path().join("dest");
+        commit(source.path(), "g.txt", "b\n", "second");
+
+        let mut state = RemoteOpState::default();
+        state.start(RemoteOpKind::Fetch, dest_path.clone());
+        let result = poll_until_done(&mut state);
+
+        assert!(
+            matches!(
+                result,
+                RemoteOpPollResult::Done(Ok(RemoteOpOutcome::FetchDone))
+            ),
+            "expected Done(Ok(FetchDone)), got {result:?}"
+        );
+        assert!(state.error.is_none());
+        let branch = String::from_utf8(
+            Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&dest_path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let status = Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("refs/remotes/origin/{branch}"),
+            ])
+            .current_dir(&dest_path)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "expected the remote-tracking ref to exist after fetch"
+        );
+    }
+
+    #[test]
+    fn remote_op_pull_fast_forwards_and_reports_merged() {
+        let source = init_repo();
+        commit(source.path(), "f.txt", "a\n", "init");
+        let dest = clone_repo_dir(source.path());
+        let dest_path = dest.path().join("dest");
+        commit(source.path(), "g.txt", "b\n", "second");
+
+        let mut state = RemoteOpState::default();
+        state.start(RemoteOpKind::Pull, dest_path.clone());
+        let result = poll_until_done(&mut state);
+
+        match result {
+            RemoteOpPollResult::Done(Ok(RemoteOpOutcome::Merged(outcome))) => {
+                assert_eq!(outcome, MergeOutcome::FastForward);
+            }
+            other => panic!("expected Done(Ok(Merged(FastForward))), got {other:?}"),
+        }
+        assert!(dest_path.join("g.txt").exists());
+    }
+
+    #[test]
+    fn remote_op_push_pushes_local_commits_to_the_remote() {
+        let source = init_repo();
+        commit(source.path(), "f.txt", "a\n", "init");
+
+        // libgit2's local transport doesn't support pushing to a non-bare
+        // repo at all (`GIT_ERROR_BAREREPO`) -- same requirement `ide-ui`'s
+        // and `ide-core`'s own push tests establish. The "remote" here is a
+        // bare clone of `source`; `dest` clones from *that* bare repo.
+        let bare_parent = tempfile::tempdir().unwrap();
+        let bare_path = bare_parent.path().join("bare.git");
+        run(
+            bare_parent.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &source.path().to_string_lossy(),
+                &bare_path.to_string_lossy(),
+            ],
+        );
+        let dest = clone_repo_dir(&bare_path);
+        let dest_path = dest.path().join("dest");
+        commit(&dest_path, "g.txt", "b\n", "on dest");
+
+        let mut state = RemoteOpState::default();
+        state.start(RemoteOpKind::Push, dest_path.clone());
+        let result = poll_until_done(&mut state);
+
+        assert!(
+            matches!(
+                result,
+                RemoteOpPollResult::Done(Ok(RemoteOpOutcome::PushDone))
+            ),
+            "expected Done(Ok(PushDone)), got {result:?}"
+        );
+        let summary = String::from_utf8(
+            Command::new("git")
+                .args([
+                    "--git-dir",
+                    &bare_path.to_string_lossy(),
+                    "log",
+                    "-1",
+                    "--format=%s",
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(summary, "on dest");
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-ui-2026-09-04.md`,
+    /// finding 1's fix, applied here from the start: a hostile remote (a
+    /// from-scratch minimal git-receive-pack wire-protocol responder, the
+    /// same technique `ide-ui`'s/`ide-core`'s own equivalent tests use) can
+    /// put an arbitrary, valid-UTF-8 rejection reason -- including a
+    /// Unicode bidi-override control character and a long tail -- into
+    /// `GitError::PushRejected`. `RemoteOpState.error` must strip the bidi
+    /// control and cap the length before it ever reaches the Git Panel's
+    /// status line.
+    #[test]
+    fn remote_op_error_from_a_malicious_push_rejection_is_sanitized_and_bounded() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn pkt_line(data: &[u8]) -> Vec<u8> {
+            if data.is_empty() {
+                return b"0000".to_vec();
+            }
+            let mut out = format!("{:04x}", data.len() + 4).into_bytes();
+            out.extend_from_slice(data);
+            out
+        }
+
+        fn read_pkt_line(stream: &mut impl Read) -> Vec<u8> {
+            let mut hdr = [0u8; 4];
+            stream.read_exact(&mut hdr).unwrap();
+            let n = usize::from_str_radix(std::str::from_utf8(&hdr).unwrap(), 16).unwrap();
+            if n == 0 {
+                return Vec::new();
+            }
+            let mut buf = vec![0u8; n - 4];
+            stream.read_exact(&mut buf).unwrap();
+            buf
+        }
+
+        let dir = init_repo();
+        commit(dir.path(), "a.txt", "a\n", "init");
+        let branch = String::from_utf8(
+            Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let branch_for_server = branch.clone();
+
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _request_line = read_pkt_line(&mut conn);
+
+            let zero = "0".repeat(40);
+            let mut first = format!("{zero} capabilities^{{}}\0").into_bytes();
+            first.extend_from_slice(b"report-status delete-refs ofs-delta");
+            first.push(b'\n');
+            conn.write_all(&pkt_line(&first)).unwrap();
+            conn.write_all(&pkt_line(&[])).unwrap();
+
+            loop {
+                if read_pkt_line(&mut conn).is_empty() {
+                    break;
+                }
+            }
+            conn.set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .unwrap();
+            let mut sink = [0u8; 65536];
+            while matches!(conn.read(&mut sink), Ok(n) if n > 0) {}
+
+            // Valid UTF-8 throughout: a bidi-override control character
+            // plus a long repeated tail, nothing invalid that would trip
+            // the (separate) panic-on-non-UTF-8 path `ide-core` handles.
+            let reason = format!(
+                "gnp.tsoh\u{202e} :desufer eb dluow siht ,kcatta laer a nI {}",
+                "A".repeat(2000)
+            );
+
+            conn.write_all(&pkt_line(b"unpack ok\n")).unwrap();
+            let mut ng = format!("ng refs/heads/{branch_for_server} ").into_bytes();
+            ng.extend_from_slice(reason.as_bytes());
+            ng.push(b'\n');
+            conn.write_all(&pkt_line(&ng)).unwrap();
+            conn.write_all(&pkt_line(&[])).unwrap();
+        });
+
+        run(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("git://127.0.0.1:{port}/repo.git"),
+            ],
+        );
+
+        let mut state = RemoteOpState::default();
+        state.start(RemoteOpKind::Push, dir.path().to_path_buf());
+        let result = poll_until_done(&mut state);
+        server.join().unwrap();
+
+        assert!(
+            matches!(result, RemoteOpPollResult::Done(Err(_))),
+            "expected Done(Err(_)), got {result:?}"
+        );
+        let error = state.error.expect("error should be set on rejection");
+        assert!(
+            !error.contains('\u{202e}'),
+            "bidi override control character leaked into the rendered error: {error:?}"
+        );
+        assert!(
+            error.chars().count() <= MAX_REMOTE_OP_ERROR_CHARS,
+            "error text exceeds the display cap ({} chars): {error:?}",
+            error.chars().count()
+        );
     }
 }
