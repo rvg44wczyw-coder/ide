@@ -248,6 +248,8 @@ pub enum Action {
     NavigateBack,
     NavigateForward,
     ToggleClonePanel,
+    ReformatCode,
+    ToggleFormatOnSave,
     Exit,
 }
 
@@ -1026,6 +1028,24 @@ pub fn commands() -> &'static [Command] {
             // (`docs/features/tui-git-clone.md` §2.2).
             binding: None,
             action: Action::ToggleClonePanel,
+        },
+        Command {
+            id: "ReformatCode",
+            title: "Reformat Code",
+            // `⌘⌥L` translated.
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                KeyCode::Char('l'),
+            )),
+            action: Action::ReformatCode,
+        },
+        Command {
+            id: "ToggleFormatOnSave",
+            title: "Toggle Format on Save",
+            // Palette-only -- no reference-IDE macOS keymap entry for this
+            // action (`docs/features/tui-formatting.md` §2.3).
+            binding: None,
+            action: Action::ToggleFormatOnSave,
         },
         Command {
             id: "Exit",

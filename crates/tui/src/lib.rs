@@ -123,9 +123,13 @@ pub fn main(root: Option<PathBuf>) -> ExitCode {
     };
     // Only remembered on a successful open (§4.2 of the doc above) -- a
     // path that fails to open as a project must never overwrite a
-    // previously-good remembered one.
+    // previously-good remembered one. `format_on_save` is carried through
+    // from whatever `App::new` itself just loaded (`docs/features/
+    // tui-formatting.md` §2.3), so this startup save never resets a
+    // previously-toggled-on preference back to `false`.
     state::save(&state::PersistedState {
         last_project: Some(resolved_root),
+        format_on_save: app.format_on_save,
     });
 
     std::panic::set_hook(Box::new(|info| {

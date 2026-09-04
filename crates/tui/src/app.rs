@@ -761,6 +761,12 @@ pub struct App {
     /// other concurrently-running test's `App::new` -> `keymap::load()`
     /// against that corruption). Always `None` in production.
     keymap_path_override: Option<std::path::PathBuf>,
+    /// Same purpose as `keymap_path_override`, for `crate::state::
+    /// PersistedState` writes `toggle_format_on_save` makes (`docs/
+    /// features/tui-formatting.md` §2.3) -- without it, a test exercising
+    /// that toggle would write to the real `$HOME/.config/ide-tui/
+    /// state.json`. Always `None` in production.
+    state_path_override: Option<std::path::PathBuf>,
     pub(crate) keymap_popup: Option<KeymapPopupState>,
     pub(crate) new_scratch_file: Option<NewScratchFileState>,
     pub(crate) scratch_files: Option<ScratchFilesState>,
@@ -858,6 +864,19 @@ pub struct App {
     pub(crate) debug_panel: DebugPanelState,
     status: Option<String>,
     editor_viewport_rows: u16,
+    /// Loaded once at startup from `crate::state::PersistedState`
+    /// (`docs/features/tui-formatting.md` §2.3) -- toggled by
+    /// `Action::ToggleFormatOnSave`, which re-saves it immediately so a
+    /// toggle survives a restart the same way `state::save`'s existing
+    /// `last_project` write already does.
+    pub(crate) format_on_save: bool,
+    /// The path `maybe_trigger_format_on_save` fired a request for --
+    /// `handle_format_ready` re-saves that same tab (once) only when the
+    /// arriving `FormatReady` answers this path, distinguishing an
+    /// explicit `ReformatCode` invocation (this stays `None`) from a
+    /// save-triggered one. Cleared as soon as it's matched, regardless of
+    /// outcome.
+    format_on_save_target: Option<PathBuf>,
 }
 
 /// `docs/features/tui-tool-window-docking.md` §2.1 (T33).
@@ -952,6 +971,7 @@ impl App {
             watcher,
             keymap: crate::keymap::load(),
             keymap_path_override: None,
+            state_path_override: None,
             keymap_popup: None,
             new_scratch_file: None,
             scratch_files: None,
@@ -997,6 +1017,8 @@ impl App {
             // this crate's pre-scroll-follow behavior exactly rather than
             // guessing a real viewport height no test fixture needs.
             editor_viewport_rows: u16::MAX,
+            format_on_save: crate::state::load().format_on_save,
+            format_on_save_target: None,
         })
     }
 
@@ -1024,6 +1046,7 @@ impl App {
         self.handle_workspace_edit_ready();
         self.handle_prepare_rename_ready();
         self.handle_rename_ready();
+        self.handle_format_ready();
     }
 
     /// Called once per frame by `lib.rs`'s run loop, alongside `poll_lsp`
@@ -5638,6 +5661,8 @@ impl App {
             Action::NavigateBack => self.nav_back(),
             Action::NavigateForward => self.nav_forward(),
             Action::ToggleClonePanel => self.toggle_clone_panel(),
+            Action::ReformatCode => self.trigger_reformat_code(),
+            Action::ToggleFormatOnSave => self.toggle_format_on_save(),
             Action::Exit => return LoopSignal::Exit,
         }
         LoopSignal::Continue
@@ -6074,8 +6099,15 @@ impl App {
     /// charset. A charset the buffer can't honor losslessly surfaces a
     /// one-time `notify` (not a transient `self.status`, per §1) the
     /// first time this tab's config names one.
-    fn trigger_save_active(&mut self) {
-        let Some(buf) = self.active_buffer_mut() else {
+    ///
+    /// Takes an explicit `idx` rather than reading `self.active_tab`
+    /// (`docs/features/tui-formatting.md` §2.3) so `handle_format_ready`
+    /// can re-save a tab that answered a Format on Save request without
+    /// requiring it to still be the active one. `refresh_blame_if_on(idx)`
+    /// below is unconditional for the same reason -- it's cheap and
+    /// idempotent, so there's no need to special-case a non-active `idx`.
+    fn save_tab_at(&mut self, idx: usize) {
+        let Some(buf) = self.tabs.get_mut(idx) else {
             return;
         };
         if let Some(edit) = editorconfig::save_edit(buf.buffer.text(), &buf.config) {
@@ -6091,18 +6123,18 @@ impl App {
             watcher.suppress(&path);
         }
         let buf = self
-            .active_buffer_mut()
-            .expect("the tab being saved is still the active one");
+            .tabs
+            .get_mut(idx)
+            .expect("the tab being saved is still present");
         if let Err(err) = buf.buffer.save_with(charset) {
             self.status = Some(err.to_string());
             return;
         }
-        if let Some(idx) = self.active_tab {
-            self.refresh_blame_if_on(idx);
-        }
+        self.refresh_blame_if_on(idx);
         let buf = self
-            .active_buffer_mut()
-            .expect("the tab just saved is still the active one");
+            .tabs
+            .get_mut(idx)
+            .expect("the tab just saved is still present");
         if buf.charset_notice_shown {
             return;
         }
@@ -6121,6 +6153,111 @@ impl App {
             buf.path.display(),
         );
         self.notify(message);
+    }
+
+    fn trigger_save_active(&mut self) {
+        let Some(idx) = self.active_tab else {
+            return;
+        };
+        self.save_tab_at(idx);
+        self.maybe_trigger_format_on_save(idx);
+    }
+
+    /// Resolves `self.tabs[idx]`'s indent into `tab_size`/`insert_spaces`
+    /// and fires a `Format` request for it -- the one primitive both
+    /// `trigger_reformat_code` (explicit command, active tab only) and
+    /// `maybe_trigger_format_on_save` (implicit, any just-saved tab) send
+    /// requests through, so the two never drift (`docs/features/
+    /// tui-formatting.md` §2.3).
+    fn request_format_for(&mut self, idx: usize) {
+        let Some(buf) = self.tabs.get(idx) else {
+            return;
+        };
+        let tab_size = buf.indent.width as u32;
+        let insert_spaces = matches!(buf.indent.style, ide_core::IndentStyle::Spaces);
+        let path = buf.path.clone();
+        self.lsp.request_format(&path, tab_size, insert_spaces);
+    }
+
+    /// `Ctrl+Alt+L` / command palette -- no-op with no active tab, exactly
+    /// like every other active-tab-scoped command in this file.
+    fn trigger_reformat_code(&mut self) {
+        let Some(idx) = self.active_tab else {
+            return;
+        };
+        self.request_format_for(idx);
+    }
+
+    /// `ToggleFormatOnSave`'s dispatch -- re-saves immediately so the new
+    /// value survives a restart the same way `state::save`'s `last_project`
+    /// write already does (`docs/features/tui-formatting.md` §2.3).
+    fn toggle_format_on_save(&mut self) {
+        self.format_on_save = !self.format_on_save;
+        let state = crate::state::PersistedState {
+            last_project: Some(self.project_root.clone()),
+            format_on_save: self.format_on_save,
+        };
+        match &self.state_path_override {
+            Some(path) => crate::state::save_to(path, &state),
+            None => crate::state::save(&state),
+        }
+    }
+
+    /// Called only from `trigger_save_active`, immediately after
+    /// `save_tab_at` -- never from `maybe_trigger_format_on_save`'s own
+    /// callers going through `trigger_reformat_code`, since that would
+    /// re-check `self.active_tab` instead of using the tab that was just
+    /// saved (`docs/features/tui-formatting.md` §2.3, this is the fix for
+    /// the doc's own first-draft snippet contradiction -- see its
+    /// Revision notes).
+    fn maybe_trigger_format_on_save(&mut self, idx: usize) {
+        if !self.format_on_save {
+            return;
+        }
+        let Some(path) = self.tabs.get(idx).map(|buf| buf.path.clone()) else {
+            return;
+        };
+        self.request_format_for(idx);
+        self.format_on_save_target = Some(path);
+    }
+
+    /// Called from `poll_lsp`, right after `handle_rename_ready` -- applies
+    /// a ready `Format`/`FormatRange` response, then re-saves the tab a
+    /// second time if this format was fired by Format on Save (`docs/
+    /// features/tui-formatting.md` §2.3). Uses `apply_workspace_edit` (the
+    /// same generic disk/buffer-partitioning entry point rename/code
+    /// actions already go through) rather than indexing `self.tabs[idx]`
+    /// directly: if the tab that requested this format was closed before
+    /// the response arrived, `apply_workspace_edit`/`apply_file_edits`
+    /// degrade gracefully to a disk write (`ide_core::
+    /// apply_workspace_edit_to_disk`) instead of panicking on a stale
+    /// index -- see §4's Path provenance note for why that fail-safe
+    /// property makes reuse the safer choice here, not just the
+    /// convenient one.
+    fn handle_format_ready(&mut self) {
+        if !self.lsp.format_ready {
+            return;
+        }
+        self.lsp.format_ready = false;
+        let path = self.lsp.format_path.take();
+        let edit = self.lsp.format_edit.take();
+        let is_format_on_save = path.is_some() && path == self.format_on_save_target;
+        if is_format_on_save {
+            self.format_on_save_target = None;
+        }
+        let Some(edit) = edit else {
+            return;
+        };
+        if self.apply_workspace_edit(edit, "Reformat Code").is_err() {
+            return;
+        }
+        if is_format_on_save {
+            if let Some(path) = path {
+                if let Some(idx) = self.tabs.iter().position(|tab| tab.path == path) {
+                    self.save_tab_at(idx);
+                }
+            }
+        }
     }
 
     /// Shared wiring for every whole-buffer command T18b adds (line ops,
@@ -8181,7 +8318,9 @@ mod tests {
         for c in "save".chars() {
             app.handle_key(plain_key(KeyCode::Char(c)));
         }
-        assert_eq!(app.palette.as_ref().unwrap().filtered.len(), 1);
+        // "Save" (`SaveAll`) and "Toggle Format on Save" (`T38`,
+        // `docs/features/tui-formatting.md`) both match this substring.
+        assert_eq!(app.palette.as_ref().unwrap().filtered.len(), 2);
         app.handle_key(plain_key(KeyCode::Backspace));
         app.handle_key(plain_key(KeyCode::Backspace));
         app.handle_key(plain_key(KeyCode::Backspace));
@@ -8247,8 +8386,14 @@ mod tests {
             app.handle_key(plain_key(KeyCode::Char(c)));
         }
         let palette = app.palette.as_ref().unwrap();
-        assert_eq!(palette.filtered.len(), 1);
-        assert_eq!(palette.filtered[0].id, "SaveAll");
+        // "Save" (`SaveAll`) and "Toggle Format on Save" (`T38`,
+        // `docs/features/tui-formatting.md`) both match this substring.
+        assert_eq!(palette.filtered.len(), 2);
+        assert!(palette.filtered.iter().any(|c| c.id == "SaveAll"));
+        assert!(palette
+            .filtered
+            .iter()
+            .any(|c| c.id == "ToggleFormatOnSave"));
     }
 
     #[test]
@@ -11219,6 +11364,251 @@ mod tests {
 
         assert!(app.cargo_panel_open());
         assert!(app.pending_rename_preview.is_some());
+    }
+
+    #[test]
+    fn request_format_for_with_no_tab_at_idx_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.request_format_for(0);
+        assert!(!app.lsp.format_ready);
+        assert!(app.lsp.format_path.is_none());
+    }
+
+    #[test]
+    fn request_format_for_resolves_indent_and_sends_a_request() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        app.request_format_for(0);
+
+        // No LSP client is running in this fixture, so `request_format`'s
+        // missing-client fast path resolves `format_ready` immediately
+        // (`docs/features/tui-formatting.md` §2.3) rather than leaving the
+        // caller to guess whether a response is ever coming.
+        assert!(app.lsp.format_ready);
+        assert_eq!(app.lsp.format_path, Some(a));
+    }
+
+    #[test]
+    fn trigger_reformat_code_with_no_active_tab_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.trigger_reformat_code();
+        assert!(!app.lsp.format_ready);
+    }
+
+    #[test]
+    fn trigger_reformat_code_requests_format_for_the_active_tab() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        app.trigger_reformat_code();
+
+        assert!(app.lsp.format_ready);
+        assert_eq!(app.lsp.format_path, Some(a));
+    }
+
+    #[test]
+    fn save_tab_at_saves_a_tab_that_is_not_the_active_one() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // a.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.handle_key(ctrl('t')); // focus editor
+        app.handle_key(plain_key(KeyCode::Char('x'))); // dirty tab 0
+        app.handle_key(ctrl('t')); // back to tree
+        app.handle_key(plain_key(KeyCode::Down)); // b.txt
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.active_tab, Some(1));
+        assert!(app.tabs[0].buffer.is_dirty());
+
+        app.save_tab_at(0);
+
+        assert!(fs::read_to_string(&a).unwrap().starts_with('x'));
+        assert!(!app.tabs[0].buffer.is_dirty());
+        // Saving tab 0 must not disturb which tab is active.
+        assert_eq!(app.active_tab, Some(1));
+    }
+
+    #[test]
+    fn save_tab_at_with_no_tab_at_idx_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.save_tab_at(0);
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn maybe_trigger_format_on_save_is_a_noop_when_disabled() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(!app.format_on_save);
+
+        app.maybe_trigger_format_on_save(0);
+
+        assert!(!app.lsp.format_ready);
+        assert!(app.format_on_save_target.is_none());
+    }
+
+    #[test]
+    fn maybe_trigger_format_on_save_requests_format_and_records_the_target_when_enabled() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.format_on_save = true;
+
+        app.maybe_trigger_format_on_save(0);
+
+        assert!(app.lsp.format_ready);
+        assert_eq!(app.lsp.format_path, Some(a.clone()));
+        assert_eq!(app.format_on_save_target, Some(a));
+    }
+
+    #[test]
+    fn handle_format_ready_is_a_noop_when_not_ready() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.format_ready = false;
+        app.lsp.format_edit = Some(workspace_edit(vec![]));
+        app.handle_format_ready();
+        assert!(app.lsp.format_edit.is_some());
+    }
+
+    #[test]
+    fn handle_format_ready_with_no_edit_is_a_noop() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.format_ready = true;
+        app.lsp.format_path = Some(a);
+        app.lsp.format_edit = None;
+
+        app.handle_format_ready();
+
+        assert!(!app.lsp.format_ready);
+        assert!(app.tabs.is_empty());
+    }
+
+    #[test]
+    fn handle_format_ready_applies_the_edit_to_the_open_tab() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp.format_ready = true;
+        app.lsp.format_path = Some(a.clone());
+        app.lsp.format_edit = Some(workspace_edit(vec![ide_lsp::FileEdit {
+            path: a,
+            text_edits: vec![text_edit((0, 0), (0, 5), "HELLO")],
+        }]));
+
+        app.handle_format_ready();
+
+        assert!(!app.lsp.format_ready);
+        assert_eq!(app.tabs[0].buffer.text(), "HELLO\nworld");
+    }
+
+    #[test]
+    fn handle_format_ready_does_not_resave_an_explicit_reformat_request() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        // `trigger_reformat_code`'s path: no `format_on_save_target` set.
+        app.lsp.format_ready = true;
+        app.lsp.format_path = Some(a.clone());
+        app.lsp.format_edit = Some(workspace_edit(vec![ide_lsp::FileEdit {
+            path: a.clone(),
+            text_edits: vec![text_edit((0, 0), (0, 5), "HELLO")],
+        }]));
+
+        app.handle_format_ready();
+
+        assert_eq!(app.tabs[0].buffer.text(), "HELLO\nworld");
+        // Applied to the buffer only -- an explicit Reformat Code never
+        // implies a save.
+        assert_eq!(fs::read_to_string(&a).unwrap(), "hello\nworld");
+    }
+
+    #[test]
+    fn handle_format_ready_resaves_a_format_on_save_request() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.format_on_save_target = Some(a.clone());
+        app.lsp.format_ready = true;
+        app.lsp.format_path = Some(a.clone());
+        app.lsp.format_edit = Some(workspace_edit(vec![ide_lsp::FileEdit {
+            path: a.clone(),
+            text_edits: vec![text_edit((0, 0), (0, 5), "HELLO")],
+        }]));
+
+        app.handle_format_ready();
+
+        assert_eq!(fs::read_to_string(&a).unwrap(), "HELLO\nworld");
+        assert!(app.format_on_save_target.is_none());
+    }
+
+    #[test]
+    fn handle_format_ready_clears_a_stale_format_on_save_target_that_does_not_match() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.format_on_save_target = Some(PathBuf::from("/some/other/file.rs"));
+        app.lsp.format_ready = true;
+        app.lsp.format_path = Some(a.clone());
+        app.lsp.format_edit = Some(workspace_edit(vec![ide_lsp::FileEdit {
+            path: a.clone(),
+            text_edits: vec![text_edit((0, 0), (0, 5), "HELLO")],
+        }]));
+
+        app.handle_format_ready();
+
+        assert_eq!(app.tabs[0].buffer.text(), "HELLO\nworld");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "hello\nworld");
+        // The stale target was for a different path -- left untouched.
+        assert_eq!(
+            app.format_on_save_target,
+            Some(PathBuf::from("/some/other/file.rs"))
+        );
+    }
+
+    #[test]
+    fn toggle_format_on_save_flips_the_flag_and_persists_through_the_override() {
+        let dir = sample_project();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state_path = state_dir.path().join("state.json");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.state_path_override = Some(state_path.clone());
+        assert!(!app.format_on_save);
+
+        app.run_action(Action::ToggleFormatOnSave);
+
+        assert!(app.format_on_save);
+        assert!(crate::state::load_from(&state_path).format_on_save);
+
+        app.run_action(Action::ToggleFormatOnSave);
+
+        assert!(!app.format_on_save);
+        assert!(!crate::state::load_from(&state_path).format_on_save);
     }
 
     #[test]
@@ -14868,7 +15258,11 @@ mod tests {
         assert_eq!(app.keymap_popup.as_ref().unwrap().selected, 0);
         let filtered = app.keymap_popup_rows();
         assert!(filtered.len() < all);
-        assert!(filtered.iter().all(|c| c.id == "SaveAll"));
+        // "Save" (`SaveAll`) and "Toggle Format on Save" (`T38`,
+        // `docs/features/tui-formatting.md`) both match this substring.
+        assert!(filtered
+            .iter()
+            .all(|c| c.id == "SaveAll" || c.id == "ToggleFormatOnSave"));
 
         app.handle_key(plain_key(KeyCode::Backspace));
         assert_eq!(app.keymap_popup.as_ref().unwrap().query, "sa");
