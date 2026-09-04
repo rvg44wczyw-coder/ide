@@ -165,6 +165,20 @@ pub struct PushProgress {
     pub total: usize,
     pub bytes: usize,
 }
+
+/// Added in Revision notes #10: process-wide libgit2 network-I/O timeout
+/// configuration. `ide-ui`/`ide-tui`'s `main.rs` must call this exactly
+/// once at startup, before any thread that might use `GitRepo` for a
+/// network operation is spawned -- see the function's own doc comment for
+/// the full safety contract (it is `unsafe`: libgit2's underlying option
+/// is process-global and not safe to mutate concurrently with other
+/// in-flight `git2` calls). Bounds a remote that accepts a connection and
+/// then stalls indefinitely; does **not** bound a fast-flood remote (see
+/// `MAX_ADVERTISED_REFS`'s own doc comment) -- both verified live.
+pub unsafe fn configure_network_timeouts(
+    connect_timeout_ms: i32,
+    io_timeout_ms: i32,
+) -> Result<(), GitError>;
 ```
 
 `GitError` gains four variants (all existing variants unchanged):
@@ -192,6 +206,15 @@ unchanged as the regression check that this refactor didn't alter
 behavior — the closure body itself doesn't change, only where it lives.
 
 ### 2.2 `crates/ui/src/git_panel.rs` + `crates/ui/src/command.rs` + `crates/ui/src/app.rs`
+
+**New required startup step (Revision notes #10):** `crates/ui/src/main.rs`
+must call `ide_core::git::configure_network_timeouts(connect_ms, io_ms)`
+exactly once, before `eframe::run_native` (or any code that might spawn a
+`RemoteOpState` background thread) starts — pick reasonable defaults (e.g.
+10 seconds connect, 30 seconds I/O) since there's no UI for configuring
+this in v1. This is process-wide libgit2 state, `unsafe` for the reason
+its own doc comment gives; call it once, synchronously, before any other
+thread touches `GitRepo`.
 
 New module-level type in `git_panel.rs`, following `clone_panel.rs`'s
 own `ClonePollResult` shape exactly (§2.2 of `git-remote.md`) since this
@@ -330,6 +353,16 @@ message in the same spot the panel's other inline errors already use
 precedent).
 
 ### 2.3 `crates/tui/src/git_panel.rs` + `crates/tui/src/commands.rs` + `crates/tui/src/app.rs`
+
+**Same new required startup step as §2.2** (Revision notes #10): whichever
+of `crates/tui/src/main.rs`/`lib.rs`'s `main` entry point runs first when
+`ide-tui` is the actual process (its own standalone binary, or `ide --tui`
+dispatching into `ide_tui::main`) must call `ide_core::git::
+configure_network_timeouts` exactly once before any `RemoteOpState`
+background thread can be spawned — same call, same reasoning as §2.2's.
+If both `ide-ui` and `ide-tui` are merged in the same run, only one call
+site actually needs to exist (whichever binary's `main` runs) — this
+doesn't need calling twice from both crates in the unified-binary case.
 
 Same `RemoteOpKind`/`RemoteOpProgress`/`RemoteOpOutcome`/`RemoteOpPollResult`/
 `RemoteOpState` shapes (the `RemoteOpPollResult`/private-`RemoteOpEvent`
@@ -752,3 +785,22 @@ day:**
    implemented still provides genuine, narrower protection: an attacker
    who gets a fetch past the advertisement phase can no longer force an
    unbounded number of local ref updates to be applied afterward.
+
+10. User-requested follow-up on finding 2's residual gap, same day: added
+    `ide_core::git::configure_network_timeouts` (§2.1), a new required
+    `ide-ui`/`ide-tui` startup step (§2.2/§2.3) wrapping `git2`'s
+    `set_server_connect_timeout_in_milliseconds`/
+    `set_server_timeout_in_milliseconds`. Live-verified this fixes a
+    *different*, previously completely unmitigated attack in the same
+    neighborhood — a remote that accepts a connection and then stalls
+    forever, which blocked `fetch`'s calling thread indefinitely with no
+    configured timeout, and returned a bounded `Err` at the configured
+    deadline once one was set. Also live-verified, per the same
+    investigation, that this timeout does **not** help against finding 2's
+    original fast-flood scenario (a 2,000,000-ref flood attack took the
+    same ~26s/~400MB with or without the timeout configured) — the flood
+    delivers its payload in one continuous burst, so no individual read
+    call ever blocks long enough to trip a read/write timeout; that cost
+    is CPU-bound between reads, not I/O-wait-shaped, and remains the one
+    part of finding 2 this crate cannot close within `git2` 0.21.0's
+    public API.
