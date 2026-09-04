@@ -21,7 +21,7 @@ use crate::editor::{self, BlameAnnotation, EditorState};
 use crate::file_structure;
 use crate::files_search;
 use crate::find_bar::FindBar;
-use crate::git_panel::GitPanel;
+use crate::git_panel::{GitPanel, RemoteOpKind, RemoteOpOutcome, RemoteOpPollResult};
 use crate::keymap::{ImportReport, KeymapOverlay};
 use crate::lsp_bridge::LspBridge;
 use crate::nav_history::{NavHistory, NavLocation};
@@ -1659,6 +1659,44 @@ impl IdeApp {
                 self.refresh_language_suggestions();
             }
             None => {}
+        }
+        true
+    }
+
+    /// Fetch/Pull/Push's per-frame completion handling (`docs/features/
+    /// git-fetch-pull-push.md` §2.2/§3.1). `FetchDone`/`PushDone` just
+    /// `refresh()` the main-thread `GitPanel::repo` handle -- closing the
+    /// read-staleness gap §3.1 describes, now that the background thread's
+    /// write has landed. `Merged` reuses `apply_merge_outcome` (shared with
+    /// the synchronous `merge_branch`), pre-filling the same
+    /// "Merge remote-tracking branch '<remote>/<branch>' into <current>"
+    /// wording real `git pull` itself uses (§3.2). Returns `true` when a
+    /// repaint is warranted, mirroring every other `poll_*` method's shape.
+    fn poll_remote_op(&mut self) -> bool {
+        let Some(result) = self.git.remote_op.poll() else {
+            return false;
+        };
+        if let RemoteOpPollResult::Done(outcome) = result {
+            if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                match outcome {
+                    Ok(RemoteOpOutcome::FetchDone) | Ok(RemoteOpOutcome::PushDone) => {
+                        self.git.refresh(&root);
+                    }
+                    Ok(RemoteOpOutcome::Merged(merge_outcome)) => {
+                        let branch = self
+                            .git
+                            .current_branch
+                            .clone()
+                            .unwrap_or_else(|| "HEAD".to_string());
+                        let message = format!(
+                            "Merge remote-tracking branch '{}/{branch}' into {branch}",
+                            ide_core::git::DEFAULT_REMOTE
+                        );
+                        self.git.apply_merge_outcome(&root, merge_outcome, &message);
+                    }
+                    Err(_) => {}
+                }
+            }
         }
         true
     }
@@ -4748,6 +4786,15 @@ impl IdeApp {
                 .active_tab
                 .is_some_and(|idx| self.tabs[idx].buffer.path().is_some()),
             CommandAction::GitWorktrees => self.project.is_some(),
+            // Not a no-op-and-silently-fail: `is_command_enabled` gates the
+            // palette/menu entry itself on both a project being open *and*
+            // it being a git repo (`git-fetch-pull-push.md` §2.2), unlike
+            // `GitBranches`/`GitWorktrees` above which only gate on a
+            // project being open and let their own popups show a "not a
+            // repository" state instead.
+            CommandAction::Fetch | CommandAction::Pull | CommandAction::Push => {
+                self.project.is_some() && self.git.is_repo()
+            }
             // Same "active tab, and it's a real git repo" precondition as
             // `ToggleBlameAnnotations` -- this command needs a concrete
             // file, not just a project (`GitWorktrees`'s weaker check).
@@ -4897,6 +4944,21 @@ impl IdeApp {
                 }
             }
             CommandAction::ShowFileHistory => self.trigger_show_file_history(),
+            CommandAction::Fetch => {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    self.git.remote_op.start(RemoteOpKind::Fetch, root);
+                }
+            }
+            CommandAction::Pull => {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    self.git.remote_op.start(RemoteOpKind::Pull, root);
+                }
+            }
+            CommandAction::Push => {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    self.git.remote_op.start(RemoteOpKind::Push, root);
+                }
+            }
             CommandAction::Debug => self.trigger_debug(),
             CommandAction::ResumeProgram => self.debug.resume(),
             CommandAction::StepOver => self.debug.step_over(),
@@ -5992,6 +6054,158 @@ c
 
         assert!(app.git.is_repo());
         assert!(app.git.worktrees_popup.open);
+    }
+
+    /// A real `git clone` of `source` into a fresh directory, giving the
+    /// clone an `origin` remote pointing back at it -- `fetch`/`pull`/
+    /// `push` all resolve `DEFAULT_REMOTE` ("origin") by name, so tests
+    /// need an actual (if local-transport) remote, not just a bare repo.
+    fn git_clone_repo(source: &Path) -> tempfile::TempDir {
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("dest");
+        git_run(
+            parent.path(),
+            &[
+                "clone",
+                "-q",
+                &source.to_string_lossy(),
+                &dest.to_string_lossy(),
+            ],
+        );
+        parent
+    }
+
+    #[test]
+    fn is_command_enabled_fetch_pull_push_needs_a_project_and_a_repo() {
+        let mut app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::Fetch));
+        assert!(!app.is_command_enabled(CommandAction::Pull));
+        assert!(!app.is_command_enabled(CommandAction::Push));
+
+        // A project open but not (yet) a git repo -- `is_command_enabled`
+        // checks `self.git.is_repo()` directly (unlike `GitBranches`/
+        // `GitWorktrees`, which only gate on a project being open).
+        let dir = tempfile::tempdir().unwrap();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        assert!(!app.is_command_enabled(CommandAction::Fetch));
+
+        git_run(dir.path(), &["init", "-q"]);
+        app.git.refresh(dir.path());
+        assert!(app.is_command_enabled(CommandAction::Fetch));
+        assert!(app.is_command_enabled(CommandAction::Pull));
+        assert!(app.is_command_enabled(CommandAction::Push));
+    }
+
+    #[test]
+    fn run_command_fetch_updates_the_remote_tracking_ref() {
+        let source = git_init_repo();
+        git_commit(source.path(), "f.txt", "a\n");
+        let dest = git_clone_repo(source.path());
+        let dest_path = dest.path().join("dest");
+        git_commit(source.path(), "g.txt", "b\n");
+
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(&dest_path).unwrap());
+        app.git.refresh(&dest_path);
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::Fetch, &ctx);
+        assert!(app.git.remote_op.is_running());
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.git.remote_op.is_running() {
+            app.poll_remote_op();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fetch never completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.git.remote_op.error.is_none());
+    }
+
+    #[test]
+    fn run_command_pull_fast_forwards_the_working_tree() {
+        let source = git_init_repo();
+        git_commit(source.path(), "f.txt", "a\n");
+        let dest = git_clone_repo(source.path());
+        let dest_path = dest.path().join("dest");
+        git_commit(source.path(), "g.txt", "b\n");
+
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(&dest_path).unwrap());
+        app.git.refresh(&dest_path);
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::Pull, &ctx);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.git.remote_op.is_running() {
+            app.poll_remote_op();
+            assert!(std::time::Instant::now() < deadline, "pull never completed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.git.remote_op.error.is_none());
+        assert!(dest_path.join("g.txt").exists());
+        assert!(!app.git.merging);
+    }
+
+    #[test]
+    fn run_command_push_pushes_local_commits_to_the_remote() {
+        let source = git_init_repo();
+        git_commit(source.path(), "f.txt", "a\n");
+
+        // libgit2's local transport doesn't support pushing to a non-bare
+        // repo at all -- same requirement `ide-core`'s and `git_panel.rs`'s
+        // own push tests already establish. The actual "remote" here is a
+        // bare clone of `source`; `dest` clones from *that* bare repo.
+        let bare_parent = tempfile::tempdir().unwrap();
+        let bare_path = bare_parent.path().join("bare.git");
+        git_run(
+            bare_parent.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &source.path().to_string_lossy(),
+                &bare_path.to_string_lossy(),
+            ],
+        );
+        let dest = git_clone_repo(&bare_path);
+        let dest_path = dest.path().join("dest");
+        git_commit(&dest_path, "g.txt", "b\n");
+
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(&dest_path).unwrap());
+        app.git.refresh(&dest_path);
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::Push, &ctx);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.git.remote_op.is_running() {
+            app.poll_remote_op();
+            assert!(std::time::Instant::now() < deadline, "push never completed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.git.remote_op.error.is_none());
+        let summary = String::from_utf8(
+            std::process::Command::new("git")
+                .args([
+                    "--git-dir",
+                    &bare_path.to_string_lossy(),
+                    "log",
+                    "-1",
+                    "--format=%s",
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(summary, "commit");
     }
 
     #[test]

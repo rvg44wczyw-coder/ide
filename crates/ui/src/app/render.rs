@@ -12,6 +12,7 @@ use crate::command::{self, CommandAction};
 use crate::editor::blame_gutter::relative_time;
 use crate::editor::{cursor_line_column, CodeEditor};
 use crate::file_structure;
+use crate::git_panel::RemoteOpKind;
 use crate::theme::{self, Tokens};
 use eframe::egui;
 use ide_core::{ChangeKind, DiffLine, DiffSpan, DirEntry, DirEntryKind, FileDiff, StatusEntry};
@@ -3626,6 +3627,7 @@ impl IdeApp {
             return;
         }
         self.git.sync_status();
+        self.render_remote_op_toolbar(ui);
 
         if !self.git.conflicts.is_empty() {
             ui.heading("Conflicts");
@@ -3741,6 +3743,68 @@ impl IdeApp {
             None => {
                 ui.label("No diff to show — open a tracked file or select a commit.");
             }
+        }
+    }
+
+    /// Fetch/Push/"Update Project" buttons at the Git Panel's top
+    /// (`docs/features/git-fetch-pull-push.md` §2.2) -- "Update Project"
+    /// is `Pull`'s title text, distinct from its command id, matching the
+    /// reference IDE's own labeling exactly. Disabled while
+    /// `remote_op.is_running()`; while running, shows a determinate
+    /// `egui::ProgressBar` once `progress.total > 0`, a spinner before
+    /// (same convention `git-remote.md` §3.6 established for the clone
+    /// launcher). `remote_op.error`, when `Some`, renders as a dismissible
+    /// inline message, matching `branches_popup.error`/`worktrees_popup.
+    /// error`/`log_filter.error`'s existing precedent.
+    fn render_remote_op_toolbar(&mut self, ui: &mut egui::Ui) {
+        let running = self.git.remote_op.is_running();
+        let project_root = self.project.as_ref().map(|p| p.root().to_path_buf());
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Fetch"))
+                .clicked()
+            {
+                if let Some(root) = project_root.clone() {
+                    self.git.remote_op.start(RemoteOpKind::Fetch, root);
+                }
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Update Project"))
+                .clicked()
+            {
+                if let Some(root) = project_root.clone() {
+                    self.git.remote_op.start(RemoteOpKind::Pull, root);
+                }
+            }
+            if ui
+                .add_enabled(!running, egui::Button::new("Push"))
+                .clicked()
+            {
+                if let Some(root) = project_root.clone() {
+                    self.git.remote_op.start(RemoteOpKind::Push, root);
+                }
+            }
+        });
+        if running {
+            match self.git.remote_op.progress {
+                Some(p) if p.total > 0 => {
+                    ui.add(
+                        egui::ProgressBar::new(p.current as f32 / p.total as f32)
+                            .text(format!("{}/{}", p.current, p.total)),
+                    );
+                }
+                _ => {
+                    ui.spinner();
+                }
+            }
+        }
+        if let Some(err) = self.git.remote_op.error.clone() {
+            ui.horizontal(|ui| {
+                ui.colored_label(self.theme.tokens().color.warning, &err);
+                if ui.button("Dismiss").clicked() {
+                    self.git.remote_op.error = None;
+                }
+            });
         }
     }
 
@@ -4556,6 +4620,9 @@ impl eframe::App for IdeApp {
             }
             Some(_) => ctx.request_repaint(),
             None => {}
+        }
+        if self.poll_remote_op() {
+            ctx.request_repaint();
         }
         if self.poll_tree_scan() {
             ctx.request_repaint();

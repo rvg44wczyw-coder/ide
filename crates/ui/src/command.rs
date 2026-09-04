@@ -225,6 +225,9 @@ pub enum CommandAction {
     ToggleBlameAnnotations,
     GitWorktrees,
     ShowFileHistory,
+    Fetch,
+    Pull,
+    Push,
     Debug,
     ResumeProgram,
     StepOver,
@@ -533,6 +536,32 @@ pub fn commands() -> &'static [Command] {
                 // `ToggleBlameAnnotations` above (`git-log-viewer.md` §2.2).
                 binding: None,
                 action: CommandAction::ShowFileHistory,
+            },
+            Command {
+                id: "Fetch",
+                title: "Fetch",
+                category: "Git",
+                // The reference IDE's own default keymap has no dedicated
+                // shortcut for a bare Fetch (only Update Project, which
+                // fetches *and* merges) -- inventing one would violate
+                // `CLAUDE.md`'s "never invent a binding" rule from the
+                // other direction (`git-fetch-pull-push.md` §3.5).
+                binding: None,
+                action: CommandAction::Fetch,
+            },
+            Command {
+                id: "Pull",
+                title: "Update Project",
+                category: "Git",
+                binding: Some(Binding::same(KeyChord::new(Key::T).command())),
+                action: CommandAction::Pull,
+            },
+            Command {
+                id: "Push",
+                title: "Push",
+                category: "Git",
+                binding: Some(Binding::same(KeyChord::new(Key::K).command().shift())),
+                action: CommandAction::Push,
             },
             Command {
                 id: "ToggleZenMode",

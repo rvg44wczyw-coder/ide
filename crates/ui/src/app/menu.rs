@@ -111,6 +111,10 @@ const MENU_GROUPS: &[MenuGroup] = &[
             Some("ToggleBlameAnnotations"),
             Some("GitWorktrees"),
             Some("ShowFileHistory"),
+            None,
+            Some("Fetch"),
+            Some("Pull"),
+            Some("Push"),
         ],
     },
     MenuGroup {
