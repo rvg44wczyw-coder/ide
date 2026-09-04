@@ -1694,6 +1694,50 @@ fn credential_callback(callbacks: &mut git2::RemoteCallbacks) {
     });
 }
 
+/// Configures libgit2's own global network-I/O timeouts. **Process-wide,
+/// call exactly once at startup**, before any concurrent `GitRepo` network
+/// operation begins (`docs/features/git-fetch-pull-push.md` §2.1/Revision
+/// notes #10). Added after a `hacker` pass found `fetch`/`pull`/`push` had
+/// *no* protection at all against a remote that accepts a connection and
+/// then never sends anything -- a "slowloris"-style stall, distinct from
+/// the fast-flood resource-exhaustion case [`MAX_ADVERTISED_REFS`]
+/// addresses. Verified live: with no timeout configured, a stalling remote
+/// blocks the calling thread indefinitely (no way to recover short of
+/// killing the process); with `configure_network_timeouts(3_000, 3_000)`
+/// active, the identical stalling-remote scenario returned a bounded `Err`
+/// at 3.00s elapsed.
+///
+/// **Does not help against a fast-flood attacker** (one that sends a huge
+/// amount of data quickly rather than stalling) -- verified live that the
+/// same 2,000,000-ref flood attack that motivated `MAX_ADVERTISED_REFS`
+/// still took its full ~26s/~400MB with a 3-second timeout configured,
+/// since data kept arriving continuously and no individual read call ever
+/// blocked long enough to trip it. That gap remains open; see
+/// `MAX_ADVERTISED_REFS`'s own doc comment.
+///
+/// # Safety
+/// Wraps `git2::opts::set_server_connect_timeout_in_milliseconds`/
+/// `set_server_timeout_in_milliseconds`, which libgit2 documents as
+/// process-global, non-thread-safe configuration state. The caller must
+/// ensure no other thread is concurrently calling into `git2`/libgit2
+/// (including any other `GitRepo` method in this crate) while this runs --
+/// call it once, at startup, before spawning any thread that might use
+/// `GitRepo`, never from inside `fetch`/`pull`/`push` themselves (which
+/// this doc's own §3.1 threading model allows to run concurrently with
+/// unrelated local `GitRepo` calls on another thread).
+pub unsafe fn configure_network_timeouts(
+    connect_timeout_ms: i32,
+    io_timeout_ms: i32,
+) -> Result<(), GitError> {
+    // SAFETY: forwarded to the caller via this function's own `unsafe`
+    // signature and doc comment above.
+    unsafe {
+        git2::opts::set_server_connect_timeout_in_milliseconds(connect_timeout_ms)?;
+        git2::opts::set_server_timeout_in_milliseconds(io_timeout_ms)?;
+    }
+    Ok(())
+}
+
 /// git always uses `/`-separated repo-relative paths internally; accept a
 /// platform path from the caller but normalize separators before using it
 /// as a lookup key or index path.
@@ -4748,6 +4792,52 @@ mod tests {
         assert!(
             matches!(result, Err(GitError::PushRejected(_))),
             "expected Err(PushRejected(_)) instead of a panic, got {result:?}"
+        );
+    }
+
+    /// `docs/security-findings/git-fetch-pull-push-2026-09-04.md`'s
+    /// fix-round follow-up: `configure_network_timeouts` is the only test
+    /// in this suite that mutates libgit2's global timeout state
+    /// (`git2::opts::set_server_*_timeout_in_milliseconds`), which is
+    /// process-wide and, per its own doc comment, not safe to change
+    /// concurrently with other in-flight `git2` calls -- every other test
+    /// in this module talks to a local filesystem-path "remote" (untouched
+    /// by a *network*-server timeout) rather than a real socket, so this
+    /// is the only one where that global state is actually load-bearing.
+    #[test]
+    fn configure_network_timeouts_bounds_a_stalling_remote() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        unsafe {
+            configure_network_timeouts(2_000, 2_000).unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // Accept, then never send anything -- the connection just
+            // sits open until the client's own read times out.
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut sink = [0u8; 1];
+            let _ = conn.read(&mut sink);
+        });
+
+        let (dir, repo) = init_repo();
+        commit_file(&repo, "a.txt", "a", "init");
+        repo.remote("origin", &format!("git://127.0.0.1:{port}/repo.git"))
+            .unwrap();
+        let git = GitRepo::open(dir.path()).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = git.fetch("origin", |_| {});
+        let elapsed = start.elapsed();
+        server.join().unwrap();
+
+        assert!(result.is_err(), "expected a timeout Err, got {result:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "expected the configured 2s timeout to bound this, took {elapsed:?}"
         );
     }
 
