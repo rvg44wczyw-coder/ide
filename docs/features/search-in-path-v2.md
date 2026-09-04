@@ -547,3 +547,25 @@ follow-up-note precedent).
   nothing at all, which would block `ReplaceInPathResult`'s derive line —
   added a small, additive, behavior-preserving derive addition to both
   types to this doc's core-role scope to unblock it.
+- §2.2's `build_matchers`: fixed a `hacker` finding surfaced during a
+  later, unrelated port of this feature into `ide-tui`
+  (`docs/security-findings/tui-search-and-replace-in-path-2026-09-04.md`,
+  finding 1 — pre-existing in this module, reachable from both frontends'
+  Exclude field, not introduced by that port). `build_matchers` forces
+  every exclude pattern through `format!("!{pattern}")` to make it a
+  blacklist entry for `OverrideBuilder`; an exclude pattern that itself
+  already started with `!` (natural gitignore muscle memory, where `!`
+  means "un-ignore") produced a doubled `!!pattern`, which `ignore`'s glob
+  parser treats as *cancelling* the forced negation outright — the
+  pattern silently stopped excluding anything at all, with no error.
+  Live-verified: `exclude: vec!["!drop.rs".to_string()]` against a project
+  containing `drop.rs`/`keep.rs` matched both files, not just `keep.rs`.
+  On a write path (Replace in Path), this meant a user typing e.g.
+  `!vendor` into Exclude, believing it protects `vendor/`, would get
+  `vendor/`'s files rewritten anyway. Fixed by rejecting any exclude
+  pattern starting with `!` outright, via the same `PathSearchError::
+  InvalidGlob` variant already used for a malformed glob (using `ignore::
+  Error::Glob`'s public constructor to build a synthetic source error) —
+  fails closed instead of silently succeeding with the wrong semantics.
+  New regression test: `exclude_pattern_starting_with_bang_is_rejected_
+  not_silently_ineffective`.

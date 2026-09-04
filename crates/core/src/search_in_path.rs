@@ -83,6 +83,19 @@ pub enum PathSearchError {
 /// `.gitignore` is silently treated as "no extra rules" (same skip-on-I/O
 /// -failure convention `crate::search::search_file` already uses for
 /// unreadable files), not a hard error.
+///
+/// An exclude pattern that itself starts with `!` is rejected outright
+/// (`docs/security-findings/tui-search-and-replace-in-path-2026-09-04.md`,
+/// finding 1) rather than passed through: every exclude pattern is already
+/// forced through `format!("!{pattern}")` below to make it a blacklist
+/// entry for `OverrideBuilder`, so a user-typed leading `!` (natural
+/// gitignore muscle memory, where `!` means "un-ignore") produces a
+/// doubled `!!pattern` that `ignore`'s glob parser treats as *cancelling*
+/// the forced negation -- the pattern would silently stop excluding
+/// anything at all, with no error, on a path (Replace in Path) that writes
+/// to disk. Failing closed here is deliberately more restrictive than
+/// necessary for the (rarer) literal-filename-starting-with-`!` case, in
+/// exchange for never silently defeating a user's exclude intent.
 fn build_matchers(
     root: &Path,
     options: &PathSearchOptions,
@@ -105,6 +118,17 @@ fn build_matchers(
             })?;
     }
     for pattern in &options.exclude {
+        if pattern.starts_with('!') {
+            return Err(PathSearchError::InvalidGlob {
+                glob: pattern.clone(),
+                source: ignore::Error::Glob {
+                    glob: Some(pattern.clone()),
+                    err: "exclude patterns may not start with '!' -- it would cancel \
+                          the implicit exclusion and silently stop excluding anything"
+                        .to_string(),
+                },
+            });
+        }
         override_builder
             .add(&format!("!{pattern}"))
             .map_err(|source| PathSearchError::InvalidGlob {
@@ -488,6 +512,25 @@ mod tests {
             results.matches[0].path,
             stdfs::canonicalize(dir.path()).unwrap().join("a.rs")
         );
+    }
+
+    #[test]
+    fn exclude_pattern_starting_with_bang_is_rejected_not_silently_ineffective() {
+        let dir = tempfile::tempdir().unwrap();
+        stdfs::write(dir.path().join("keep.rs"), "needle").unwrap();
+        stdfs::write(dir.path().join("drop.rs"), "needle").unwrap();
+        let project = Project::open(dir.path()).unwrap();
+        let tree = project.scan_tree();
+
+        // Before the fix, this exclude pattern was silently cancelled by
+        // the forced `!` prefix `build_matchers` already applies (a
+        // doubled `!!drop.rs`), so `drop.rs` was never actually excluded.
+        let options = PathSearchOptions {
+            exclude: vec!["!drop.rs".to_string()],
+            ..opts()
+        };
+        let err = search_tree_advanced(&tree, "needle", &options).unwrap_err();
+        assert!(matches!(err, PathSearchError::InvalidGlob { .. }));
     }
 
     #[test]
