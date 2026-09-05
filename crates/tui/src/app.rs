@@ -5943,6 +5943,8 @@ impl App {
         match key.code {
             KeyCode::Up => self.tree_state.move_selection(&self.tree, -1),
             KeyCode::Down => self.tree_state.move_selection(&self.tree, 1),
+            KeyCode::Left => self.tree_state.collapse_or_ascend_selected(&self.tree),
+            KeyCode::Right => self.tree_state.expand_or_descend_selected(&self.tree),
             KeyCode::Enter => self.handle_tree_enter(),
             _ => {}
         }
@@ -7907,6 +7909,58 @@ mod tests {
         // raw `TempDir` path (which on macOS differs by a `/private`
         // prefix from its own canonicalization).
         assert_eq!(buf.path, dir.path().canonicalize().unwrap().join("a.txt"));
+    }
+
+    // -- T40: Left/Right arrow expand/collapse
+    // (`tui-tree-arrow-expand-collapse.md`) -- dispatch-wiring proof only;
+    // `TreeState`'s own algorithm is exhaustively covered by `tree.rs`'s
+    // own test module.
+
+    #[test]
+    fn right_arrow_in_the_tree_expands_and_then_descends_into_a_directory() {
+        let dir = sample_project();
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        // Row 0 is "sub" (dirs sort before files).
+
+        app.handle_key(plain_key(KeyCode::Right)); // expand sub/
+        let rows = app.tree_state.visible_rows(&app.tree);
+        assert!(rows[0].expanded);
+        assert_eq!(
+            app.tree_state.selected_row(&rows).unwrap().path,
+            root.join("sub")
+        );
+
+        app.handle_key(plain_key(KeyCode::Right)); // descend into c.txt
+        let rows = app.tree_state.visible_rows(&app.tree);
+        assert_eq!(
+            app.tree_state.selected_row(&rows).unwrap().path,
+            root.join("sub").join("c.txt")
+        );
+    }
+
+    #[test]
+    fn left_arrow_in_the_tree_ascends_then_collapses_a_directory() {
+        let dir = sample_project();
+        let root = dir.path().canonicalize().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Right)); // expand sub/
+        app.handle_key(plain_key(KeyCode::Right)); // -> c.txt
+
+        app.handle_key(plain_key(KeyCode::Left)); // c.txt isn't a dir -> ascend
+        let rows = app.tree_state.visible_rows(&app.tree);
+        assert_eq!(
+            app.tree_state.selected_row(&rows).unwrap().path,
+            root.join("sub")
+        );
+
+        app.handle_key(plain_key(KeyCode::Left)); // sub/ is expanded -> collapse
+        let rows = app.tree_state.visible_rows(&app.tree);
+        assert!(!rows[0].expanded);
+        assert_eq!(
+            app.tree_state.selected_row(&rows).unwrap().path,
+            root.join("sub")
+        );
     }
 
     #[test]

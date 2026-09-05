@@ -84,6 +84,59 @@ impl TreeState {
         }
     }
 
+    /// `Right` arrow (`docs/features/tui-tree-arrow-expand-collapse.md`
+    /// §2.3/§3.1): a collapsed directory expands in place; an already-
+    /// expanded directory moves the selection to its first child, guarded
+    /// by an explicit depth check -- `visible_rows()`'s depth-first order
+    /// only guarantees a child sits at `selected + 1` when one exists, so
+    /// an empty expanded directory's `selected + 1` (if any) is a sibling
+    /// or an ancestor's sibling, never a child, and must not be descended
+    /// into. No-op on a file row.
+    pub fn expand_or_descend_selected(&mut self, root: &DirEntry) {
+        let rows = self.visible_rows(root);
+        let Some(row) = rows.get(self.selected) else {
+            return;
+        };
+        if !row.is_dir {
+            return;
+        }
+        if self.expanded.insert(row.path.clone()) {
+            return;
+        }
+        let is_child = rows
+            .get(self.selected + 1)
+            .is_some_and(|next| next.depth == row.depth + 1);
+        if is_child {
+            self.selected += 1;
+        }
+    }
+
+    /// `Left` arrow (`docs/features/tui-tree-arrow-expand-collapse.md`
+    /// §2.3/§3.2): an expanded directory collapses in place; otherwise
+    /// (a file row, or an already-collapsed directory) the selection moves
+    /// to its parent row -- the nearest earlier row whose `depth` is
+    /// exactly one less than the selected row's. No-op at `depth == 0`
+    /// (no parent row exists).
+    pub fn collapse_or_ascend_selected(&mut self, root: &DirEntry) {
+        let rows = self.visible_rows(root);
+        let Some(row) = rows.get(self.selected) else {
+            return;
+        };
+        if row.is_dir && self.expanded.remove(&row.path) {
+            return;
+        }
+        if row.depth == 0 {
+            return;
+        }
+        let target_depth = row.depth - 1;
+        if let Some(parent_idx) = rows[..self.selected]
+            .iter()
+            .rposition(|r| r.depth == target_depth)
+        {
+            self.selected = parent_idx;
+        }
+    }
+
     pub fn selected_row<'a>(&self, rows: &'a [TreeRow]) -> Option<&'a TreeRow> {
         rows.get(self.selected)
     }
@@ -252,6 +305,211 @@ mod tests {
         let root = dir("root", "/root", vec![]);
         let mut state = TreeState::new();
         state.select(&root, 3);
+        assert_eq!(state.selected, 0);
+    }
+
+    // -- T40: Left/Right arrow expand/collapse
+    // (`tui-tree-arrow-expand-collapse.md`) --
+
+    /// `src/` (containing `lib/` (containing `mod.rs`) and `main.rs`),
+    /// `empty/` (no children), `Cargo.toml` -- deep and wide enough to
+    /// exercise multi-level ascend and the empty-directory descend guard.
+    fn deep_tree() -> DirEntry {
+        dir(
+            "root",
+            "/root",
+            vec![
+                dir(
+                    "src",
+                    "/root/src",
+                    vec![
+                        dir(
+                            "lib",
+                            "/root/src/lib",
+                            vec![file("mod.rs", "/root/src/lib/mod.rs")],
+                        ),
+                        file("main.rs", "/root/src/main.rs"),
+                    ],
+                ),
+                dir("empty", "/root/empty", vec![]),
+                file("Cargo.toml", "/root/Cargo.toml"),
+            ],
+        )
+    }
+
+    #[test]
+    fn right_on_a_collapsed_directory_expands_it_and_keeps_selection() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 0); // src/
+
+        state.expand_or_descend_selected(&root);
+
+        let rows = state.visible_rows(&root);
+        assert!(rows[0].expanded);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn right_on_an_expanded_directory_descends_to_its_first_child() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 0); // src/
+        state.expand_or_descend_selected(&root); // expand
+
+        state.expand_or_descend_selected(&root); // descend
+
+        let rows = state.visible_rows(&root);
+        assert_eq!(rows[state.selected].path, PathBuf::from("/root/src/lib"));
+    }
+
+    #[test]
+    fn right_twice_more_descends_through_nested_directories() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 0); // src/
+        state.expand_or_descend_selected(&root); // expand src/
+        state.expand_or_descend_selected(&root); // -> lib/
+        state.expand_or_descend_selected(&root); // expand lib/
+
+        state.expand_or_descend_selected(&root); // -> mod.rs
+
+        let rows = state.visible_rows(&root);
+        assert_eq!(
+            rows[state.selected].path,
+            PathBuf::from("/root/src/lib/mod.rs")
+        );
+    }
+
+    #[test]
+    fn right_on_an_expanded_empty_directory_is_a_noop_not_a_sibling_jump() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        // rows when collapsed: src/ (0), empty/ (1), Cargo.toml (2)
+        state.select(&root, 1); // empty/
+        state.expand_or_descend_selected(&root); // expand empty/ (still no children)
+
+        state.expand_or_descend_selected(&root); // must NOT jump to Cargo.toml
+
+        let rows = state.visible_rows(&root);
+        assert_eq!(rows[state.selected].path, PathBuf::from("/root/empty"));
+    }
+
+    #[test]
+    fn right_on_a_file_is_a_noop() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 2); // Cargo.toml
+
+        state.expand_or_descend_selected(&root);
+
+        assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn right_on_empty_tree_is_a_noop() {
+        let root = dir("root", "/root", vec![]);
+        let mut state = TreeState::new();
+        state.expand_or_descend_selected(&root);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn left_on_an_expanded_directory_collapses_it_and_keeps_selection() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 0); // src/
+        state.expand_or_descend_selected(&root); // expand
+
+        state.collapse_or_ascend_selected(&root);
+
+        let rows = state.visible_rows(&root);
+        assert!(!rows[0].expanded);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn left_on_a_file_ascends_to_its_parent_directory() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 0); // src/
+        state.expand_or_descend_selected(&root); // expand src/
+        state.expand_or_descend_selected(&root); // -> lib/
+        state.expand_or_descend_selected(&root); // expand lib/
+        state.expand_or_descend_selected(&root); // -> mod.rs
+
+        state.collapse_or_ascend_selected(&root); // mod.rs isn't a dir -> ascend
+
+        let rows = state.visible_rows(&root);
+        assert_eq!(rows[state.selected].path, PathBuf::from("/root/src/lib"));
+    }
+
+    #[test]
+    fn left_on_a_collapsed_directory_ascends_to_its_parent() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 0); // src/
+        state.expand_or_descend_selected(&root); // expand src/
+        state.expand_or_descend_selected(&root); // -> lib/ (still collapsed)
+
+        state.collapse_or_ascend_selected(&root); // lib/ is collapsed -> ascend
+
+        let rows = state.visible_rows(&root);
+        assert_eq!(rows[state.selected].path, PathBuf::from("/root/src"));
+    }
+
+    #[test]
+    fn left_ascends_past_a_sibling_to_the_correct_ancestor() {
+        // Regression proof for the exact-depth-match requirement: after
+        // expanding src/ and lib/, the visible rows are
+        // src(0) lib(1) mod.rs(2) main.rs(1) empty(0) Cargo.toml(0) --
+        // ascending from main.rs (depth 1) must land on src (depth 0), not
+        // on lib (also depth 1, and closer in row order to mod.rs but not
+        // an ancestor of main.rs).
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 0); // src/
+        state.expand_or_descend_selected(&root); // expand src/: rows = src, lib, main.rs, empty, Cargo.toml
+        let rows = state.visible_rows(&root);
+        let main_rs_idx = rows
+            .iter()
+            .position(|r| r.path == std::path::Path::new("/root/src/main.rs"))
+            .unwrap();
+        state.select(&root, main_rs_idx);
+
+        state.collapse_or_ascend_selected(&root);
+
+        let rows = state.visible_rows(&root);
+        assert_eq!(rows[state.selected].path, PathBuf::from("/root/src"));
+    }
+
+    #[test]
+    fn left_on_a_top_level_collapsed_directory_is_a_noop() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 1); // empty/ (depth 0, collapsed)
+
+        state.collapse_or_ascend_selected(&root);
+
+        assert_eq!(state.selected, 1);
+    }
+
+    #[test]
+    fn left_on_a_top_level_file_is_a_noop() {
+        let root = deep_tree();
+        let mut state = TreeState::new();
+        state.select(&root, 2); // Cargo.toml (depth 0)
+
+        state.collapse_or_ascend_selected(&root);
+
+        assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn left_on_empty_tree_is_a_noop() {
+        let root = dir("root", "/root", vec![]);
+        let mut state = TreeState::new();
+        state.collapse_or_ascend_selected(&root);
         assert_eq!(state.selected, 0);
     }
 }
