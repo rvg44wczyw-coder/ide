@@ -22,9 +22,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    App, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView, DebugPanelFocus, FilterField,
-    Focus, GitPanelFocus, GitPanelState, GitPanelView, LeftDockState, LeftDockTab,
-    SearchInPathField,
+    ActionFormField, App, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView,
+    DebugPanelFocus, FilterField, Focus, GitPanelFocus, GitPanelState, GitPanelView, LeftDockState,
+    LeftDockTab, SearchInPathField,
 };
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
@@ -196,6 +196,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.theme_popup.is_some() {
         render_theme_popup(frame, app, size);
     }
+    if app.manage_actions_popup.is_some() {
+        render_manage_actions_popup(frame, app, size);
+    }
     if app.new_scratch_file.is_some() {
         render_new_scratch_file_prompt(frame, app, size);
     }
@@ -345,10 +348,11 @@ fn render_bottom_dock(
     };
     let strip = Line::from(Span::styled(
         format!(
-            "{}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}",
             strip_label(BottomDockTab::Docker, "Docker"),
             strip_label(BottomDockTab::Kubernetes, "Kubernetes"),
             strip_label(BottomDockTab::Cargo, "Cargo"),
+            strip_label(BottomDockTab::CustomActions, "Custom Actions"),
             strip_label(BottomDockTab::Problems, "Problems"),
             strip_label(BottomDockTab::GitLog, "Git Log"),
         ),
@@ -360,6 +364,7 @@ fn render_bottom_dock(
         BottomDockTab::Docker => render_docker_panel(frame, app, rows[1]),
         BottomDockTab::Kubernetes => render_k8s_panel(frame, app, rows[1]),
         BottomDockTab::Cargo => render_cargo_panel(frame, app, rows[1]),
+        BottomDockTab::CustomActions => render_custom_actions_panel(frame, app, rows[1]),
         BottomDockTab::Problems => {
             render_problems_panel(frame, app, rows[1], dock.problems_selected)
         }
@@ -1791,6 +1796,164 @@ fn render_cargo_panel(frame: &mut Frame, app: &App, area: Rect) {
     };
     let block = Block::default().borders(Borders::ALL).title(title);
     frame.render_widget(List::new(items).block(block), area);
+}
+
+/// Custom Actions dock tab (`docs/features/tui-custom-actions.md` §3.1) --
+/// mirrors `render_docker_panel`'s list-plus-output-area shape rather than
+/// `render_cargo_panel`'s single list, since here the declared-action list
+/// and the running output are two logically distinct things (Cargo only
+/// ever has its six fixed built-in subcommands, never a user-declared
+/// list to select from).
+fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme.theme();
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(0)])
+        .split(area);
+
+    let selected = app.custom_actions.selected;
+    let items: Vec<ListItem> = if app.custom_actions.actions.is_empty() {
+        vec![ListItem::new(Line::from(
+            "No custom actions declared -- open the command palette and run \
+             \"Custom Actions: Manage\" to add one.",
+        ))]
+    } else {
+        app.custom_actions
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let style = if i == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let args = action.args.join(" ");
+                let label = if args.is_empty() {
+                    format!("{}  --  {}", action.name, action.command)
+                } else {
+                    format!("{}  --  {} {}", action.name, action.command, args)
+                };
+                ListItem::new(Line::from(Span::styled(label, style)))
+            })
+            .collect()
+    };
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Custom Actions  (Enter: run)");
+    frame.render_widget(List::new(items).block(list_block), rows[0]);
+
+    let visible_rows = rows[1].height.saturating_sub(2) as usize;
+    let output = &app.custom_actions.output;
+    let start = output.len().saturating_sub(visible_rows);
+    let output_items: Vec<ListItem> = if output.is_empty() {
+        vec![ListItem::new(Line::from("No output yet."))]
+    } else {
+        output[start..]
+            .iter()
+            .map(|line| {
+                // `subprocess::run_and_stream`'s two spawn-failure message
+                // shapes ("{program} not found on PATH" / "failed to run
+                // {program}: {e}") -- flagged in `error_text` so a mistyped
+                // custom-action command is visually distinct from ordinary
+                // stdout/stderr output (`docs/features/tui-custom-
+                // actions.md` §2.3's `ui.rs` bullet).
+                let style =
+                    if line.ends_with("not found on PATH") || line.starts_with("failed to run ") {
+                        Style::default().fg(theme.error_text)
+                    } else {
+                        Style::default()
+                    };
+                ListItem::new(Line::from(Span::styled(line.as_str(), style)))
+            })
+            .collect()
+    };
+    let output_title = match app.custom_actions.running.as_ref() {
+        Some(action) => format!("{}  (running...)", action.name),
+        None => "Output".to_string(),
+    };
+    let output_block = Block::default().borders(Borders::ALL).title(output_title);
+    frame.render_widget(List::new(output_items).block(output_block), rows[1]);
+}
+
+/// The Manage Custom Actions popup (`docs/features/tui-custom-actions.md`
+/// §3.2) -- mirrors `render_git_worktrees_popup`'s list/add-form split
+/// exactly, including the field-marker (`>`) convention for the form.
+fn render_manage_actions_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.clamp(30, 70).min(area.width);
+    let height = area.height.clamp(6, 16).min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let Some(state) = app.manage_actions_popup.as_ref() else {
+        return;
+    };
+
+    if state.adding {
+        let field_marker = |field: ActionFormField| {
+            if state.add_field == field {
+                ">"
+            } else {
+                " "
+            }
+        };
+        let items = vec![
+            ListItem::new(Line::from(format!(
+                "{} Name: {}",
+                field_marker(ActionFormField::Name),
+                state.new_name
+            ))),
+            ListItem::new(Line::from(format!(
+                "{} Command: {}",
+                field_marker(ActionFormField::Command),
+                state.new_command
+            ))),
+            ListItem::new(Line::from(format!(
+                "{} Args: {}",
+                field_marker(ActionFormField::Args),
+                state.new_args
+            ))),
+        ];
+        let title = if state.editing_index.is_some() {
+            "Edit Custom Action  (Tab: next field, Enter: save, Esc: cancel)"
+        } else {
+            "New Custom Action  (Tab: next field, Enter: save, Esc: cancel)"
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
+        frame.render_widget(List::new(items).block(block), popup);
+        return;
+    }
+
+    let selected = state.selected;
+    let mut items: Vec<ListItem> = app
+        .custom_actions
+        .actions
+        .iter()
+        .enumerate()
+        .map(|(i, action)| {
+            let style = if i == selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let args = action.args.join(" ");
+            let label = format!("{}  --  {} {}", action.name, action.command, args);
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from("No custom actions.")));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Manage Custom Actions  (n: add, Enter: edit, d: delete, Esc: close)");
+    frame.render_widget(List::new(items).block(block), popup);
 }
 
 /// `F1`'s popup (`docs/features/tui-hover-and-inlay-hints.md` §3.1) --

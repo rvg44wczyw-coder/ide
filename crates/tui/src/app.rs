@@ -682,6 +682,7 @@ pub(crate) enum BottomDockTab {
     Docker,
     Kubernetes,
     Cargo,
+    CustomActions,
     Problems,
     GitLog,
 }
@@ -691,7 +692,8 @@ impl BottomDockTab {
         match self {
             BottomDockTab::Docker => BottomDockTab::Kubernetes,
             BottomDockTab::Kubernetes => BottomDockTab::Cargo,
-            BottomDockTab::Cargo => BottomDockTab::Problems,
+            BottomDockTab::Cargo => BottomDockTab::CustomActions,
+            BottomDockTab::CustomActions => BottomDockTab::Problems,
             BottomDockTab::Problems => BottomDockTab::GitLog,
             BottomDockTab::GitLog => BottomDockTab::Docker,
         }
@@ -702,7 +704,8 @@ impl BottomDockTab {
             BottomDockTab::Docker => BottomDockTab::GitLog,
             BottomDockTab::Kubernetes => BottomDockTab::Docker,
             BottomDockTab::Cargo => BottomDockTab::Kubernetes,
-            BottomDockTab::Problems => BottomDockTab::Cargo,
+            BottomDockTab::CustomActions => BottomDockTab::Cargo,
+            BottomDockTab::Problems => BottomDockTab::CustomActions,
             BottomDockTab::GitLog => BottomDockTab::Problems,
         }
     }
@@ -731,6 +734,59 @@ pub(crate) struct GitLogDockState {
     pub(crate) focus: GitPanelFocus,
     pub(crate) graph_selected: usize,
     pub(crate) diff_scroll: u16,
+}
+
+/// Which field of the Manage Custom Actions add/edit form has focus;
+/// `Tab`/`BackTab` cycle it. Mirrors `WorktreeAddField`
+/// (`git_panel.rs`) exactly (`docs/features/tui-custom-actions.md` §2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ActionFormField {
+    #[default]
+    Name,
+    Command,
+    Args,
+}
+
+impl ActionFormField {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            ActionFormField::Name => ActionFormField::Command,
+            ActionFormField::Command => ActionFormField::Args,
+            ActionFormField::Args => ActionFormField::Name,
+        }
+    }
+
+    pub(crate) fn prev(self) -> Self {
+        match self {
+            ActionFormField::Name => ActionFormField::Args,
+            ActionFormField::Command => ActionFormField::Name,
+            ActionFormField::Args => ActionFormField::Command,
+        }
+    }
+}
+
+/// The Manage Custom Actions popup's state (`docs/features/
+/// tui-custom-actions.md` §2.3/§3.2). `adding` doubles as "add" and "edit"
+/// mode (mirrors `WorktreesPopupState::adding`) -- `editing_index:
+/// Some(i)` means the form was opened via `Enter` on `actions[i]` and
+/// `Enter` in the form overwrites that index instead of pushing a new
+/// entry. `editing_index` is guaranteed valid whenever `adding` is `true`:
+/// the key-routing chain delivers input to either the list view or the
+/// form view, never both, so nothing can mutate `App::custom_actions.
+/// actions` out from under an open form.
+#[derive(Default)]
+pub(crate) struct ManageActionsPopupState {
+    pub(crate) selected: usize,
+    pub(crate) adding: bool,
+    pub(crate) editing_index: Option<usize>,
+    pub(crate) add_field: ActionFormField,
+    pub(crate) new_name: String,
+    pub(crate) new_command: String,
+    /// Raw typed text, space-separated -- split into `Vec<String>` only in
+    /// `confirm_action_form`, the same one-parse-site discipline
+    /// `confirm_debug_adapter_config`'s `args: String` field already
+    /// establishes.
+    pub(crate) new_args: String,
 }
 
 pub struct App {
@@ -823,6 +879,8 @@ pub struct App {
     pub(crate) keymap_popup: Option<KeymapPopupState>,
     pub(crate) theme: crate::theme::ThemeKind,
     pub(crate) theme_popup: Option<ThemePopupState>,
+    pub(crate) custom_actions: crate::custom_actions::CustomActionsPanel,
+    pub(crate) manage_actions_popup: Option<ManageActionsPopupState>,
     pub(crate) new_scratch_file: Option<NewScratchFileState>,
     pub(crate) scratch_files: Option<ScratchFilesState>,
     pub(crate) claude: ClaudePanel,
@@ -1031,6 +1089,11 @@ impl App {
             keymap_popup: None,
             theme: crate::state::load().theme,
             theme_popup: None,
+            custom_actions: crate::custom_actions::CustomActionsPanel {
+                actions: crate::custom_actions::load(project.root()),
+                ..Default::default()
+            },
+            manage_actions_popup: None,
             new_scratch_file: None,
             scratch_files: None,
             claude: ClaudePanel::default(),
@@ -1134,6 +1197,12 @@ impl App {
     /// Same reasoning as `poll_docker`, for the Kubernetes panel.
     pub fn poll_k8s(&mut self) {
         self.k8s.poll();
+    }
+
+    /// Same reasoning as `poll_docker`, for the Custom Actions dock tab
+    /// (`docs/features/tui-custom-actions.md` §2.3, T42).
+    pub fn poll_custom_actions(&mut self) {
+        self.custom_actions.poll();
     }
 
     /// Called once per frame (`lib.rs`'s main loop) -- unlike
@@ -1931,6 +2000,7 @@ impl App {
         self.bookmarks_popup = None;
         self.keymap_popup = None;
         self.theme_popup = None;
+        self.manage_actions_popup = None;
         self.new_scratch_file = None;
         self.scratch_files = None;
         self.claude_panel_open = false;
@@ -5399,6 +5469,9 @@ impl App {
         if self.theme_popup.is_some() {
             return self.handle_theme_popup_key(key);
         }
+        if self.manage_actions_popup.is_some() {
+            return self.handle_manage_actions_popup_key(key);
+        }
         if self.new_scratch_file.is_some() {
             return self.handle_new_scratch_file_key(key);
         }
@@ -5476,6 +5549,7 @@ impl App {
             || self.clone_panel_open
             || self.keymap_popup.is_some()
             || self.theme_popup.is_some()
+            || self.manage_actions_popup.is_some()
             || self.new_scratch_file.is_some()
             || self.scratch_files.is_some()
             || self.claude_panel_open
@@ -5818,6 +5892,8 @@ impl App {
             Action::OpenPalette => self.open_palette(),
             Action::ToggleKeymapSettings => self.toggle_keymap_popup(),
             Action::ToggleThemeSettings => self.toggle_theme_popup(),
+            Action::ManageCustomActions => self.toggle_manage_actions_popup(),
+            Action::ToggleCustomActionsPanel => self.toggle_custom_actions_panel(),
             Action::ResetAllKeybindings => {
                 self.keymap.reset_all();
                 self.persist_keymap();
@@ -5890,6 +5966,9 @@ impl App {
                     }
                     BottomDockTab::Cargo => {
                         self.handle_cargo_panel_key(key);
+                    }
+                    BottomDockTab::CustomActions => {
+                        self.handle_custom_actions_panel_key(key);
                     }
                     BottomDockTab::Problems => {
                         self.handle_problems_key(key);
@@ -7286,6 +7365,200 @@ impl App {
             _ => {}
         }
         LoopSignal::Continue
+    }
+
+    /// `ManageCustomActions` command (`docs/features/tui-custom-actions.md`
+    /// §2.3/§3.2): opens/closes the Manage Custom Actions popup in list
+    /// mode, closing every other overlay first (same convention
+    /// `toggle_theme_popup` establishes).
+    fn toggle_manage_actions_popup(&mut self) {
+        let opening = self.manage_actions_popup.is_none();
+        self.close_all_overlays();
+        if opening {
+            self.manage_actions_popup = Some(ManageActionsPopupState::default());
+        }
+    }
+
+    /// `ToggleCustomActionsPanel` command: switches the bottom dock to the
+    /// Custom Actions tab (`docs/features/tui-custom-actions.md` §3.1),
+    /// same shape `toggle_docker_panel`/`toggle_cargo_panel` already use.
+    fn toggle_custom_actions_panel(&mut self) {
+        self.show_bottom_dock_tab(BottomDockTab::CustomActions);
+    }
+
+    /// Custom Actions dock tab key handling (`docs/features/
+    /// tui-custom-actions.md` §3.1): `Up`/`Down` move the selection cursor
+    /// (clamped, mirrors `handle_docker_panel_key`'s list navigation);
+    /// `Enter` runs the selected action.
+    fn handle_custom_actions_panel_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => {
+                self.custom_actions.selected = self.custom_actions.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let len = self.custom_actions.actions.len();
+                self.custom_actions.selected =
+                    (self.custom_actions.selected + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let root = self.project_root.clone();
+                self.custom_actions.run_selected(&root);
+            }
+            _ => {}
+        }
+    }
+
+    /// Manage Custom Actions popup, list mode (`docs/features/
+    /// tui-custom-actions.md` §3.2). Reached only while `manage_actions_
+    /// popup.is_some() && !manage_actions_popup.adding` -- the key-routing
+    /// chain hands form-mode input to `handle_action_form_key` instead, so
+    /// the two modes never both receive the same keypress.
+    fn handle_manage_actions_popup_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.manage_actions_popup.as_ref() else {
+            return LoopSignal::Continue;
+        };
+        if state.adding {
+            return self.handle_action_form_key(key);
+        }
+        match key.code {
+            KeyCode::Esc => self.manage_actions_popup = None,
+            KeyCode::Up => {
+                let state = self.manage_actions_popup.as_mut().unwrap();
+                state.selected = state.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let len = self.custom_actions.actions.len();
+                let state = self.manage_actions_popup.as_mut().unwrap();
+                state.selected = (state.selected + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::Char('n') => {
+                let state = self.manage_actions_popup.as_mut().unwrap();
+                state.adding = true;
+                state.editing_index = None;
+                state.add_field = ActionFormField::Name;
+                state.new_name.clear();
+                state.new_command.clear();
+                state.new_args.clear();
+            }
+            KeyCode::Enter => {
+                let selected = state.selected;
+                if let Some(action) = self.custom_actions.actions.get(selected).cloned() {
+                    let state = self.manage_actions_popup.as_mut().unwrap();
+                    state.adding = true;
+                    state.editing_index = Some(selected);
+                    state.add_field = ActionFormField::Name;
+                    state.new_name = action.name;
+                    state.new_command = action.command;
+                    state.new_args = action.args.join(" ");
+                }
+            }
+            KeyCode::Char('d') => {
+                let selected = state.selected;
+                if selected < self.custom_actions.actions.len() {
+                    self.custom_actions.actions.remove(selected);
+                    let state = self.manage_actions_popup.as_mut().unwrap();
+                    let len = self.custom_actions.actions.len();
+                    state.selected = state.selected.min(len.saturating_sub(1));
+                    self.persist_custom_actions();
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Manage Custom Actions popup, add/edit form mode (`docs/features/
+    /// tui-custom-actions.md` §3.2). `Tab`/`BackTab` cycle the three
+    /// fields, `Backspace`/`Char` edit the focused one, `Esc` discards back
+    /// to list mode, `Enter` confirms. Mirrors
+    /// `handle_git_worktree_add_key`'s exact shape.
+    fn handle_action_form_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.manage_actions_popup.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                state.adding = false;
+                state.editing_index = None;
+                state.new_name.clear();
+                state.new_command.clear();
+                state.new_args.clear();
+            }
+            KeyCode::Tab => state.add_field = state.add_field.next(),
+            KeyCode::BackTab => state.add_field = state.add_field.prev(),
+            KeyCode::Enter => self.confirm_action_form(),
+            KeyCode::Backspace => {
+                let field = match state.add_field {
+                    ActionFormField::Name => &mut state.new_name,
+                    ActionFormField::Command => &mut state.new_command,
+                    ActionFormField::Args => &mut state.new_args,
+                };
+                field.pop();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let field = match state.add_field {
+                    ActionFormField::Name => &mut state.new_name,
+                    ActionFormField::Command => &mut state.new_command,
+                    ActionFormField::Args => &mut state.new_args,
+                };
+                field.push(c);
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Validates and saves the Manage Custom Actions add/edit form
+    /// (`docs/features/tui-custom-actions.md` §3.2): trims `name`/
+    /// `command`, rejecting (via `notify`, form stays open) if either is
+    /// empty; splits `args` on whitespace. `editing_index: Some(i)`
+    /// overwrites `actions[i]` in place (guaranteed in-bounds -- see
+    /// `ManageActionsPopupState`'s own doc comment); `None` pushes a new
+    /// entry. Persists to `.ide/custom_actions.json` on success.
+    fn confirm_action_form(&mut self) {
+        let Some(state) = self.manage_actions_popup.as_ref() else {
+            return;
+        };
+        let name = state.new_name.trim().to_string();
+        let command = state.new_command.trim().to_string();
+        if name.is_empty() {
+            self.notify("Custom action name cannot be empty.");
+            return;
+        }
+        if command.is_empty() {
+            self.notify("Custom action command cannot be empty.");
+            return;
+        }
+        let args: Vec<String> = state
+            .new_args
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let editing_index = state.editing_index;
+        let action = crate::custom_actions::CustomAction {
+            name,
+            command,
+            args,
+        };
+        match editing_index {
+            Some(idx) => self.custom_actions.actions[idx] = action,
+            None => self.custom_actions.actions.push(action),
+        }
+        self.persist_custom_actions();
+        let state = self.manage_actions_popup.as_mut().unwrap();
+        state.adding = false;
+        state.editing_index = None;
+        state.new_name.clear();
+        state.new_command.clear();
+        state.new_args.clear();
+    }
+
+    /// Best-effort persist of `self.custom_actions.actions` to
+    /// `.ide/custom_actions.json` (`docs/features/tui-custom-actions.md`
+    /// §3.3), same fire-and-forget shape `persist_keymap`/`persist_theme`
+    /// already use.
+    fn persist_custom_actions(&mut self) {
+        crate::custom_actions::save(&self.project_root, &self.custom_actions.actions);
     }
 
     /// Same persist-on-change shape `toggle_format_on_save` establishes,
@@ -15722,6 +15995,149 @@ mod tests {
     }
 
     #[test]
+    fn action_form_field_next_and_prev_cycle_through_all_three_fields() {
+        assert_eq!(ActionFormField::Name.next(), ActionFormField::Command);
+        assert_eq!(ActionFormField::Command.next(), ActionFormField::Args);
+        assert_eq!(ActionFormField::Args.next(), ActionFormField::Name);
+        assert_eq!(ActionFormField::Name.prev(), ActionFormField::Args);
+        assert_eq!(ActionFormField::Command.prev(), ActionFormField::Name);
+        assert_eq!(ActionFormField::Args.prev(), ActionFormField::Command);
+    }
+
+    #[test]
+    fn close_all_overlays_clears_the_manage_actions_popup() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.manage_actions_popup = Some(ManageActionsPopupState::default());
+
+        app.close_all_overlays();
+
+        assert!(app.manage_actions_popup.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_reports_true_when_only_the_manage_actions_popup_is_set() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.manage_actions_popup = Some(ManageActionsPopupState::default());
+
+        assert!(app.any_popup_open());
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn manage_actions_popup_add_edit_delete_round_trips_through_persistence() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.custom_actions.actions.is_empty());
+
+        app.run_action(Action::ManageCustomActions);
+        assert!(app.manage_actions_popup.is_some());
+
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        assert!(app.manage_actions_popup.as_ref().unwrap().adding);
+        type_str(&mut app, "Run tests");
+        app.handle_key(plain_key(KeyCode::Tab));
+        type_str(&mut app, "cargo");
+        app.handle_key(plain_key(KeyCode::Tab));
+        type_str(&mut app, "test --workspace");
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(!app.manage_actions_popup.as_ref().unwrap().adding);
+        assert_eq!(app.custom_actions.actions.len(), 1);
+        assert_eq!(app.custom_actions.actions[0].name, "Run tests");
+        assert_eq!(app.custom_actions.actions[0].command, "cargo");
+        assert_eq!(
+            app.custom_actions.actions[0].args,
+            vec!["test".to_string(), "--workspace".to_string()]
+        );
+
+        let reloaded = crate::custom_actions::load(dir.path());
+        assert_eq!(reloaded, app.custom_actions.actions);
+
+        // Edit: Enter on the selected row opens the form pre-filled.
+        app.handle_key(plain_key(KeyCode::Enter));
+        let state = app.manage_actions_popup.as_ref().unwrap();
+        assert!(state.adding);
+        assert_eq!(state.editing_index, Some(0));
+        assert_eq!(state.new_name, "Run tests");
+        assert_eq!(state.new_command, "cargo");
+        assert_eq!(state.new_args, "test --workspace");
+
+        // Overwrite the name, keep the rest, save.
+        for _ in 0.."Run tests".len() {
+            app.handle_key(plain_key(KeyCode::Backspace));
+        }
+        type_str(&mut app, "Run all tests");
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.custom_actions.actions.len(), 1);
+        assert_eq!(app.custom_actions.actions[0].name, "Run all tests");
+
+        // Delete.
+        app.handle_key(plain_key(KeyCode::Char('d')));
+        assert!(app.custom_actions.actions.is_empty());
+        assert!(crate::custom_actions::load(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn manage_actions_popup_form_esc_discards_without_saving() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        type_str(&mut app, "Discarded");
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.manage_actions_popup.as_ref().unwrap().adding);
+        assert!(app.custom_actions.actions.is_empty());
+    }
+
+    #[test]
+    fn confirm_action_form_with_empty_name_notifies_and_keeps_form_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        app.handle_key(plain_key(KeyCode::Tab));
+        type_str(&mut app, "cargo");
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.manage_actions_popup.as_ref().unwrap().adding);
+        assert!(app.custom_actions.actions.is_empty());
+    }
+
+    #[test]
+    fn confirm_action_form_with_empty_command_notifies_and_keeps_form_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        type_str(&mut app, "Run tests");
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.manage_actions_popup.as_ref().unwrap().adding);
+        assert!(app.custom_actions.actions.is_empty());
+    }
+
+    #[test]
+    fn toggle_custom_actions_panel_action_switches_the_bottom_dock_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleCustomActionsPanel);
+        assert_eq!(
+            app.bottom_dock.as_ref().unwrap().tab,
+            BottomDockTab::CustomActions
+        );
+    }
+
+    #[test]
     fn keymap_popup_typing_filters_rows_and_resets_selection() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
@@ -16890,7 +17306,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_bottom_dock_key_tab_cycles_through_all_five_tabs_and_back() {
+    fn handle_bottom_dock_key_tab_cycles_through_all_six_tabs_and_back() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
@@ -16899,6 +17315,7 @@ mod tests {
         let forward = [
             BottomDockTab::Kubernetes,
             BottomDockTab::Cargo,
+            BottomDockTab::CustomActions,
             BottomDockTab::Problems,
             BottomDockTab::GitLog,
             BottomDockTab::Docker,

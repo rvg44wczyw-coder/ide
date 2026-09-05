@@ -233,6 +233,8 @@ pub enum Action {
     ToggleClaudePanel,
     ToggleDockerPanel,
     ToggleK8sPanel,
+    ManageCustomActions,
+    ToggleCustomActionsPanel,
     Debug,
     ResumeProgram,
     StepOver,
@@ -864,6 +866,22 @@ pub fn commands() -> &'static [Command] {
             // Same reasoning as `ToggleDockerPanel` immediately above.
             binding: None,
             action: Action::ToggleK8sPanel,
+        },
+        Command {
+            id: "ManageCustomActions",
+            title: "Custom Actions: Manage",
+            // Same reasoning as `ToggleDockerPanel`/`ToggleK8sPanel` above
+            // -- a new settings surface with no reference-IDE keybinding to
+            // translate (`docs/features/tui-custom-actions.md` §2.3).
+            binding: None,
+            action: Action::ManageCustomActions,
+        },
+        Command {
+            id: "ToggleCustomActionsPanel",
+            title: "Custom Actions",
+            // Same reasoning as `ManageCustomActions` immediately above.
+            binding: None,
+            action: Action::ToggleCustomActionsPanel,
         },
         Command {
             id: "Debug",
