@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::theme::ThemeKind;
+
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedState {
     pub last_project: Option<PathBuf>,
@@ -17,6 +19,12 @@ pub struct PersistedState {
     /// i.e. `false`, matching `bool::default()`.
     #[serde(default)]
     pub format_on_save: bool,
+    /// `#[serde(default)]` so a state file written before `T41` (color
+    /// themes, `docs/features/tui-theme.md`) still deserializes -- a
+    /// missing field means `ThemeKind::Classic` (`ThemeKind`'s own
+    /// `#[default]`), i.e. today's unchanged look.
+    #[serde(default)]
+    pub theme: ThemeKind,
 }
 
 /// Best-effort load: a missing file, malformed JSON, or an unresolvable
@@ -99,6 +107,7 @@ mod tests {
         let remembered = PersistedState {
             last_project: Some(PathBuf::from("/tmp/some-project")),
             format_on_save: true,
+            theme: ThemeKind::Ember,
         };
         save_to(&path, &remembered);
         assert_eq!(load_from(&path), remembered);
@@ -114,8 +123,41 @@ mod tests {
             PersistedState {
                 last_project: Some(PathBuf::from("/tmp/some-project")),
                 format_on_save: false,
+                theme: ThemeKind::Classic,
             }
         );
+    }
+
+    #[test]
+    fn load_on_a_pre_t41_file_without_theme_defaults_it_to_classic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"last_project":"/tmp/some-project","format_on_save":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_from(&path),
+            PersistedState {
+                last_project: Some(PathBuf::from("/tmp/some-project")),
+                format_on_save: true,
+                theme: ThemeKind::Classic,
+            }
+        );
+    }
+
+    #[test]
+    fn save_then_load_round_trips_the_ember_theme() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = PersistedState {
+            last_project: None,
+            format_on_save: false,
+            theme: ThemeKind::Ember,
+        };
+        save_to(&path, &state);
+        assert_eq!(load_from(&path).theme, ThemeKind::Ember);
     }
 
     #[test]
@@ -136,6 +178,7 @@ mod tests {
             &PersistedState {
                 last_project: Some(PathBuf::from("/tmp/x")),
                 format_on_save: false,
+                theme: ThemeKind::Classic,
             },
         );
         assert!(path.exists());

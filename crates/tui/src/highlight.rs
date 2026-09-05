@@ -16,23 +16,28 @@ use ratatui::text::{Line, Span};
 use ide_core::{TextBuffer, Token, TokenKind};
 use ide_lsp::{SemanticToken, SemanticTokenKind};
 
-/// Mirrors `crates/ui/src/theme/mod.rs`'s `SyntaxColors::of` shape: ten
-/// distinctly-colored variants, `Punctuation`/`Variable` both left at the
-/// plain-text default (brackets are structure, not logic; `Variable` is a
-/// semantic-highlighting target the regex tokenizer never produces on its
-/// own -- see that variant's own doc comment in `crates/core/src/syntax.rs`).
-pub fn style_for(kind: TokenKind) -> Style {
+use crate::theme::Theme;
+#[cfg(test)]
+use crate::theme::CLASSIC;
+
+/// Resolves `kind` against `theme.syntax`'s matching field
+/// (`docs/features/tui-theme.md` §2.3/`T41`). `Punctuation`/`Variable`
+/// both stay at the plain-text default in every theme (brackets are
+/// structure, not logic; `Variable` is a semantic-highlighting target the
+/// regex tokenizer never produces on its own -- see that variant's own
+/// doc comment in `crates/core/src/syntax.rs`).
+pub fn style_for(kind: TokenKind, theme: &Theme) -> Style {
     let color = match kind {
-        TokenKind::Keyword => Color::Magenta,
-        TokenKind::String => Color::Green,
-        TokenKind::Number => Color::LightYellow,
-        TokenKind::Comment => Color::DarkGray,
-        TokenKind::Key => Color::Blue,
-        TokenKind::Function => Color::Cyan,
-        TokenKind::Type => Color::LightCyan,
-        TokenKind::Macro => Color::LightMagenta,
-        TokenKind::Constant => Color::LightRed,
-        TokenKind::Operator => Color::Red,
+        TokenKind::Keyword => theme.syntax.keyword,
+        TokenKind::String => theme.syntax.string,
+        TokenKind::Number => theme.syntax.number,
+        TokenKind::Comment => theme.syntax.comment,
+        TokenKind::Key => theme.syntax.key,
+        TokenKind::Function => theme.syntax.function,
+        TokenKind::Type => theme.syntax.r#type,
+        TokenKind::Macro => theme.syntax.r#macro,
+        TokenKind::Constant => theme.syntax.constant,
+        TokenKind::Operator => theme.syntax.operator,
         TokenKind::Punctuation | TokenKind::Variable => return Style::default(),
     };
     Style::default().fg(color)
@@ -264,6 +269,7 @@ pub fn styled_line(
     line: usize,
     overlays: &LineOverlays<'_>,
     tab_width: usize,
+    theme: &Theme,
 ) -> Line<'static> {
     let line_text = text_buffer.line_text(line).unwrap_or("");
     let Some(line_start) = text_buffer.lines().line_start(line) else {
@@ -369,12 +375,10 @@ pub fn styled_line(
         offset: usize,
         spans: &mut Vec<Span<'static>>,
         col: &mut usize,
+        chip_fg: Color,
     ) {
         for (_, label) in chips.iter().filter(|(o, _)| *o == offset) {
-            spans.push(Span::styled(
-                label.clone(),
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(label.clone(), Style::default().fg(chip_fg)));
             *col += label.chars().count();
         }
     }
@@ -382,33 +386,33 @@ pub fn styled_line(
     let mut spans = Vec::new();
     for pair in boundaries.windows(2) {
         let (b0, b1) = (pair[0], pair[1]);
-        push_chips_at(&chips, b0, &mut spans, &mut col);
+        push_chips_at(&chips, b0, &mut spans, &mut col, theme.chip_fg);
         if b1 > b0 {
             let mut style = tokens
                 .iter()
                 .find(|t| t.range.start <= b0 && b1 <= t.range.end)
-                .map(|t| style_for(t.kind))
+                .map(|t| style_for(t.kind, theme))
                 .unwrap_or_default();
             if breakpoints_unverified
                 .iter()
                 .any(|b| b.start <= b0 && b1 <= b.end)
             {
-                style = style.bg(Color::DarkGray);
+                style = style.bg(theme.wash_breakpoint_unverified);
             }
             if breakpoints_verified
                 .iter()
                 .any(|b| b.start <= b0 && b1 <= b.end)
             {
-                style = style.bg(Color::Red);
+                style = style.bg(theme.wash_breakpoint_verified);
             }
             if highlights.iter().any(|h| h.start <= b0 && b1 <= h.end) {
-                style = style.bg(Color::DarkGray);
+                style = style.bg(theme.wash_document_highlight);
             }
             if selections.iter().any(|s| s.start <= b0 && b1 <= s.end) {
-                style = style.bg(Color::Yellow);
+                style = style.bg(theme.wash_selection);
             }
             if bracket_pair.iter().any(|p| p.start <= b0 && b1 <= p.end) {
-                style = style.bg(Color::Blue);
+                style = style.bg(theme.wash_bracket_pair);
             }
             let (expanded, new_col) =
                 expand_tabs(&line_text[b0 - line_start..b1 - line_start], col, tab_width);
@@ -416,7 +420,7 @@ pub fn styled_line(
             spans.push(Span::styled(expanded, style));
         }
     }
-    push_chips_at(&chips, line_end, &mut spans, &mut col);
+    push_chips_at(&chips, line_end, &mut spans, &mut col, theme.chip_fg);
 
     Line::from(spans)
 }
@@ -524,7 +528,7 @@ mod tests {
             (TokenKind::Operator, Color::Red),
         ];
         for (kind, color) in expect {
-            assert_eq!(style_for(kind).fg, Some(color), "{kind:?}");
+            assert_eq!(style_for(kind, &CLASSIC).fg, Some(color), "{kind:?}");
         }
         let colors: Vec<Color> = expect.iter().map(|(_, c)| *c).collect();
         for i in 0..colors.len() {
@@ -536,14 +540,17 @@ mod tests {
 
     #[test]
     fn style_for_punctuation_and_variable_are_plain_default() {
-        assert_eq!(style_for(TokenKind::Punctuation), Style::default());
-        assert_eq!(style_for(TokenKind::Variable), Style::default());
+        assert_eq!(
+            style_for(TokenKind::Punctuation, &CLASSIC),
+            Style::default()
+        );
+        assert_eq!(style_for(TokenKind::Variable, &CLASSIC), Style::default());
     }
 
     #[test]
     fn styled_line_on_untokenized_buffer_is_one_plain_span() {
         let b = buffer("plain text", None);
-        let line = styled_line(&b, 0, &no_overlays(), 4);
+        let line = styled_line(&b, 0, &no_overlays(), 4, &CLASSIC);
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].content, "plain text");
         assert_eq!(line.spans[0].style, Style::default());
@@ -552,7 +559,7 @@ mod tests {
     #[test]
     fn styled_line_on_out_of_range_line_is_a_safe_fallback() {
         let b = buffer("only one line", None);
-        let line = styled_line(&b, 5, &no_overlays(), 4);
+        let line = styled_line(&b, 5, &no_overlays(), 4, &CLASSIC);
         let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, "", "an out-of-range line has no text");
     }
@@ -560,13 +567,13 @@ mod tests {
     #[test]
     fn styled_line_colors_a_keyword_and_leaves_the_rest_plain() {
         let b = buffer("let x = 1;", Some(&ide_core::RUST));
-        let line = styled_line(&b, 0, &no_overlays(), 4);
+        let line = styled_line(&b, 0, &no_overlays(), 4, &CLASSIC);
         let keyword_span = line
             .spans
             .iter()
             .find(|s| s.content.as_ref() == "let")
             .expect("`let` should be its own span");
-        assert_eq!(keyword_span.style, style_for(TokenKind::Keyword));
+        assert_eq!(keyword_span.style, style_for(TokenKind::Keyword, &CLASSIC));
         let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, "let x = 1;");
     }
@@ -579,27 +586,27 @@ mod tests {
         let b = buffer("/* one\ntwo */\n", Some(&ide_core::RUST));
         assert_eq!(b.lines().line_count(), 3);
 
-        let line0 = styled_line(&b, 0, &no_overlays(), 4);
+        let line0 = styled_line(&b, 0, &no_overlays(), 4, &CLASSIC);
         let rebuilt0: String = line0.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt0, "/* one");
         assert!(line0
             .spans
             .iter()
-            .all(|s| s.style == style_for(TokenKind::Comment)));
+            .all(|s| s.style == style_for(TokenKind::Comment, &CLASSIC)));
 
-        let line1 = styled_line(&b, 1, &no_overlays(), 4);
+        let line1 = styled_line(&b, 1, &no_overlays(), 4, &CLASSIC);
         let rebuilt1: String = line1.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt1, "two */");
         assert!(line1
             .spans
             .iter()
-            .all(|s| s.style == style_for(TokenKind::Comment)));
+            .all(|s| s.style == style_for(TokenKind::Comment, &CLASSIC)));
     }
 
     #[test]
     fn styled_line_handles_multibyte_utf8_tokens() {
         let b = buffer("// héllo wörld\n", Some(&ide_core::RUST));
-        let line = styled_line(&b, 0, &no_overlays(), 4);
+        let line = styled_line(&b, 0, &no_overlays(), 4, &CLASSIC);
         let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, "// héllo wörld");
     }
@@ -673,7 +680,7 @@ mod tests {
     #[test]
     fn styled_line_expands_a_leading_tab_instead_of_dropping_it() {
         let b = buffer("\tname string\n", Some(&ide_core::RUST));
-        let line = styled_line(&b, 0, &no_overlays(), 4);
+        let line = styled_line(&b, 0, &no_overlays(), 4, &CLASSIC);
         let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, "    name string");
     }
@@ -681,7 +688,7 @@ mod tests {
     #[test]
     fn styled_line_a_tab_after_a_token_still_advances_to_the_next_stop() {
         let b = buffer("ab\tc\n", Some(&ide_core::RUST));
-        let line = styled_line(&b, 0, &no_overlays(), 4);
+        let line = styled_line(&b, 0, &no_overlays(), 4, &CLASSIC);
         let rebuilt: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, "ab  c");
     }
@@ -716,13 +723,14 @@ mod tests {
                 breakpoints_unverified: &[],
             },
             4,
+            &CLASSIC,
         );
         let foo_span = line
             .spans
             .iter()
             .find(|s| s.content.as_ref() == "foo")
             .expect("\"foo\" should be its own span");
-        assert_eq!(foo_span.style, style_for(TokenKind::Type));
+        assert_eq!(foo_span.style, style_for(TokenKind::Type, &CLASSIC));
     }
 
     fn semantic_token(
@@ -1055,7 +1063,7 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         assert_eq!(rebuild(&line), "let x = 1;");
         let x_span = line
             .spans
@@ -1085,7 +1093,7 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         let chip_index = line
             .spans
             .iter()
@@ -1124,7 +1132,7 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         assert_eq!(rebuild(&line), "let x = 1;");
     }
 
@@ -1146,13 +1154,13 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         let foo_span = line
             .spans
             .iter()
             .find(|s| s.content.as_ref() == "foo")
             .expect("\"foo\" should be its own span");
-        assert_eq!(foo_span.style.fg, style_for(TokenKind::Type).fg);
+        assert_eq!(foo_span.style.fg, style_for(TokenKind::Type, &CLASSIC).fg);
         assert_eq!(foo_span.style.bg, Some(Color::DarkGray));
     }
 
@@ -1174,7 +1182,7 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         // Reconstructing every span *except* the two pure-insertion chips
         // must exactly reproduce the original line, with nothing lost or
         // duplicated -- the no-gap/no-overlap covering invariant §4
@@ -1202,7 +1210,7 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         assert_eq!(rebuild(&line), "let x = (1);");
         for content in ["(", ")"] {
             let span = line
@@ -1234,7 +1242,7 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         let x_span = line
             .spans
             .iter()
@@ -1269,7 +1277,7 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         assert_eq!(rebuild(&line), "let x = 1;");
         assert!(line.spans.iter().all(|s| s.style.bg != Some(Color::Yellow)));
     }
@@ -1290,7 +1298,7 @@ mod tests {
             breakpoints_verified: &[],
             breakpoints_unverified: &[],
         };
-        let line = styled_line(&b, 0, &overlays, 4);
+        let line = styled_line(&b, 0, &overlays, 4, &CLASSIC);
         assert_eq!(rebuild(&line), "abcdef");
         // The shared boundary at offset 3 splits the two selections into
         // their own spans ("bc", "de") -- neither merges into the other nor
