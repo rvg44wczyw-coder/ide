@@ -224,6 +224,8 @@ pub enum CommandAction {
     GitBranches,
     ToggleBlameAnnotations,
     GitWorktrees,
+    ManageCustomActions,
+    ToggleCustomActionsToolWindow,
     ShowFileHistory,
     Fetch,
     Pull,
@@ -485,6 +487,13 @@ pub fn commands() -> &'static [Command] {
                 action: CommandAction::ToggleClaudeToolWindow,
             },
             Command {
+                id: "ToggleCustomActionsToolWindow",
+                title: "Custom Actions",
+                category: "Window",
+                binding: None,
+                action: CommandAction::ToggleCustomActionsToolWindow,
+            },
+            Command {
                 id: "NextTab",
                 title: "Next Tab",
                 category: "Window",
@@ -532,6 +541,21 @@ pub fn commands() -> &'static [Command] {
                 // palette/menu-only (`git-worktrees.md` §2.2.2).
                 binding: None,
                 action: CommandAction::GitWorktrees,
+            },
+            Command {
+                id: "ManageCustomActions",
+                title: "Manage Custom Actions...",
+                // "Run" (not "Build", where Cargo's own commands live) --
+                // this is the "declare and execute something" category,
+                // whose real existing occupants are the debug-session
+                // actions (Debug/ResumeProgram/StepOver/...), which are
+                // closer in kind to running an arbitrary external command
+                // than Cargo's fixed build/lint subcommands are.
+                category: "Run",
+                // No JetBrains-IDE precedent to copy a binding from --
+                // per root CLAUDE.md's "never invent a binding" rule.
+                binding: None,
+                action: CommandAction::ManageCustomActions,
             },
             Command {
                 id: "ShowFileHistory",
@@ -1165,6 +1189,8 @@ mod tests {
             "ShowLanguageSettings",
             "ShowKeymapSettings",
             "ToggleFormatOnSave",
+            "ManageCustomActions",
+            "ToggleCustomActionsToolWindow",
         ] {
             let cmd = commands().iter().find(|c| c.id == id).unwrap();
             assert!(cmd.binding.is_none(), "{id} should have no default binding");

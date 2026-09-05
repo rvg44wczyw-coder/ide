@@ -219,6 +219,36 @@ pub enum BottomView {
     /// Threads/stack/output for the active debug session (`docs/features/
     /// debugger.md` §2.3) -- extends the row above to five-way.
     Debug,
+    /// User-declared named external commands (`docs/features/
+    /// custom-actions.md`, `G8`) -- extends the row above to six-way.
+    CustomActions,
+}
+
+/// The Manage Custom Actions popup's state (`docs/features/
+/// custom-actions.md` §2.2). Simpler than `git_panel.rs`'s
+/// `WorktreesPopupState`-style forms: `egui` renders Name/Command/Args as
+/// three always-visible `TextEdit` widgets at once (mouse-driven, not
+/// modal keyboard input), so there's no field-cycling state to track.
+#[derive(Default)]
+pub struct CustomActionsPopupState {
+    pub open: bool,
+    pub new_name: String,
+    pub new_command: String,
+    pub new_args: String,
+    /// `Some(i)` while editing `actions[i]` in place; `None` means Create
+    /// appends instead of overwriting. Valid whenever checked *within* a
+    /// project, but `load_project_settings` resets this whole struct on
+    /// every project switch rather than trying to re-validate `Some(i)`
+    /// against the new project's (possibly shorter) action list --
+    /// without that reset, editing an action then switching to a project
+    /// with fewer actions would let `confirm_custom_action_form` index
+    /// out of bounds on Save.
+    pub editing_index: Option<usize>,
+    /// Set by `confirm_custom_action_form` on validation failure (empty
+    /// name/command), rendered above the form the same way
+    /// `WorktreesPopupState::error` is rendered in `render_worktrees_popup`.
+    /// Cleared on success and when the popup is (re)opened.
+    pub error: Option<String>,
 }
 
 /// Parameterizes `IdeApp::toggle_tool_window` / `is_tool_window_open`
@@ -823,6 +853,8 @@ pub struct IdeApp {
     lsp: LspBridge,
     debug: DebugPanel,
     cargo: CargoPanel,
+    custom_actions: crate::custom_actions::CustomActionsPanel,
+    custom_actions_popup: CustomActionsPopupState,
     clone: CloneState,
     /// `Some` only between startup and `resolve_startup_restore` clearing
     /// it, and only when the registry had 2+ entries (`git-worktrees.md`
@@ -1201,6 +1233,8 @@ impl IdeApp {
             lsp: LspBridge::default(),
             debug: DebugPanel::default(),
             cargo: CargoPanel::default(),
+            custom_actions: crate::custom_actions::CustomActionsPanel::default(),
+            custom_actions_popup: CustomActionsPopupState::default(),
             clone: CloneState::default(),
             startup_restore_prompt: None,
             open_projects_registry_path: registry_path,
@@ -1433,6 +1467,86 @@ impl IdeApp {
     /// underlying `show_*_tool_window` flags.
     fn toggle_zen_mode(&mut self) {
         self.zen_mode = !self.zen_mode;
+    }
+
+    fn open_custom_actions_popup(&mut self) {
+        self.custom_actions_popup = CustomActionsPopupState {
+            open: true,
+            ..Default::default()
+        };
+    }
+
+    /// No-op if `index` is out of range. `args` are rejoined with single
+    /// spaces (a lossy hand-edited-round-trip limitation, same as `ide-tui`'s
+    /// own `ActionFormField`-driven form accepts for the identical reason).
+    fn start_editing_custom_action(&mut self, index: usize) {
+        let Some(action) = self.custom_actions.actions.get(index) else {
+            return;
+        };
+        self.custom_actions_popup.new_name = action.name.clone();
+        self.custom_actions_popup.new_command = action.command.clone();
+        self.custom_actions_popup.new_args = action.args.join(" ");
+        self.custom_actions_popup.editing_index = Some(index);
+    }
+
+    /// Trims and validates `new_name`/`new_command` non-empty, same
+    /// visible-error-on-failure shape `add_custom_language` uses via its own
+    /// `language_settings_error` field -- rejects back to the form rather
+    /// than silently doing nothing.
+    fn confirm_custom_action_form(&mut self) {
+        let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) else {
+            return;
+        };
+        let name = self.custom_actions_popup.new_name.trim().to_string();
+        if name.is_empty() {
+            self.custom_actions_popup.error =
+                Some("Custom action name cannot be empty.".to_string());
+            return;
+        }
+        let command = self.custom_actions_popup.new_command.trim().to_string();
+        if command.is_empty() {
+            self.custom_actions_popup.error =
+                Some("Custom action command cannot be empty.".to_string());
+            return;
+        }
+        let args: Vec<String> = self
+            .custom_actions_popup
+            .new_args
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let action = crate::custom_actions::CustomAction {
+            name,
+            command,
+            args,
+        };
+        match self.custom_actions_popup.editing_index {
+            Some(i) if i < self.custom_actions.actions.len() => {
+                self.custom_actions.actions[i] = action;
+            }
+            _ => self.custom_actions.actions.push(action),
+        }
+        crate::custom_actions::save(&root, &self.custom_actions.actions);
+        self.custom_actions_popup.new_name.clear();
+        self.custom_actions_popup.new_command.clear();
+        self.custom_actions_popup.new_args.clear();
+        self.custom_actions_popup.editing_index = None;
+        self.custom_actions_popup.error = None;
+    }
+
+    /// No-op if `index` is out of range. No confirmation step, same as
+    /// `ide-tui`'s own Manage popup delete.
+    fn delete_custom_action(&mut self, index: usize) {
+        if index >= self.custom_actions.actions.len() {
+            return;
+        }
+        self.custom_actions.actions.remove(index);
+        if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+            crate::custom_actions::save(&root, &self.custom_actions.actions);
+        }
+        if self.custom_actions_popup.editing_index == Some(index) {
+            self.custom_actions_popup.editing_index = None;
+        }
     }
 
     /// Aggregate error/warning counts across every open-project diagnostic
@@ -1895,6 +2009,10 @@ impl IdeApp {
         self.keymap = preferences.keymap;
         self.format_on_save = preferences.format_on_save;
         self.dismissed_language_suggestions = preferences.dismissed_language_suggestions;
+        self.custom_actions.actions = crate::custom_actions::load(root);
+        // Not just `editing_index` -- see `CustomActionsPopupState::
+        // editing_index`'s doc comment for why the whole popup resets.
+        self.custom_actions_popup = CustomActionsPopupState::default();
 
         let workspace =
             project_settings::read::<WorkspaceState>(root, ProjectSettingsFile::Workspace)
@@ -4801,6 +4919,8 @@ impl IdeApp {
                 .active_tab
                 .is_some_and(|idx| self.tabs[idx].buffer.path().is_some()),
             CommandAction::GitWorktrees => self.project.is_some(),
+            CommandAction::ManageCustomActions => self.project.is_some(),
+            CommandAction::ToggleCustomActionsToolWindow => self.project.is_some(),
             // Not a no-op-and-silently-fail: `is_command_enabled` gates the
             // palette/menu entry itself on both a project being open *and*
             // it being a git repo (`git-fetch-pull-push.md` §2.2), unlike
@@ -4957,6 +5077,10 @@ impl IdeApp {
                 if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
                     self.git.open_worktrees_popup(&root);
                 }
+            }
+            CommandAction::ManageCustomActions => self.open_custom_actions_popup(),
+            CommandAction::ToggleCustomActionsToolWindow => {
+                self.toggle_bottom_tool_window(BottomView::CustomActions)
             }
             CommandAction::ShowFileHistory => self.trigger_show_file_history(),
             CommandAction::Fetch => {
@@ -5441,6 +5565,8 @@ mod tests {
             lsp: LspBridge::default(),
             debug: DebugPanel::default(),
             cargo: CargoPanel::default(),
+            custom_actions: crate::custom_actions::CustomActionsPanel::default(),
+            custom_actions_popup: CustomActionsPopupState::default(),
             clone: CloneState::default(),
             startup_restore_prompt: None,
             open_projects_registry_path: None,
@@ -7142,6 +7268,244 @@ b
         assert_eq!(app.theme, Theme::Dark);
         assert!(app.custom_languages.is_empty());
         assert!(!app.format_on_save);
+    }
+
+    #[test]
+    fn load_project_settings_loads_persisted_custom_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::custom_actions::save(
+            dir.path(),
+            &[crate::custom_actions::CustomAction {
+                name: "Run tests".to_string(),
+                command: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            }],
+        );
+        let mut app = app_without_gui();
+
+        app.load_project_settings(dir.path(), &egui::Context::default());
+
+        assert_eq!(app.custom_actions.actions.len(), 1);
+        assert_eq!(app.custom_actions.actions[0].name, "Run tests");
+    }
+
+    #[test]
+    fn load_project_settings_resets_the_custom_actions_popup_on_project_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.custom_actions_popup.editing_index = Some(3);
+        app.custom_actions_popup.error = Some("stale error".to_string());
+        app.custom_actions_popup.new_name = "stale draft".to_string();
+        app.custom_actions_popup.open = true;
+
+        app.load_project_settings(dir.path(), &egui::Context::default());
+
+        // `open` is deliberately *not* asserted false here -- resetting the
+        // whole struct to `Default` closes it as a side effect, which is
+        // exactly the point: an edit in flight against the old project's
+        // (now-replaced) action list must not survive to index the new
+        // project's list out of bounds.
+        assert!(app.custom_actions_popup.editing_index.is_none());
+        assert!(app.custom_actions_popup.error.is_none());
+        assert!(app.custom_actions_popup.new_name.is_empty());
+    }
+
+    #[test]
+    fn open_custom_actions_popup_starts_fresh_and_open() {
+        let mut app = app_without_gui();
+        app.custom_actions_popup.error = Some("stale".to_string());
+        app.custom_actions_popup.new_name = "stale".to_string();
+
+        app.open_custom_actions_popup();
+
+        assert!(app.custom_actions_popup.open);
+        assert!(app.custom_actions_popup.error.is_none());
+        assert!(app.custom_actions_popup.new_name.is_empty());
+    }
+
+    #[test]
+    fn start_editing_custom_action_populates_the_form_with_a_space_joined_args() {
+        let mut app = app_without_gui();
+        app.custom_actions.actions = vec![crate::custom_actions::CustomAction {
+            name: "Run tests".to_string(),
+            command: "cargo".to_string(),
+            args: vec!["test".to_string(), "--all".to_string()],
+        }];
+
+        app.start_editing_custom_action(0);
+
+        assert_eq!(app.custom_actions_popup.new_name, "Run tests");
+        assert_eq!(app.custom_actions_popup.new_command, "cargo");
+        assert_eq!(app.custom_actions_popup.new_args, "test --all");
+        assert_eq!(app.custom_actions_popup.editing_index, Some(0));
+    }
+
+    #[test]
+    fn start_editing_custom_action_out_of_range_is_a_noop() {
+        let mut app = app_without_gui();
+        app.start_editing_custom_action(0);
+        assert!(app.custom_actions_popup.editing_index.is_none());
+    }
+
+    #[test]
+    fn confirm_custom_action_form_rejects_an_empty_name_and_keeps_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.custom_actions_popup.new_name = "   ".to_string();
+        app.custom_actions_popup.new_command = "cargo".to_string();
+
+        app.confirm_custom_action_form();
+
+        assert!(app.custom_actions.actions.is_empty());
+        assert_eq!(
+            app.custom_actions_popup.error.as_deref(),
+            Some("Custom action name cannot be empty.")
+        );
+        // Text is left intact so the user doesn't lose what they typed.
+        assert_eq!(app.custom_actions_popup.new_command, "cargo");
+    }
+
+    #[test]
+    fn confirm_custom_action_form_rejects_an_empty_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.custom_actions_popup.new_name = "Run tests".to_string();
+        app.custom_actions_popup.new_command = "  ".to_string();
+
+        app.confirm_custom_action_form();
+
+        assert!(app.custom_actions.actions.is_empty());
+        assert_eq!(
+            app.custom_actions_popup.error.as_deref(),
+            Some("Custom action command cannot be empty.")
+        );
+    }
+
+    #[test]
+    fn confirm_custom_action_form_creates_splits_args_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.custom_actions_popup.new_name = "  Run tests  ".to_string();
+        app.custom_actions_popup.new_command = " cargo ".to_string();
+        app.custom_actions_popup.new_args = "test  --all".to_string();
+        app.custom_actions_popup.open = true;
+
+        app.confirm_custom_action_form();
+
+        assert_eq!(
+            app.custom_actions.actions,
+            vec![crate::custom_actions::CustomAction {
+                name: "Run tests".to_string(),
+                command: "cargo".to_string(),
+                args: vec!["test".to_string(), "--all".to_string()],
+            }]
+        );
+        assert!(app.custom_actions_popup.new_name.is_empty());
+        assert!(app.custom_actions_popup.error.is_none());
+        assert!(app.custom_actions_popup.open); // stays open, matching worktrees' own Create behaviour
+        assert_eq!(crate::custom_actions::load(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn confirm_custom_action_form_with_editing_index_overwrites_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.custom_actions.actions = vec![
+            crate::custom_actions::CustomAction {
+                name: "a".to_string(),
+                command: "cmd-a".to_string(),
+                args: Vec::new(),
+            },
+            crate::custom_actions::CustomAction {
+                name: "b".to_string(),
+                command: "cmd-b".to_string(),
+                args: Vec::new(),
+            },
+        ];
+        app.custom_actions_popup.editing_index = Some(1);
+        app.custom_actions_popup.new_name = "b renamed".to_string();
+        app.custom_actions_popup.new_command = "cmd-b2".to_string();
+
+        app.confirm_custom_action_form();
+
+        assert_eq!(app.custom_actions.actions.len(), 2);
+        assert_eq!(app.custom_actions.actions[0].name, "a");
+        assert_eq!(app.custom_actions.actions[1].name, "b renamed");
+        assert_eq!(app.custom_actions.actions[1].command, "cmd-b2");
+        assert!(app.custom_actions_popup.editing_index.is_none());
+    }
+
+    #[test]
+    fn delete_custom_action_removes_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.custom_actions.actions = vec![crate::custom_actions::CustomAction {
+            name: "a".to_string(),
+            command: "cmd-a".to_string(),
+            args: Vec::new(),
+        }];
+
+        app.delete_custom_action(0);
+
+        assert!(app.custom_actions.actions.is_empty());
+        assert!(crate::custom_actions::load(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn delete_custom_action_out_of_range_is_a_noop() {
+        let mut app = app_without_gui();
+        app.delete_custom_action(0);
+        assert!(app.custom_actions.actions.is_empty());
+    }
+
+    #[test]
+    fn delete_custom_action_clears_a_matching_editing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.custom_actions.actions = vec![crate::custom_actions::CustomAction {
+            name: "a".to_string(),
+            command: "cmd-a".to_string(),
+            args: Vec::new(),
+        }];
+        app.custom_actions_popup.editing_index = Some(0);
+
+        app.delete_custom_action(0);
+
+        assert!(app.custom_actions_popup.editing_index.is_none());
+    }
+
+    #[test]
+    fn is_command_enabled_custom_actions_need_a_project() {
+        let app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::ManageCustomActions));
+        assert!(!app.is_command_enabled(CommandAction::ToggleCustomActionsToolWindow));
+    }
+
+    #[test]
+    fn run_command_manage_custom_actions_opens_the_popup() {
+        let mut app = app_without_gui();
+        app.run_command(
+            CommandAction::ManageCustomActions,
+            &egui::Context::default(),
+        );
+        assert!(app.custom_actions_popup.open);
+    }
+
+    #[test]
+    fn run_command_toggle_custom_actions_tool_window_switches_the_bottom_view() {
+        let mut app = app_without_gui();
+        app.run_command(
+            CommandAction::ToggleCustomActionsToolWindow,
+            &egui::Context::default(),
+        );
+        assert!(app.show_bottom_tool_window);
+        assert_eq!(app.bottom_view, BottomView::CustomActions);
     }
 
     #[test]
