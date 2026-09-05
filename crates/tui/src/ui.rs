@@ -1813,11 +1813,10 @@ fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     let selected = app.custom_actions.selected;
     let items: Vec<ListItem> = if app.custom_actions.actions.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
+        vec![ListItem::new(Line::from(
             "No custom actions declared -- open the command palette and run \
              \"Custom Actions: Manage\" to add one.",
-            Style::default().fg(theme.error_text),
-        )))]
+        ))]
     } else {
         app.custom_actions
             .actions
@@ -1852,7 +1851,21 @@ fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         output[start..]
             .iter()
-            .map(|line| ListItem::new(Line::from(line.as_str())))
+            .map(|line| {
+                // `subprocess::run_and_stream`'s two spawn-failure message
+                // shapes ("{program} not found on PATH" / "failed to run
+                // {program}: {e}") -- flagged in `error_text` so a mistyped
+                // custom-action command is visually distinct from ordinary
+                // stdout/stderr output (`docs/features/tui-custom-
+                // actions.md` §2.3's `ui.rs` bullet).
+                let style =
+                    if line.ends_with("not found on PATH") || line.starts_with("failed to run ") {
+                        Style::default().fg(theme.error_text)
+                    } else {
+                        Style::default()
+                    };
+                ListItem::new(Line::from(Span::styled(line.as_str(), style)))
+            })
             .collect()
     };
     let output_title = match app.custom_actions.running.as_ref() {
