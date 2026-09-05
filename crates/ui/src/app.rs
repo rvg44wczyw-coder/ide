@@ -1536,6 +1536,15 @@ impl IdeApp {
 
     /// No-op if `index` is out of range. No confirmation step, same as
     /// `ide-tui`'s own Manage popup delete.
+    ///
+    /// `editing_index` needs more than an exact-match clear here:
+    /// `Vec::remove` shifts every later element down by one, so deleting a
+    /// row *before* the one currently open for editing would otherwise
+    /// leave `editing_index` pointing at a different action than the one
+    /// the form was populated from -- a later Save would then silently
+    /// overwrite that unrelated action (or, once bounds-checked, push a
+    /// spurious duplicate) instead of failing loudly. Deleting the exact
+    /// row being edited still clears the index outright, same as before.
     fn delete_custom_action(&mut self, index: usize) {
         if index >= self.custom_actions.actions.len() {
             return;
@@ -1544,8 +1553,10 @@ impl IdeApp {
         if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
             crate::custom_actions::save(&root, &self.custom_actions.actions);
         }
-        if self.custom_actions_popup.editing_index == Some(index) {
-            self.custom_actions_popup.editing_index = None;
+        match self.custom_actions_popup.editing_index {
+            Some(i) if i == index => self.custom_actions_popup.editing_index = None,
+            Some(i) if i > index => self.custom_actions_popup.editing_index = Some(i - 1),
+            _ => {}
         }
     }
 
@@ -7478,6 +7489,58 @@ b
         app.delete_custom_action(0);
 
         assert!(app.custom_actions_popup.editing_index.is_none());
+    }
+
+    #[test]
+    fn delete_custom_action_before_the_edited_row_shifts_editing_index_down() {
+        // hacker findings, gui-custom-actions-2026-09-06.md, finding 1:
+        // editing row `c` (index 2), then deleting an earlier, unrelated
+        // row must keep `editing_index` pointing at `c`, not silently
+        // drift onto whatever slid into index 2.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        let action = |n: &str| crate::custom_actions::CustomAction {
+            name: n.to_string(),
+            command: "cmd".to_string(),
+            args: Vec::new(),
+        };
+        app.custom_actions.actions = vec![action("a"), action("b"), action("c")];
+        app.start_editing_custom_action(2);
+        assert_eq!(app.custom_actions_popup.editing_index, Some(2));
+
+        app.delete_custom_action(0);
+
+        assert_eq!(app.custom_actions.actions.len(), 2);
+        assert_eq!(app.custom_actions_popup.editing_index, Some(1));
+        assert_eq!(
+            app.custom_actions.actions[app.custom_actions_popup.editing_index.unwrap()].name,
+            "c"
+        );
+
+        // Saving now must still overwrite `c`, not push a duplicate.
+        app.custom_actions_popup.new_command = "cmd-renamed".to_string();
+        app.confirm_custom_action_form();
+        assert_eq!(app.custom_actions.actions.len(), 2);
+        assert_eq!(app.custom_actions.actions[1].command, "cmd-renamed");
+    }
+
+    #[test]
+    fn delete_custom_action_after_the_edited_row_leaves_editing_index_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        let action = |n: &str| crate::custom_actions::CustomAction {
+            name: n.to_string(),
+            command: "cmd".to_string(),
+            args: Vec::new(),
+        };
+        app.custom_actions.actions = vec![action("a"), action("b"), action("c")];
+        app.start_editing_custom_action(0);
+
+        app.delete_custom_action(2);
+
+        assert_eq!(app.custom_actions_popup.editing_index, Some(0));
     }
 
     #[test]
