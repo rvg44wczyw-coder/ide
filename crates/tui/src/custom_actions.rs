@@ -13,6 +13,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::subprocess::{self, StreamEvent};
 
+/// Hard cap on how many actions `load` will hand back, mirroring
+/// `docker_panel.rs`'s `MAX_DOCKER_LIST_ITEMS`/`k8s_panel.rs`'s
+/// `MAX_K8S_LIST_ITEMS` (500) -- `.ide/custom_actions.json` is untrusted
+/// input the moment it can arrive via a cloned repository (`docs/features/
+/// tui-custom-actions.md` §4), and without this cap a crafted file with an
+/// extreme action count would make `render_custom_actions_panel`/
+/// `render_manage_actions_popup` rebuild an unbounded `Vec<ListItem>`
+/// every single frame the Custom Actions dock tab or Manage popup is open
+/// -- confirmed live (`docs/security-findings/
+/// tui-custom-actions-2026-09-05.md`, finding 1) to cost ~100ms/frame at
+/// 1,000,000 actions, i.e. a real, sustained UI hang, not a one-time cost.
+/// Applied at *load* time (unlike `project_state.rs`'s `MAX_RECENT_FILES`,
+/// enforced only at write time) since this file can be populated by
+/// something other than this feature's own write path.
+const MAX_CUSTOM_ACTIONS: usize = 500;
+
 /// One user-declared, named external command. `args` is already a real
 /// argv (split once, at save time, in `App::confirm_action_form`) -- never
 /// re-split from a raw string at run time.
@@ -36,11 +52,16 @@ pub(crate) struct CustomActionsFile {
 /// `project_state::load`/`state::load` already establish. Never blocks
 /// `App::new`.
 pub(crate) fn load(project_root: &Path) -> Vec<CustomAction> {
-    project_settings::read::<CustomActionsFile>(project_root, ProjectSettingsFile::CustomActions)
-        .ok()
-        .flatten()
-        .unwrap_or_default()
-        .actions
+    let mut actions = project_settings::read::<CustomActionsFile>(
+        project_root,
+        ProjectSettingsFile::CustomActions,
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+    .actions;
+    actions.truncate(MAX_CUSTOM_ACTIONS);
+    actions
 }
 
 /// Best-effort save -- swallows every failure the same way
@@ -166,6 +187,27 @@ mod tests {
         let actions = vec![sample_action("Run tests"), sample_action("Run clippy")];
         save(dir.path(), &actions);
         assert_eq!(load(dir.path()), actions);
+    }
+
+    #[test]
+    fn load_truncates_a_maliciously_oversized_file_to_max_custom_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ide_dir = dir.path().join(".ide");
+        std::fs::create_dir_all(&ide_dir).unwrap();
+        let oversized = CustomActionsFile {
+            actions: (0..MAX_CUSTOM_ACTIONS + 50)
+                .map(|i| sample_action(&format!("action-{i}")))
+                .collect(),
+        };
+        std::fs::write(
+            ide_dir.join("custom_actions.json"),
+            serde_json::to_vec(&oversized).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load(dir.path());
+        assert_eq!(loaded.len(), MAX_CUSTOM_ACTIONS);
+        assert_eq!(loaded[0].name, "action-0");
     }
 
     #[test]
