@@ -36,6 +36,7 @@ mod claude_panel;
 mod claude_terminal;
 mod clone_panel;
 mod commands;
+mod custom_actions;
 mod debug_config;
 mod debug_panel;
 mod docker_panel;
@@ -256,6 +257,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // background even while the panel is closed (`docs/features/
         // tui-cargo-panel.md` §3/§4).
         app.poll_cargo();
+        // Same reasoning, for a running Custom Action (`docs/features/
+        // tui-custom-actions.md` §2.3, T42).
+        app.poll_custom_actions();
         // Same reasoning, for a Find in Path search running in the
         // background while the panel is closed (`docs/features/
         // tui-find-in-path.md` §3.1).
