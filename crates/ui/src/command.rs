@@ -364,6 +364,12 @@ pub fn commands() -> &'static [Command] {
                 id: "ToggleTheme",
                 title: "Toggle Theme",
                 category: "View",
+                // Cycles forward through all three built-in themes (`Light
+                // -> Dark -> Ember -> Light`, `theme/mod.rs`'s `Theme::
+                // next`), not a two-way flip -- the name is kept for
+                // backward compatibility with this id/binding, but a
+                // future reader should not assume "toggle" means exactly
+                // two states.
                 binding: None,
                 action: CommandAction::ToggleTheme,
             },
