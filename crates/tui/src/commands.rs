@@ -187,6 +187,11 @@ pub enum Action {
     FindInPath,
     ReplaceInPath,
     ShowIntentionActions,
+    GenerateMenu,
+    ImplementMethods,
+    OverrideMethods,
+    CreateTest,
+    OptimizeImports,
     Rename,
     ToggleGitPanel,
     JumpToMatchingBracket,
@@ -405,6 +410,48 @@ pub fn commands() -> &'static [Command] {
             // (`docs/features/tui-code-actions-and-rename.md` §2.3).
             binding: Some((KeyModifiers::ALT, KeyCode::Enter)),
             action: Action::ShowIntentionActions,
+        },
+        Command {
+            id: "GenerateMenu",
+            title: "Generate...",
+            // `⌘N`/`Alt+Insert` is a genuine mac/other divergence, not a
+            // `Cmd`->`Ctrl` substitution (`docs/features/
+            // tui-code-generation.md` §1.1/§2.3) -- `ide-ui`'s `other`
+            // binding is used literally here, the same precedent
+            // `GoToFile`'s `Ctrl+Shift+N` and `GoToSymbol`'s
+            // `Ctrl+Alt+Shift+N` already established for this table.
+            binding: Some((KeyModifiers::ALT, KeyCode::Insert)),
+            action: Action::GenerateMenu,
+        },
+        Command {
+            id: "ImplementMethods",
+            title: "Implement Methods...",
+            binding: Some((KeyModifiers::CONTROL, KeyCode::Char('i'))),
+            action: Action::ImplementMethods,
+        },
+        Command {
+            id: "OverrideMethods",
+            title: "Override Methods...",
+            binding: Some((KeyModifiers::CONTROL, KeyCode::Char('o'))),
+            action: Action::OverrideMethods,
+        },
+        Command {
+            id: "CreateTest",
+            title: "Create Test...",
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+                KeyCode::Char('t'),
+            )),
+            action: Action::CreateTest,
+        },
+        Command {
+            id: "OptimizeImports",
+            title: "Optimize Imports",
+            // No default binding, mirroring `ide-ui`'s own -- reachable
+            // from the command palette, bindable by the user
+            // (`docs/features/tui-code-generation.md` §2.3).
+            binding: None,
+            action: Action::OptimizeImports,
         },
         Command {
             id: "Rename",

@@ -312,6 +312,52 @@ pub(crate) struct CodeActionsState {
     pub(crate) selected: usize,
 }
 
+/// Generate menu's list-selection state (`docs/features/
+/// tui-code-generation.md` §2.3) -- its own type, not a reuse of
+/// `CodeActionsState`, since it indexes into `generate_menu_actions()`'s
+/// filtered view, not `lsp.code_actions` wholesale; the two lists can have
+/// different lengths and orderings, so an index meaningful in one is not
+/// meaningful in the other.
+pub(crate) struct GenerateMenuState {
+    pub(crate) selected: usize,
+}
+
+/// The three Generate-menu actions that also have their own direct
+/// keybinding (`docs/features/tui-code-generation.md` §1.1/§2.3) --
+/// matched against whatever rust-analyzer happens to offer via `kind`/
+/// `title`, mirroring `ide-ui`'s own `DirectGenerateKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectGenerateKind {
+    ImplementMethods,
+    OverrideMethods,
+    CreateTest,
+}
+
+impl DirectGenerateKind {
+    fn name(self) -> &'static str {
+        match self {
+            DirectGenerateKind::ImplementMethods => "Implement Methods",
+            DirectGenerateKind::OverrideMethods => "Override Methods",
+            DirectGenerateKind::CreateTest => "Create Test",
+        }
+    }
+
+    fn matches(self, action: &ide_lsp::CodeAction) -> bool {
+        let title = action.title.to_lowercase();
+        match self {
+            DirectGenerateKind::ImplementMethods => {
+                action.kind.as_deref() == Some("quickfix")
+                    && title.contains("implement missing members")
+            }
+            DirectGenerateKind::OverrideMethods => {
+                action.kind.as_deref() == Some("quickfix")
+                    && title.contains("implement default members")
+            }
+            DirectGenerateKind::CreateTest => title.contains("test"),
+        }
+    }
+}
+
 /// Recent Files' typed query and list selection (`docs/features/
 /// tui-recent-files-and-bookmarks.md` §2.3). The candidate list itself is
 /// `nav_state.recent_files` -- this only tracks the live filter/selection,
@@ -785,6 +831,7 @@ pub struct App {
     /// `CodeAction` query for -- mirrors `last_highlighted_target`
     /// (`docs/features/tui-code-actions-and-rename.md` §2.3).
     last_code_actions_target: Option<(PathBuf, Position)>,
+    pub(crate) generate_menu: Option<GenerateMenuState>,
     pub(crate) rename_popup: Option<RenamePopup>,
     /// `(edit, new_name)` awaiting Apply/Cancel -- presence is visibility,
     /// same reasoning `rename_popup` documents.
@@ -983,6 +1030,7 @@ impl App {
             new_claude_terminal: None,
             code_actions: None,
             last_code_actions_target: None,
+            generate_menu: None,
             rename_popup: None,
             pending_rename_preview: None,
             lsp,
@@ -1864,6 +1912,7 @@ impl App {
         self.go_to_symbol = None;
         self.file_structure = None;
         self.code_actions = None;
+        self.generate_menu = None;
         self.rename_popup = None;
         self.pending_rename_preview = None;
         self.git_panel = None;
@@ -4713,6 +4762,105 @@ impl App {
         LoopSignal::Continue
     }
 
+    /// `Generate`'s filtered view of `lsp.code_actions` (`docs/features/
+    /// tui-code-generation.md` §2.3) -- every action whose `kind` is the
+    /// empty string, rust-analyzer's marker for a source-generation assist
+    /// (never `None`, never omitted -- see that doc's §1.1).
+    pub(crate) fn generate_menu_actions(&self) -> Vec<&ide_lsp::CodeAction> {
+        self.lsp
+            .code_actions
+            .iter()
+            .filter(|action| action.kind.as_deref() == Some(""))
+            .collect()
+    }
+
+    /// `Alt+Insert`'s entry point (`docs/features/tui-code-generation.md`
+    /// §2.3/§3.1) -- mirrors `trigger_show_intention_actions`'s own shape
+    /// exactly (unconditional `close_all_overlays()` first), but no-ops
+    /// with a status message when there is nothing to generate, since
+    /// unlike Show Intention Actions an empty Generate menu has no useful
+    /// "open it anyway" state to show.
+    fn trigger_generate_menu(&mut self) {
+        if self.generate_menu_actions().is_empty() {
+            self.status = Some("Generate: nothing to generate here".to_string());
+            return;
+        }
+        self.close_all_overlays();
+        self.generate_menu = Some(GenerateMenuState { selected: 0 });
+    }
+
+    fn handle_generate_menu_key(&mut self, key: KeyEvent) -> LoopSignal {
+        if self.generate_menu.is_none() {
+            return LoopSignal::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.generate_menu = None;
+            }
+            KeyCode::Up => {
+                if let Some(state) = self.generate_menu.as_mut() {
+                    if state.selected > 0 {
+                        state.selected -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                let len = self.generate_menu_actions().len();
+                if let Some(state) = self.generate_menu.as_mut() {
+                    if state.selected + 1 < len {
+                        state.selected += 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self.generate_menu.as_ref().map(|s| s.selected);
+                self.generate_menu = None;
+                if let Some(selected) = selected {
+                    let actions = self.generate_menu_actions();
+                    if let Some(action) = actions.get(selected) {
+                        let index = action.index;
+                        self.lsp.apply_code_action(index);
+                    }
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// `Ctrl+I`/`Ctrl+O`/`Ctrl+Shift+T`'s entry point (`docs/features/
+    /// tui-code-generation.md` §2.3/§3.2/§3.3) -- searches for a single
+    /// non-disabled match rather than opening a menu, mirroring `ide-ui`'s
+    /// own `trigger_direct_generate`.
+    fn trigger_direct_generate(&mut self, kind: DirectGenerateKind) {
+        let found = self
+            .lsp
+            .code_actions
+            .iter()
+            .find(|action| action.disabled_reason.is_none() && kind.matches(action));
+        match found {
+            Some(action) => {
+                let index = action.index;
+                self.lsp.apply_code_action(index);
+            }
+            None => {
+                self.status = Some(format!("{}: not available here", kind.name()));
+            }
+        }
+    }
+
+    /// `Optimize Imports`' entry point (`docs/features/
+    /// tui-code-generation.md` §2.3/§3.4) -- unlike `trigger_direct_
+    /// generate`, this never reaches into `lsp.code_actions` at all; it
+    /// always fires a fresh `OrganizeImports` request, since rust-analyzer
+    /// doesn't surface this as an ambient code action.
+    fn trigger_optimize_imports(&mut self) {
+        let Some(path) = self.active_buffer().map(|b| b.path.clone()) else {
+            return;
+        };
+        self.lsp.request_organize_imports(&path);
+    }
+
     /// Shared apply primitive, ported from `ide-ui`'s own `apply_workspace_
     /// edit` with no behavioural change (`docs/features/
     /// tui-code-actions-and-rename.md` §2.3/§3.1): partitions `edit.edits`
@@ -5212,6 +5360,9 @@ impl App {
         if self.code_actions.is_some() {
             return self.handle_code_actions_key(key);
         }
+        if self.generate_menu.is_some() {
+            return self.handle_generate_menu_key(key);
+        }
         if self.rename_popup.is_some() {
             return self.handle_rename_popup_key(key);
         }
@@ -5301,6 +5452,7 @@ impl App {
             || self.recent_files.is_some()
             || self.bookmarks_popup.is_some()
             || self.code_actions.is_some()
+            || self.generate_menu.is_some()
             || self.rename_popup.is_some()
             || self.pending_rename_preview.is_some()
             || self.blame_popup.is_some()
@@ -5588,6 +5740,15 @@ impl App {
             Action::FindInPath => self.toggle_search_panel(),
             Action::ReplaceInPath => self.trigger_replace_in_path(),
             Action::ShowIntentionActions => self.trigger_show_intention_actions(),
+            Action::GenerateMenu => self.trigger_generate_menu(),
+            Action::ImplementMethods => {
+                self.trigger_direct_generate(DirectGenerateKind::ImplementMethods)
+            }
+            Action::OverrideMethods => {
+                self.trigger_direct_generate(DirectGenerateKind::OverrideMethods)
+            }
+            Action::CreateTest => self.trigger_direct_generate(DirectGenerateKind::CreateTest),
+            Action::OptimizeImports => self.trigger_optimize_imports(),
             Action::Rename => self.trigger_rename(),
             Action::ToggleGitPanel => self.toggle_git_panel(),
             Action::GitBranches => self.trigger_git_branches(),
@@ -18420,5 +18581,295 @@ mod tests {
         assert_eq!(buf.path, root.join("a.txt"));
         let offset = buf.buffer.text_buffer().selections().primary().head;
         assert_eq!(offset, 6, "must record the real caret, not a hardcoded 0");
+    }
+
+    // -- T39: Code Generation (`tui-code-generation.md`) --
+
+    fn generate_action(index: usize, title: &str) -> ide_lsp::CodeAction {
+        ide_lsp::CodeAction {
+            index,
+            title: title.to_string(),
+            kind: Some(String::new()),
+            is_preferred: false,
+            disabled_reason: None,
+        }
+    }
+
+    fn quickfix_action(index: usize, title: &str) -> ide_lsp::CodeAction {
+        ide_lsp::CodeAction {
+            index,
+            title: title.to_string(),
+            kind: Some("quickfix".to_string()),
+            is_preferred: false,
+            disabled_reason: None,
+        }
+    }
+
+    #[test]
+    fn direct_generate_kind_matches_implement_methods_only_on_kind_and_title() {
+        let good = quickfix_action(0, "Implement missing members");
+        let wrong_kind = generate_action(0, "Implement missing members");
+        let wrong_title = quickfix_action(0, "Implement default members");
+
+        assert!(DirectGenerateKind::ImplementMethods.matches(&good));
+        assert!(!DirectGenerateKind::ImplementMethods.matches(&wrong_kind));
+        assert!(!DirectGenerateKind::ImplementMethods.matches(&wrong_title));
+    }
+
+    #[test]
+    fn direct_generate_kind_matches_override_methods_only_on_kind_and_title() {
+        let good = quickfix_action(0, "Implement default members");
+        let wrong_kind = generate_action(0, "Implement default members");
+
+        assert!(DirectGenerateKind::OverrideMethods.matches(&good));
+        assert!(!DirectGenerateKind::OverrideMethods.matches(&wrong_kind));
+    }
+
+    #[test]
+    fn direct_generate_kind_matches_create_test_kind_agnostically() {
+        let generate_kind = generate_action(0, "Generate a test module");
+        let quickfix_kind = quickfix_action(0, "Add test for this function");
+        let no_match = generate_action(0, "Implement missing members");
+
+        assert!(DirectGenerateKind::CreateTest.matches(&generate_kind));
+        assert!(DirectGenerateKind::CreateTest.matches(&quickfix_kind));
+        assert!(!DirectGenerateKind::CreateTest.matches(&no_match));
+    }
+
+    #[test]
+    fn generate_menu_actions_filters_to_empty_kind_only() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(generate_action(0, "Add derive"));
+        app.lsp.code_actions.push(quickfix_action(1, "Fix import"));
+        app.lsp
+            .code_actions
+            .push(generate_action(2, "Generate getter"));
+
+        let actions = app.generate_menu_actions();
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].title, "Add derive");
+        assert_eq!(actions[1].title, "Generate getter");
+    }
+
+    #[test]
+    fn trigger_generate_menu_with_no_matching_actions_sets_status_and_stays_closed() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(quickfix_action(0, "Fix import"));
+
+        app.run_action(Action::GenerateMenu);
+
+        assert!(app.generate_menu.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Generate: nothing to generate here")
+        );
+    }
+
+    #[test]
+    fn trigger_generate_menu_opens_the_popup_and_closes_other_overlays() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(generate_action(0, "Add derive"));
+        app.goto = Some(GotoState {
+            title: "Declaration",
+            results: vec![location(a, 0, 0)],
+            selected: 0,
+        });
+        app.notifications_open = true;
+
+        app.run_action(Action::GenerateMenu);
+
+        assert!(app.generate_menu.is_some());
+        assert_eq!(app.generate_menu.as_ref().unwrap().selected, 0);
+        assert!(app.goto.is_none());
+        assert!(!app.notifications_open);
+    }
+
+    #[test]
+    fn generate_menu_key_up_and_down_are_clamped_to_the_filtered_action_count() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(generate_action(0, "First"));
+        app.lsp
+            .code_actions
+            .push(quickfix_action(1, "Not generate"));
+        app.lsp.code_actions.push(generate_action(2, "Second"));
+        app.generate_menu = Some(GenerateMenuState { selected: 0 });
+
+        app.handle_key(plain_key(KeyCode::Up)); // clamped at 0
+        assert_eq!(app.generate_menu.as_ref().unwrap().selected, 0);
+
+        app.handle_key(plain_key(KeyCode::Down)); // -> 1 (of 2 filtered)
+        assert_eq!(app.generate_menu.as_ref().unwrap().selected, 1);
+
+        app.handle_key(plain_key(KeyCode::Down)); // clamped at len - 1
+        assert_eq!(app.generate_menu.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn generate_menu_key_esc_closes_the_popup() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(generate_action(0, "First"));
+        app.generate_menu = Some(GenerateMenuState { selected: 0 });
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(app.generate_menu.is_none());
+    }
+
+    #[test]
+    fn generate_menu_key_enter_on_an_empty_filtered_list_closes_it_without_sending_anything() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.generate_menu = Some(GenerateMenuState { selected: 0 });
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.generate_menu.is_none());
+    }
+
+    #[test]
+    fn generate_menu_key_enter_applies_the_selected_filtered_actions_absolute_index() {
+        // TOCTOU/filtered-vs-absolute-index proof (`docs/features/
+        // tui-code-generation.md` §4/§5): the filtered list's position 1
+        // ("Second") is `lsp.code_actions`' absolute index 2, not 1 -- a
+        // bug using `state.selected` directly against `lsp.code_actions`
+        // would apply the wrong action ("Not generate" at index 1).
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down)); // select a.txt's tree row
+        app.handle_key(plain_key(KeyCode::Enter)); // open a.txt
+        app.lsp.code_actions.push(generate_action(0, "First"));
+        app.lsp
+            .code_actions
+            .push(quickfix_action(1, "Not generate"));
+        app.lsp.code_actions.push(generate_action(2, "Second"));
+        app.generate_menu = Some(GenerateMenuState { selected: 1 });
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.generate_menu.is_none());
+    }
+
+    #[test]
+    fn trigger_direct_generate_applies_a_matching_non_disabled_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+        app.lsp
+            .code_actions
+            .push(quickfix_action(0, "Implement missing members"));
+
+        app.run_action(Action::ImplementMethods);
+
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn trigger_direct_generate_with_no_match_sets_a_status() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.run_action(Action::ImplementMethods);
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Implement Methods: not available here")
+        );
+    }
+
+    #[test]
+    fn trigger_direct_generate_skips_a_disabled_match() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let mut disabled = quickfix_action(0, "Implement missing members");
+        disabled.disabled_reason = Some("no missing members".to_string());
+        app.lsp.code_actions.push(disabled);
+
+        app.run_action(Action::ImplementMethods);
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Implement Methods: not available here")
+        );
+    }
+
+    #[test]
+    fn trigger_direct_generate_create_test_matches_kind_agnostically() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp
+            .code_actions
+            .push(generate_action(0, "Generate a test"));
+
+        app.run_action(Action::CreateTest);
+
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn trigger_optimize_imports_with_no_active_tab_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.run_action(Action::OptimizeImports);
+
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn trigger_optimize_imports_with_an_active_tab_is_a_noop_with_no_client() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        // `request_organize_imports` no-ops with no client running (`ide_
+        // lsp_bridge` convention); this only proves the call is reachable
+        // and doesn't panic without an active `LspClient`.
+        app.run_action(Action::OptimizeImports);
+
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn close_all_overlays_clears_the_generate_menu() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.generate_menu = Some(GenerateMenuState { selected: 0 });
+
+        app.close_all_overlays();
+
+        assert!(app.generate_menu.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_reports_true_when_only_the_generate_menu_is_set() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.generate_menu = Some(GenerateMenuState { selected: 0 });
+
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn opening_the_generate_menu_leaves_the_code_actions_popup_closed_and_vice_versa() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(generate_action(0, "Add derive"));
+
+        app.code_actions = Some(CodeActionsState { selected: 0 });
+        app.run_action(Action::GenerateMenu);
+
+        assert!(app.generate_menu.is_some());
+        assert!(app.code_actions.is_none());
     }
 }

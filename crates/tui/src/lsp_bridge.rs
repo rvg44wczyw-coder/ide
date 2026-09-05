@@ -360,6 +360,24 @@ impl LspBridge {
         self.send(LspRequest::ApplyCodeAction { index });
     }
 
+    /// Sends `LspRequest::OrganizeImports { path }` -- no target-tracking
+    /// field of its own (`docs/features/tui-code-generation.md` §1.1/§2.3):
+    /// the response reuses the already-existing `workspace_edit`/
+    /// `workspace_edit_label`/`workspace_edit_ready` fields `ApplyCodeAction`
+    /// already fills, since both produce the exact same `WorkspaceEditReady`
+    /// event shape. No-op with no client running, same as `apply_code_action`
+    /// just above (`self.send` already no-ops in that case too, but the
+    /// explicit guard here matches this struct's own established
+    /// convention of never relying on `send`'s no-op silently).
+    pub(crate) fn request_organize_imports(&self, path: &Path) {
+        if self.client.is_none() {
+            return;
+        }
+        self.send(LspRequest::OrganizeImports {
+            path: path.to_path_buf(),
+        });
+    }
+
     /// No-op with no client running. Records `(path, position)` as the
     /// target the eventual response answers, and clears any previous
     /// answer -- same "clear at send-time" convention `request_hover`
@@ -787,6 +805,12 @@ mod tests {
     }
 
     #[test]
+    fn request_organize_imports_with_no_client_running_is_a_noop() {
+        let bridge = LspBridge::default();
+        bridge.request_organize_imports(Path::new("/f.rs"));
+    }
+
+    #[test]
     fn request_prepare_rename_with_no_client_running_is_a_noop() {
         let mut bridge = LspBridge::default();
         bridge.request_prepare_rename(Path::new("/f.rs"), position());
@@ -1011,5 +1035,12 @@ mod tests {
         bridge.request_format(Path::new("/f.rs"), 4, true);
         assert!(!bridge.format_ready);
         assert_eq!(bridge.format_path, Some(PathBuf::from("/f.rs")));
+
+        // No dedicated state to assert on -- this only proves the
+        // `is_running` gate lets the send through without panicking, same
+        // as `request_semantic_tokens` above; the response reuses
+        // `workspace_edit_ready` and friends, already exercised by
+        // `ApplyCodeAction`'s own tests.
+        bridge.request_organize_imports(Path::new("/f.rs"));
     }
 }
