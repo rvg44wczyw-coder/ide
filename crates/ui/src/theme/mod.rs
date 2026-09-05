@@ -10,7 +10,7 @@ mod fonts;
 mod palette;
 
 pub use fonts::{install_fonts, UI_MEDIUM};
-pub use palette::{DARCULA, INTELLIJ_LIGHT};
+pub use palette::{DARCULA, EMBER, INTELLIJ_LIGHT};
 
 use eframe::egui;
 use egui::Color32;
@@ -21,18 +21,25 @@ use ide_lsp::DiagnosticSeverity;
 pub enum Theme {
     Light,
     Dark,
+    Ember,
 }
 
 impl Theme {
-    pub fn toggled(self) -> Self {
+    /// Cycles forward through every built-in theme: `Light -> Dark ->
+    /// Ember -> Light`. `ToggleTheme` (`command.rs`) has no bound
+    /// keybinding, only a command-palette/menu entry a user can invoke
+    /// repeatedly -- a fixed forward cycle is the natural generalisation of
+    /// the old two-way toggle now that there are three options.
+    pub fn next(self) -> Self {
         match self {
             Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::Light,
+            Theme::Dark => Theme::Ember,
+            Theme::Ember => Theme::Light,
         }
     }
 
     pub fn is_dark(self) -> bool {
-        matches!(self, Theme::Dark)
+        matches!(self, Theme::Dark | Theme::Ember)
     }
 
     /// The palette backing this theme. `&'static` -- tokens are compile-time
@@ -41,6 +48,7 @@ impl Theme {
         match self {
             Theme::Light => &INTELLIJ_LIGHT,
             Theme::Dark => &DARCULA,
+            Theme::Ember => &EMBER,
         }
     }
 
@@ -295,23 +303,28 @@ pub struct TextSizes {
 /// `Heading` text style names a custom font family, and egui panics on a
 /// family bound to no fonts.
 ///
-/// Writes *both* theme slots and then pins egui's preference. egui 0.36 keeps
-/// a separate `Style` per theme and picks between them by system preference,
-/// so writing only the active slot would let an OS theme change silently
-/// swap the app's palette out from under the user's own choice.
+/// `egui::Theme` is a strict binary (`Dark`/`Light`, an OS-preference
+/// concept) with exactly two `Style` slots -- there is no third slot for
+/// `Theme::Ember` to occupy independently, so `Ember` shares egui's `Dark`
+/// slot with `Theme::Dark`. Only one of them is ever the *active* theme's
+/// own visuals at a time: this writes the currently-selected app-level
+/// theme's own visuals into whichever single slot its [`Theme::is_dark`]
+/// maps to, then pins `ctx.set_theme` to that same slot, so the inactive
+/// slot is never read while it isn't selected (`docs/features/themes.md`
+/// §2.1/§4 -- an earlier revision of this function defensively filled
+/// *both* slots on every call with a fixed `Dark`=Darcula/`Light`=IntelliJ
+/// Light mapping, which broke the moment a second dark theme needed to
+/// share the `Dark` slot: selecting `Ember` would activate the slot while
+/// it still held `Darcula`'s colours).
 pub fn apply(ctx: &egui::Context, theme: Theme) {
-    for (slot, source) in [
-        (egui::Theme::Dark, Theme::Dark),
-        (egui::Theme::Light, Theme::Light),
-    ] {
-        ctx.set_visuals_of(slot, source.visuals());
-        ctx.style_mut_of(slot, |style| apply_metrics(style, source.tokens()));
-    }
-    ctx.set_theme(if theme.is_dark() {
+    let slot = if theme.is_dark() {
         egui::Theme::Dark
     } else {
         egui::Theme::Light
-    });
+    };
+    ctx.set_visuals_of(slot, theme.visuals());
+    ctx.style_mut_of(slot, |style| apply_metrics(style, theme.tokens()));
+    ctx.set_theme(slot);
 }
 
 fn apply_metrics(style: &mut egui::Style, t: &Tokens) {
@@ -365,9 +378,10 @@ mod tests {
     use eframe::Storage as _;
 
     #[test]
-    fn theme_toggle_flips() {
-        assert_eq!(Theme::Light.toggled(), Theme::Dark);
-        assert_eq!(Theme::Dark.toggled(), Theme::Light);
+    fn theme_next_cycles_through_all_three_and_back() {
+        assert_eq!(Theme::Light.next(), Theme::Dark);
+        assert_eq!(Theme::Dark.next(), Theme::Ember);
+        assert_eq!(Theme::Ember.next(), Theme::Light);
     }
 
     #[test]
@@ -377,13 +391,15 @@ mod tests {
             Theme::Light.tokens().color.bg_base,
             INTELLIJ_LIGHT.color.bg_base
         );
+        assert_eq!(Theme::Ember.tokens().color.bg_base, EMBER.color.bg_base);
         assert!(Theme::Dark.is_dark());
         assert!(!Theme::Light.is_dark());
+        assert!(Theme::Ember.is_dark());
     }
 
     #[test]
     fn visuals_carry_the_mapped_tokens() {
-        for theme in [Theme::Dark, Theme::Light] {
+        for theme in [Theme::Dark, Theme::Light, Theme::Ember] {
             let c = &theme.tokens().color;
             let v = theme.visuals();
             assert_eq!(v.dark_mode, theme.is_dark());
@@ -403,7 +419,7 @@ mod tests {
     /// an override set, every plain label would ignore `fg_stroke`.
     #[test]
     fn plain_text_color_comes_from_noninteractive_not_an_override() {
-        for theme in [Theme::Dark, Theme::Light] {
+        for theme in [Theme::Dark, Theme::Light, Theme::Ember] {
             let v = theme.visuals();
             let c = &theme.tokens().color;
             assert_eq!(v.override_text_color, None);
@@ -414,14 +430,16 @@ mod tests {
 
     #[test]
     fn both_widget_backgrounds_come_from_the_surface_token() {
-        let v = Theme::Dark.visuals();
-        let c = &DARCULA.color;
-        assert_eq!(v.widgets.inactive.bg_fill, c.bg_elevated);
-        assert_eq!(v.widgets.inactive.weak_bg_fill, c.bg_elevated);
-        assert_eq!(v.widgets.hovered.bg_fill, c.bg_hover);
-        assert_eq!(v.widgets.hovered.weak_bg_fill, c.bg_hover);
-        assert_eq!(v.widgets.inactive.fg_stroke.color, c.fg_secondary);
-        assert_eq!(v.widgets.hovered.fg_stroke.color, c.fg_primary);
+        for theme in [Theme::Dark, Theme::Light, Theme::Ember] {
+            let v = theme.visuals();
+            let c = &theme.tokens().color;
+            assert_eq!(v.widgets.inactive.bg_fill, c.bg_elevated);
+            assert_eq!(v.widgets.inactive.weak_bg_fill, c.bg_elevated);
+            assert_eq!(v.widgets.hovered.bg_fill, c.bg_hover);
+            assert_eq!(v.widgets.hovered.weak_bg_fill, c.bg_hover);
+            assert_eq!(v.widgets.inactive.fg_stroke.color, c.fg_secondary);
+            assert_eq!(v.widgets.hovered.fg_stroke.color, c.fg_primary);
+        }
     }
 
     #[test]
@@ -496,7 +514,7 @@ mod tests {
             Some(Theme::Dark)
         );
 
-        for theme in [Theme::Dark, Theme::Light] {
+        for theme in [Theme::Dark, Theme::Light, Theme::Ember] {
             let mut storage = FakeStorage::default();
             eframe::set_value(&mut storage, "ide_theme", &theme);
             assert_eq!(
@@ -510,35 +528,68 @@ mod tests {
     fn apply_after_install_fonts_resolves_every_text_style() {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
-        apply(&ctx, Theme::Dark);
 
-        // Resolving `Heading` exercises the custom family; egui panics on a
-        // family bound to no fonts, so reaching the assert is the proof.
-        ctx.begin_pass(egui::RawInput::default());
-        let style = ctx.global_style();
-        for text_style in [
-            egui::TextStyle::Small,
-            egui::TextStyle::Body,
-            egui::TextStyle::Button,
-            egui::TextStyle::Heading,
-            egui::TextStyle::Monospace,
-        ] {
-            let font_id = text_style.resolve(&style);
-            let height = ctx.fonts_mut(|f| f.row_height(&font_id));
-            assert!(height > 0.0, "{text_style:?} resolved to zero height");
+        for theme in [Theme::Dark, Theme::Light, Theme::Ember] {
+            apply(&ctx, theme);
+
+            // Resolving `Heading` exercises the custom family; egui panics
+            // on a family bound to no fonts, so reaching the assert is the
+            // proof.
+            ctx.begin_pass(egui::RawInput::default());
+            let style = ctx.global_style();
+            for text_style in [
+                egui::TextStyle::Small,
+                egui::TextStyle::Body,
+                egui::TextStyle::Button,
+                egui::TextStyle::Heading,
+                egui::TextStyle::Monospace,
+            ] {
+                let font_id = text_style.resolve(&style);
+                let height = ctx.fonts_mut(|f| f.row_height(&font_id));
+                assert!(height > 0.0, "{text_style:?} resolved to zero height");
+            }
+            // No renderer here to upload the font atlas epaint just built,
+            // and `TexturesDelta`'s `Drop` asserts it was applied --
+            // `clear` is the escape hatch epaint documents for exactly
+            // this case.
+            let mut output = ctx.end_pass();
+            output.textures_delta.clear();
+
+            let expected_slot = if theme.is_dark() {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            };
+            assert_eq!(ctx.theme(), expected_slot);
+            assert_eq!(
+                ctx.global_style().visuals.panel_fill,
+                theme.tokens().color.bg_base
+            );
         }
-        // No renderer here to upload the font atlas epaint just built, and
-        // `TexturesDelta`'s `Drop` asserts it was applied -- `clear` is the
-        // escape hatch epaint documents for exactly this case.
-        let mut output = ctx.end_pass();
-        output.textures_delta.clear();
+    }
 
+    /// The exact scenario the old `apply` got wrong (`docs/features/
+    /// themes.md` §2.1): `Ember` and `Dark` share egui's single native
+    /// `Dark` slot, so switching *to* `Ember` must actually overwrite that
+    /// slot with `EMBER`'s own visuals rather than leaving whatever `Dark`
+    /// last wrote there.
+    #[test]
+    fn switching_from_dark_to_ember_actually_replaces_the_shared_slots_visuals() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+
+        apply(&ctx, Theme::Dark);
         assert_eq!(ctx.theme(), egui::Theme::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, DARCULA.color.bg_base);
+
+        apply(&ctx, Theme::Ember);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        assert_eq!(ctx.global_style().visuals.panel_fill, EMBER.color.bg_base);
+        assert_ne!(EMBER.color.bg_base, DARCULA.color.bg_base);
     }
 
     #[test]
-    fn apply_pins_the_theme_and_fills_both_slots() {
+    fn apply_pins_light_independently_of_the_shared_dark_slot() {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
 
@@ -548,32 +599,30 @@ mod tests {
             ctx.global_style().visuals.panel_fill,
             INTELLIJ_LIGHT.color.bg_base
         );
-        // The dark slot is populated too, so an OS theme change can't fall
-        // back to egui's stock palette.
-        ctx.set_theme(egui::Theme::Dark);
-        assert_eq!(ctx.global_style().visuals.panel_fill, DARCULA.color.bg_base);
     }
 
     #[test]
     fn metrics_come_from_the_spacing_tokens() {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
-        apply(&ctx, Theme::Dark);
-        let style = ctx.global_style();
-        let t = &DARCULA;
-        assert_eq!(
-            style.spacing.item_spacing,
-            egui::vec2(t.space.md, t.space.sm)
-        );
-        assert_eq!(style.spacing.indent, t.space.lg);
-        assert_eq!(
-            style.spacing.window_margin,
-            egui::Margin::same(t.space.md as i8)
-        );
-        assert_eq!(
-            style.visuals.window_corner_radius,
-            egui::CornerRadius::same(t.radius.md)
-        );
+        for theme in [Theme::Dark, Theme::Light, Theme::Ember] {
+            apply(&ctx, theme);
+            let style = ctx.global_style();
+            let t = theme.tokens();
+            assert_eq!(
+                style.spacing.item_spacing,
+                egui::vec2(t.space.md, t.space.sm)
+            );
+            assert_eq!(style.spacing.indent, t.space.lg);
+            assert_eq!(
+                style.spacing.window_margin,
+                egui::Margin::same(t.space.md as i8)
+            );
+            assert_eq!(
+                style.visuals.window_corner_radius,
+                egui::CornerRadius::same(t.radius.md)
+            );
+        }
     }
 
     /// Doc §4.1: colour literals live in `theme/` and nowhere else, so a

@@ -1322,7 +1322,7 @@ impl IdeApp {
     // ---- pure logic (unit-tested below) ----
 
     fn toggle_theme(&mut self, ctx: &egui::Context) {
-        self.theme = self.theme.toggled();
+        self.theme = self.theme.next();
         crate::theme::apply(ctx, self.theme);
     }
 
