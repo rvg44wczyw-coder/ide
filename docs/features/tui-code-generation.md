@@ -196,7 +196,17 @@ impl DirectGenerateKind {
 
 - `generate_menu: Option<GenerateMenuState>` — presence is visibility,
   same convention `code_actions`/`rename_popup`/every other popup-shaped
-  field in this struct already uses.
+  field in this struct already uses. Added to **both** `close_all_
+  overlays()`'s reset list (`self.generate_menu = None;`, alongside its
+  existing `self.code_actions = None;`) and `any_popup_open()`'s
+  disjunction (`|| self.generate_menu.is_some()`) — omitting either would
+  be a real bug, not just an inconsistency: without the first, a still-open
+  Generate menu could survive an unrelated overlay-closing action that
+  every other popup already correctly gets closed by; without the second,
+  `handle_mouse_click`'s `any_popup_open()` guard (`app.rs:5348-5351`)
+  would let a mouse click fall through to the tree/editor underneath an
+  open Generate menu instead of being swallowed by it, the same way every
+  other popup already is.
 - `fn generate_menu_actions(&self) -> Vec<&ide_lsp::CodeAction>` — the
   shared filter: `self.lsp.code_actions.iter().filter(|a| a.kind.as_deref()
   == Some("")).collect()`. Called fresh by `trigger_generate_menu` (to
@@ -210,13 +220,16 @@ impl DirectGenerateKind {
   (`Action::GenerateMenu`, §1.1). No-op-with-status if
   `self.generate_menu_actions().is_empty()`
   (`self.status = Some("Generate: nothing to generate here")`); otherwise
-  `self.generate_menu = Some(GenerateMenuState { selected: 0 })`. Does
-  **not** call `close_all_overlays()` first, unlike `trigger_show_
-  intention_actions` — matching `handle_code_actions_key`'s own precedent
-  of never needing to (both popups are only ever triggered from ordinary
-  editor focus, never from inside another modal, so there is nothing to
-  close first in practice, and the existing intention-actions popup was
-  never given this call for the same reason).
+  calls `self.close_all_overlays()` first, then
+  `self.generate_menu = Some(GenerateMenuState { selected: 0 })` —
+  mirroring `trigger_show_intention_actions`'s own precedent exactly
+  (`app.rs:4681-4684`: `close_all_overlays()` unconditionally, then set the
+  popup state), not a deliberate divergence from it.
+- Key-dispatch wiring: the main key-routing chain (`app.rs`, around the
+  existing `if self.code_actions.is_some() { return self.handle_code_
+  actions_key(key); }` check) gains a matching
+  `if self.generate_menu.is_some() { return self.handle_generate_menu_key
+  (key); }` arm at the same priority tier.
 - `fn handle_generate_menu_key(&mut self, key: KeyEvent) -> LoopSignal` —
   the same `Esc`/`Up`/`Down`/`Enter` shape as `handle_code_actions_key`,
   operating on `self.generate_menu_actions()`'s length/entries instead of
@@ -538,3 +551,24 @@ Skipped — the sequence is byte-for-byte the same shape `code-generation
 `ide-tui`); a second diagram would duplicate it without adding
 information, the same reasoning `tui-formatting.md` §7 already gave for
 its own skip.
+
+## Revision notes
+
+- §2.3: `trigger_generate_menu`'s original text both contradicted itself
+  and misdescribed the actual codebase (`rev` finding) — it claimed
+  Generate deliberately skips `close_all_overlays()` "unlike
+  `trigger_show_intention_actions`," then claimed in the same breath that
+  intention-actions *also* never calls it; neither is true
+  (`app.rs:4681-4684` shows `trigger_show_intention_actions` calling
+  `close_all_overlays()` unconditionally). Corrected: `trigger_generate_
+  menu` now calls it too, mirroring its sibling exactly, no divergence.
+- §2.3: added two integration points `rev`'s independent source check
+  found missing entirely — `close_all_overlays()` must reset
+  `self.generate_menu = None;` (alongside its existing `code_actions`
+  reset) and `any_popup_open()` must gain `|| self.generate_menu.is_some()`
+  (it gates mouse-click routing, `app.rs:5348-5351` — without it, a click
+  while the Generate menu is open would fall through to the tree/editor
+  underneath instead of being swallowed by the popup, a real input bug,
+  not just a documentation nicety). Also added the key-dispatch wiring
+  note (a `generate_menu.is_some()` arm alongside the existing
+  `code_actions.is_some()` one in the main key-routing chain).
