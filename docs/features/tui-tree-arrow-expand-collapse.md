@@ -38,9 +38,15 @@ the existing `toggle_expand_selected`:
 /// `Right` arrow's tree-navigation primitive: if the selected row is a
 /// collapsed directory, expands it (selection unchanged). If the selected
 /// row is a directory that's already expanded, moves the selection to its
-/// first child (the immediately-following row in `visible_rows`, since
-/// rows are depth-first). No-op on a file row or an expanded directory
-/// with no children (nothing to descend into).
+/// first child -- but only after confirming the immediately-following row
+/// in `visible_rows` is actually a child (`rows[selected + 1].depth ==
+/// row.depth + 1`), not a sibling. That check matters specifically for an
+/// **empty, already-expanded** directory: `push_rows` only appends rows
+/// for children that exist, so with none, the row at `selected + 1` (if
+/// any) is the directory's own next sibling (same depth) or an ancestor's
+/// next sibling (shallower depth) -- never a child. No-op on a file row or
+/// an expanded directory whose next row fails that depth check (nothing
+/// to descend into).
 pub fn expand_or_descend_selected(&mut self, root: &DirEntry);
 
 /// `Left` arrow's tree-navigation primitive: if the selected row is an
@@ -130,9 +136,15 @@ primitives those already use.
   re-scans the tree structurally; it relies on `visible_rows()`'s
   depth-first ordering guarantee (already relied on by
   `toggle_expand_selected`'s own tests, e.g.
-  `expanding_a_directory_reveals_its_children_at_the_next_depth`), so the
-  child row is always at `selected + 1` immediately after the parent's own
-  row.
+  `expanding_a_directory_reveals_its_children_at_the_next_depth`) that
+  *when a child exists*, it is always at `selected + 1` immediately after
+  the parent's own row. That guarantee does not by itself prove a child
+  exists — an empty, already-expanded directory has no row at all past
+  itself that belongs to it. The implementation must therefore check
+  `rows.get(selected + 1).is_some_and(|next| next.depth == row.depth + 1)`
+  before moving the selection there; failing that check (row missing, or
+  present but at `depth <= row.depth`, meaning it's a sibling/uncle, not a
+  child) is the empty-directory no-op case.
 - `collapse_or_ascend_selected`'s "ascend to parent" branch walks
   `visible_rows()` backward from `selected` looking for the first row with
   `depth == row.depth - 1` — this is `O(depth)` in the worst case (shallow
@@ -178,3 +190,13 @@ None beyond what `crates/tui/src/tree.rs` already imports
 
 Skipped — the change is small and fully described by §3's behavior table;
 a diagram wouldn't add clarity beyond it.
+
+## Revision notes
+
+- `rev` (doc review, round 1) found that §2.3/§4's description of the
+  "descend to first child" branch didn't specify the guard needed to
+  distinguish a real child row from an empty expanded directory's next
+  *sibling* row at `selected + 1` — `visible_rows()`'s depth-first order
+  only guarantees a child is at `selected + 1` when one exists; it says
+  nothing about what's there when it doesn't. Fixed by adding the explicit
+  `rows[selected + 1].depth == row.depth + 1` guard to both sections.
