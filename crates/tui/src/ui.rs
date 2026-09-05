@@ -154,6 +154,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.code_actions.is_some() {
         render_code_actions_popup(frame, app, size);
     }
+    if app.generate_menu.is_some() {
+        render_generate_menu_popup(frame, app, size);
+    }
     if app.rename_popup.is_some() {
         render_rename_popup(frame, app, size);
     }
@@ -1978,6 +1981,54 @@ fn render_code_actions_popup(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Show Intention Actions  (Enter: apply, Esc: close)");
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// `Alt+Insert`'s popup (`docs/features/tui-code-generation.md` §2.3) --
+/// mirrors `render_code_actions_popup`'s exact shape, sourcing rows from
+/// the filtered `generate_menu_actions()` view instead of `lsp.code_
+/// actions` wholesale.
+fn render_generate_menu_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.generate_menu.as_ref() else {
+        return;
+    };
+    let actions = app.generate_menu_actions();
+    let width = area.width.clamp(30, 70);
+    let height = (actions.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = if actions.is_empty() {
+        vec![ListItem::new(Line::from("Nothing to generate here."))]
+    } else {
+        actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let style = if i == state.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let label = if action.disabled_reason.is_some() {
+                    format!("{} (disabled)", action.title)
+                } else {
+                    action.title.clone()
+                };
+                ListItem::new(Line::from(Span::styled(label, style)))
+            })
+            .collect()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Generate  (Enter: apply, Esc: close)");
     frame.render_widget(List::new(items).block(block), popup);
 }
 
