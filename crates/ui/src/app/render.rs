@@ -2160,6 +2160,90 @@ impl IdeApp {
         }
     }
 
+    /// The Manage Custom Actions popup (`docs/features/custom-actions.md`
+    /// §2.4): list of declared actions with Edit/Delete per row, plus a
+    /// Create/Save form -- structure mirrors `render_worktrees_popup` above.
+    fn render_custom_actions_popup(&mut self, ctx: &egui::Context) {
+        if !self.custom_actions_popup.open {
+            return;
+        }
+        if self.project.is_none() {
+            self.custom_actions_popup.open = false;
+            return;
+        }
+
+        let mut open = true;
+        let mut edit_index: Option<usize> = None;
+        let mut delete_index: Option<usize> = None;
+        let mut confirm = false;
+
+        egui::Window::new("Custom Actions")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (i, action) in self.custom_actions.actions.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "{} — {} {}",
+                                    action.name,
+                                    action.command,
+                                    action.args.join(" ")
+                                ));
+                                if ui.small_button("Edit").clicked() {
+                                    edit_index = Some(i);
+                                }
+                                if ui.small_button("Delete").clicked() {
+                                    delete_index = Some(i);
+                                }
+                            });
+                        }
+                    });
+
+                ui.separator();
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.custom_actions_popup.new_name)
+                        .hint_text("Name"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.custom_actions_popup.new_command)
+                        .hint_text("Command"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.custom_actions_popup.new_args)
+                        .hint_text("Args (whitespace-separated)"),
+                );
+                let save_label = if self.custom_actions_popup.editing_index.is_some() {
+                    "Save"
+                } else {
+                    "Create"
+                };
+                if ui.button(save_label).clicked() {
+                    confirm = true;
+                }
+
+                if let Some(err) = &self.custom_actions_popup.error {
+                    ui.colored_label(self.theme.tokens().color.danger, err);
+                }
+            });
+
+        if let Some(i) = edit_index {
+            self.start_editing_custom_action(i);
+        }
+        if let Some(i) = delete_index {
+            self.delete_custom_action(i);
+        }
+        if confirm {
+            self.confirm_custom_action_form();
+        }
+        if !open {
+            self.custom_actions_popup.open = false;
+        }
+    }
+
     /// The blame gutter's click popup (`docs/features/
     /// git-branches-and-blame.md` §2.2.3): full `CommitDetail` for the
     /// clicked annotation's commit, looked up live each time it's open
@@ -3373,6 +3457,72 @@ impl IdeApp {
             });
     }
 
+    /// The Custom Actions dock tab (`docs/features/custom-actions.md` §2.4):
+    /// a Run button, a click-to-select list of declared actions, and a
+    /// streamed output area below.
+    fn render_custom_actions_panel(&mut self, ui: &mut egui::Ui) {
+        let running = self.custom_actions.running.is_some();
+        let root = self.project.as_ref().map(|p| p.root().to_path_buf());
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running && root.is_some(), egui::Button::new("Run"))
+                .clicked()
+            {
+                if let Some(root) = &root {
+                    self.custom_actions.run_selected(root);
+                }
+            }
+            if ui.button("Manage...").clicked() {
+                self.open_custom_actions_popup();
+            }
+        });
+
+        if self.custom_actions.actions.is_empty() {
+            ui.label("No custom actions declared yet.");
+            return;
+        }
+
+        egui::ScrollArea::vertical()
+            .id_salt("custom_actions_list_scroll")
+            .max_height(120.0)
+            .show(ui, |ui| {
+                for (i, action) in self.custom_actions.actions.iter().enumerate() {
+                    let label = if action.args.is_empty() {
+                        format!("{} — {}", action.name, action.command)
+                    } else {
+                        format!(
+                            "{} — {} {}",
+                            action.name,
+                            action.command,
+                            action.args.join(" ")
+                        )
+                    };
+                    if ui
+                        .selectable_label(i == self.custom_actions.selected, label)
+                        .clicked()
+                    {
+                        self.custom_actions.selected = i;
+                    }
+                }
+            });
+
+        ui.separator();
+        let danger = self.theme.tokens().color.danger;
+        egui::ScrollArea::vertical()
+            .id_salt("custom_actions_output_scroll")
+            .stick_to_bottom(running)
+            .show(ui, |ui| {
+                for line in &self.custom_actions.output {
+                    if line.ends_with("not found on PATH") || line.starts_with("failed to run ") {
+                        ui.colored_label(danger, line);
+                    } else {
+                        ui.label(line);
+                    }
+                }
+            });
+    }
+
     fn render_claude_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         self.render_claude_tab_strip(ui);
         match self.claude_view {
@@ -4443,6 +4593,16 @@ impl IdeApp {
                     {
                         self.bottom_view = BottomView::Debug;
                     }
+                    if Self::render_boxed_tab(
+                        ui,
+                        tokens,
+                        self.bottom_view == BottomView::CustomActions,
+                        "Custom Actions",
+                    )
+                    .clicked()
+                    {
+                        self.bottom_view = BottomView::CustomActions;
+                    }
                 });
                 ui.separator();
                 match self.bottom_view {
@@ -4451,6 +4611,7 @@ impl IdeApp {
                     BottomView::Usages => self.render_usages_panel(ui),
                     BottomView::Search => self.render_search_panel(ui),
                     BottomView::Debug => self.render_debug_panel(ui),
+                    BottomView::CustomActions => self.render_custom_actions_panel(ui),
                 }
             });
     }
@@ -4585,6 +4746,9 @@ impl eframe::App for IdeApp {
         if self.cargo.poll() {
             ctx.request_repaint();
         }
+        if self.custom_actions.poll() {
+            ctx.request_repaint();
+        }
         // Drained every frame regardless of whether the Claude rail is
         // open (`docs/security-findings/rust-ui-dev-claude-terminal-
         // 2026-08-25.md` finding 3): a terminal tab's PTY keeps producing
@@ -4675,6 +4839,7 @@ impl eframe::App for IdeApp {
         self.render_discard_confirm_popup(&ctx);
         self.render_branches_popup(&ctx);
         self.render_worktrees_popup(&ctx);
+        self.render_custom_actions_popup(&ctx);
         self.render_blame_popup(&ctx);
         self.render_language_suggestion_popup(&ctx);
         self.render_rename_popup(&ctx);

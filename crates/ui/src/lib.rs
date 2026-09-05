@@ -10,6 +10,7 @@ mod claude_panel;
 mod claude_terminal;
 mod clone_panel;
 mod command;
+mod custom_actions;
 mod debug_panel;
 mod editor;
 mod file_structure;

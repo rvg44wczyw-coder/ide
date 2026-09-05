@@ -73,6 +73,7 @@ const MENU_GROUPS: &[MenuGroup] = &[
             Some("ToggleProblemsToolWindow"),
             Some("ToggleVcsToolWindow"),
             Some("ToggleClaudeToolWindow"),
+            Some("ToggleCustomActionsToolWindow"),
         ],
     },
     MenuGroup {
@@ -129,6 +130,8 @@ const MENU_GROUPS: &[MenuGroup] = &[
             Some("StopDebugging"),
             None,
             Some("ToggleLineBreakpoint"),
+            None,
+            Some("ManageCustomActions"),
         ],
     },
     MenuGroup {
