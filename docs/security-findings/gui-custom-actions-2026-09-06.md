@@ -132,8 +132,30 @@ rather than silently passing this off as more "live" than it is.
   reset's actual job is preventing the *other* bug (silently overwriting
   the wrong project's array slot), which it does correctly.
 
+## Round 2 (2026-09-06, commit `81c54f1`)
+
+Finding 1 fix verified: `delete_custom_action` (`app.rs`) now does a
+three-way match on `editing_index` relative to the deleted index (exact →
+clear, greater → decrement, less → untouched). Live-tested by re-running
+`delete_custom_action_before_the_edited_row_shifts_editing_index_down`
+(edits row `c`, deletes an earlier unrelated row, confirms `editing_index`
+tracks `c` to its new position, and confirms a subsequent Save actually
+overwrites `c` rather than duplicating it — the exact failure mode this
+finding described, now exercised against the real production code) and
+`delete_custom_action_after_the_edited_row_leaves_editing_index_untouched`
+— both pass. Confirmed the fix's diff is scoped to `app.rs`'s
+`delete_custom_action` plus its two new tests only (`git diff --stat
+a385938..81c54f1`) — `custom_actions.rs`, `render.rs`, `command.rs`, and
+`menu.rs` are untouched, so this round doesn't re-open the shell-safety/
+`current_dir`/`MAX_CUSTOM_ACTIONS`/clone-not-index/project-switch-reset
+properties already verified in round 1; re-ran the full `custom_actions::`
+test module (12/12 passing) as a sanity check that nothing regressed.
+
+**Finding 1: resolved.**
+
 ## Verdict
 
-Findings (Low).
+Clean (round 2). Round 1's single Low finding is fixed and verified live;
+no new findings introduced by the fix.
 
-`CHAIN_STEP step=hacker result=findings severity=Low doc="docs/security-findings/gui-custom-actions-2026-09-06.md"`
+`CHAIN_STEP step=hacker result=clean`
