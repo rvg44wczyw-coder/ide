@@ -18739,7 +18739,17 @@ mod tests {
         // tui-code-generation.md` §4/§5): the filtered list's position 1
         // ("Second") is `lsp.code_actions`' absolute index 2, not 1 -- a
         // bug using `state.selected` directly against `lsp.code_actions`
-        // would apply the wrong action ("Not generate" at index 1).
+        // would apply the wrong action ("Not generate" at index 1). Note:
+        // `apply_code_action` itself is a silent no-op with no LSP client
+        // running (this crate's own established convention -- see
+        // `request_methods_set_finding_flags_on_a_running_client`'s doc
+        // comment), so the *index it was called with* isn't independently
+        // observable here; what this test actually proves is the mapping
+        // `handle_generate_menu_key`'s Enter arm depends on -- that
+        // `generate_menu_actions()[selected]` genuinely resolves to a
+        // different, non-adjacent `.index` than `selected` itself -- which
+        // is the exact fact a `state.selected`-as-absolute-index bug would
+        // get wrong.
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.handle_key(plain_key(KeyCode::Down)); // select a.txt's tree row
@@ -18750,6 +18760,13 @@ mod tests {
             .push(quickfix_action(1, "Not generate"));
         app.lsp.code_actions.push(generate_action(2, "Second"));
         app.generate_menu = Some(GenerateMenuState { selected: 1 });
+
+        let filtered = app.generate_menu_actions();
+        assert_eq!(filtered[1].title, "Second");
+        assert_eq!(
+            filtered[1].index, 2,
+            "filtered position 1 must resolve to lsp.code_actions' absolute index 2, not 1"
+        );
 
         app.handle_key(plain_key(KeyCode::Enter));
 
