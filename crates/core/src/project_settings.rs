@@ -27,6 +27,12 @@ pub enum ProjectSettingsFile {
     /// `Workspace` are. `ide-tui` is this slot's first user; nothing about
     /// the name or file ties it to one frontend.
     Navigation,
+    /// User-declared named external commands, invocable from `ide-tui`'s
+    /// Custom Actions dock tab (`docs/features/tui-custom-actions.md`,
+    /// `T42`) -- content-named, not frontend-named, the same way
+    /// `Navigation` already is. `ide-tui` is this slot's first user too;
+    /// nothing about the name or file ties it to one frontend.
+    CustomActions,
 }
 
 impl ProjectSettingsFile {
@@ -35,6 +41,7 @@ impl ProjectSettingsFile {
             ProjectSettingsFile::Preferences => "preferences.json",
             ProjectSettingsFile::Workspace => "workspace.json",
             ProjectSettingsFile::Navigation => "navigation.json",
+            ProjectSettingsFile::CustomActions => "custom_actions.json",
         }
     }
 }
@@ -260,6 +267,35 @@ mod tests {
             .path()
             .join(SETTINGS_DIR_NAME)
             .join("navigation.json")
+            .exists());
+    }
+
+    #[test]
+    fn custom_actions_is_a_fourth_slot_independent_of_the_other_three() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ProjectSettingsFile::CustomActions,
+            &Example { count: 7 },
+        )
+        .unwrap();
+
+        assert_eq!(
+            read::<Example>(dir.path(), ProjectSettingsFile::CustomActions).unwrap(),
+            Some(Example { count: 7 })
+        );
+        assert_eq!(
+            read::<Example>(dir.path(), ProjectSettingsFile::Preferences).unwrap(),
+            None
+        );
+        assert_eq!(
+            read::<Example>(dir.path(), ProjectSettingsFile::Navigation).unwrap(),
+            None
+        );
+        assert!(dir
+            .path()
+            .join(SETTINGS_DIR_NAME)
+            .join("custom_actions.json")
             .exists());
     }
 
