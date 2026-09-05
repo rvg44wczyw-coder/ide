@@ -193,6 +193,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.keymap_popup.is_some() {
         render_keymap_popup(frame, app, size);
     }
+    if app.theme_popup.is_some() {
+        render_theme_popup(frame, app, size);
+    }
     if app.new_scratch_file.is_some() {
         render_new_scratch_file_prompt(frame, app, size);
     }
@@ -462,6 +465,7 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     // whole background instead.
     let (breakpoints_verified, breakpoints_unverified) =
         app.breakpoint_line_ranges(&buf.path, text_buffer);
+    let theme = app.theme.theme();
     let overlays = LineOverlays {
         semantic_tokens: &semantic_tokens,
         highlights: &highlights,
@@ -480,7 +484,7 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let lines: Vec<Line> = (visible_start..visible_end)
         .map(|row| {
             let line = visual.buffer_line(row);
-            let mut styled = styled_line(text_buffer, line, &overlays, buf.indent.width);
+            let mut styled = styled_line(text_buffer, line, &overlays, buf.indent.width, theme);
             // The collapsed-fold placeholder (`tui-code-folding.md` §3.4)
             // -- appended here, not inside `styled_line`, so folding stays
             // a concern this file alone knows about. Checking
@@ -493,16 +497,16 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             if buf.folded.contains(&line) && fold_ranges.iter().any(|r| r.start_line == line) {
                 styled.push_span(Span::styled(
                     " \u{22ef}",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.fold_marker_fg),
                 ));
             }
             if app.git_gutter_lane_width() > 0 {
                 let mark = app.git_gutter.iter().find(|m| m.line == line);
                 let (glyph, color) = match mark.map(|m| m.kind) {
-                    Some(crate::git_gutter::GutterMarkKind::Added) => ("+", Color::Green),
-                    Some(crate::git_gutter::GutterMarkKind::Modified) => ("~", Color::Blue),
-                    Some(crate::git_gutter::GutterMarkKind::Deleted) => ("-", Color::Red),
-                    None => (" ", Color::DarkGray),
+                    Some(crate::git_gutter::GutterMarkKind::Added) => ("+", theme.git_added),
+                    Some(crate::git_gutter::GutterMarkKind::Modified) => ("~", theme.git_modified),
+                    Some(crate::git_gutter::GutterMarkKind::Deleted) => ("-", theme.git_deleted),
+                    None => (" ", theme.git_none),
                 };
                 let mut spans = vec![Span::styled(
                     format!("{glyph} "),
@@ -513,7 +517,10 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             }
             if let Some(annotations) = &buf.blame {
                 let prefix = blame_lane_prefix(annotations, line, blame_now);
-                let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::DarkGray))];
+                let mut spans = vec![Span::styled(
+                    prefix,
+                    Style::default().fg(theme.blame_lane_fg),
+                )];
                 spans.extend(styled.spans);
                 styled = Line::from(spans);
             }
@@ -536,7 +543,7 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
             let buffer = frame.buffer_mut();
             for y in text_area.y..text_area.y + text_area.height {
                 if let Some(cell) = buffer.cell_mut((guide_x, y)) {
-                    cell.set_bg(Color::DarkGray);
+                    cell.set_bg(theme.right_margin_guide_bg);
                 }
             }
         }
@@ -1128,6 +1135,49 @@ fn render_keymap_popup(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(List::new(items).block(block), popup);
 }
 
+/// Theme Settings popup (`docs/features/tui-theme.md` §2.3/`T41`) --
+/// mirrors `render_keymap_popup`'s centered-popup/`Clear`/`List` shape.
+fn render_theme_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.theme_popup.as_ref() else {
+        return;
+    };
+    let width = area.width.saturating_sub(4).max(20);
+    let height = area.height.saturating_sub(4).max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let rows = app.theme_popup_rows();
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, kind)| {
+            let style = if i == state.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let current = if *kind == app.theme {
+                "  (current)"
+            } else {
+                ""
+            };
+            let text = format!("{}{current}", kind.label());
+            ListItem::new(Line::from(Span::styled(text, style)))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Theme  (Enter: apply, Esc: close)");
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
 /// "New Scratch File" prompt (`docs/features/tui-scratch-files.md`
 /// §2.3) -- this crate's first single-line *text-entry* popup that isn't
 /// the Find/Replace bar's status-line field or a list's own search box;
@@ -1245,6 +1295,7 @@ fn render_claude_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_claude_tab_strip(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme.theme();
     let chat_style = if matches!(app.claude_view, ClaudeView::Chat) {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
@@ -1256,7 +1307,7 @@ fn render_claude_tab_strip(frame: &mut Frame, app: &App, area: Rect) {
         let style = if is_active {
             Style::default().add_modifier(Modifier::REVERSED)
         } else if tab.exited {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.fold_marker_fg)
         } else {
             Style::default()
         };
@@ -1277,7 +1328,13 @@ fn render_claude_chat(frame: &mut Frame, app: &App, area: Rect) {
     let history_area = rows[0];
     let input_area = rows[1];
 
-    let lines: Vec<Line> = app.claude.history.iter().map(claude_message_line).collect();
+    let theme = app.theme.theme();
+    let lines: Vec<Line> = app
+        .claude
+        .history
+        .iter()
+        .map(|m| claude_message_line(m, theme))
+        .collect();
     let visible_rows = history_area.height as usize;
     let start = lines.len().saturating_sub(visible_rows);
     frame.render_widget(Paragraph::new(lines[start..].to_vec()), history_area);
@@ -1293,13 +1350,13 @@ fn render_claude_chat(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn claude_message_line(message: &ClaudeMessage) -> Line<'static> {
+fn claude_message_line(message: &ClaudeMessage, theme: &crate::theme::Theme) -> Line<'static> {
     match message {
         ClaudeMessage::User(text) => Line::from(format!("> {text}")),
         ClaudeMessage::Assistant(text) => Line::from(text.clone()),
         ClaudeMessage::Error(text) => Line::from(Span::styled(
             format!("error: {text}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error_text),
         )),
     }
 }
@@ -1414,6 +1471,7 @@ fn render_debug_launch_popup(frame: &mut Frame, app: &App, area: Rect) {
     if !app.debug.show_launch_popup {
         return;
     }
+    let theme = app.theme.theme();
     let width = area.width.clamp(30, 70);
     let height = if app.debug.error.is_some() { 5 } else { 4 }.min(area.height);
     let popup = Rect {
@@ -1447,7 +1505,7 @@ fn render_debug_launch_popup(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(error) = &app.debug.error {
         items.push(ListItem::new(Line::from(Span::styled(
             error.clone(),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error_text),
         ))));
     }
     let block = Block::default()
@@ -2458,6 +2516,7 @@ fn render_git_branches_popup(frame: &mut Frame, app: &App, area: Rect) {
 
 /// `docs/features/tui-git-worktrees.md` §2.4.
 fn render_git_worktrees_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme.theme();
     let width = area.width.clamp(30, 70).min(area.width);
     let height = area.height.clamp(6, 16).min(area.height);
     let popup = Rect {
@@ -2503,7 +2562,7 @@ fn render_git_worktrees_popup(frame: &mut Frame, app: &App, area: Rect) {
         if let Some(error) = state.error.as_ref() {
             items.push(ListItem::new(Line::from(Span::styled(
                 error.clone(),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.error_text),
             ))));
         }
         let block = Block::default()
@@ -2543,7 +2602,7 @@ fn render_git_worktrees_popup(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(error) = state.error.as_ref() {
         items.push(ListItem::new(Line::from(Span::styled(
             error.clone(),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error_text),
         ))));
     }
 
@@ -2559,6 +2618,7 @@ fn render_git_worktrees_popup(frame: &mut Frame, app: &App, area: Rect) {
 /// Panel: `app.clone_panel_open` gates this independently of
 /// `app.git_panel`.
 fn render_clone_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme.theme();
     let width = area.width.clamp(40, 70).min(area.width);
     let height = area.height.clamp(6, 8).min(area.height);
     let popup = Rect {
@@ -2592,7 +2652,7 @@ fn render_clone_panel(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(error) = state.error.as_ref() {
         items.push(ListItem::new(Line::from(Span::styled(
             error.clone(),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error_text),
         ))));
     } else if let Some(progress) = state.progress {
         let text = if progress.total_objects > 0 {
@@ -2635,6 +2695,7 @@ fn render_git_branch_line_row(
         );
         return;
     }
+    let theme = app.theme.theme();
 
     if state.focus == GitPanelFocus::Filter {
         let filter = &app.git.log_filter;
@@ -2664,7 +2725,7 @@ fn render_git_branch_line_row(
         if let Some(error) = filter.error.as_ref() {
             spans.push(Span::styled(
                 format!("  ({error})"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.error_text),
             ));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -2759,6 +2820,7 @@ fn render_git_left_column(
 /// `state.diff_scroll` (§3.2) -- a plain scroll offset, not a `ListState`,
 /// since this content isn't a selectable list.
 fn render_git_diff(frame: &mut Frame, app: &App, state: &crate::app::GitPanelState, area: Rect) {
+    let theme = app.theme.theme();
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Diff  (Up/Down: scroll, PageUp/PageDown: page)");
@@ -2784,7 +2846,7 @@ fn render_git_diff(frame: &mut Frame, app: &App, state: &crate::app::GitPanelSta
         )));
         for hunk in &file_diff.hunks {
             for diff_line in &hunk.lines {
-                lines.push(diff_line_to_line(diff_line));
+                lines.push(diff_line_to_line(diff_line, theme));
             }
         }
         if file_diff.truncated {
@@ -2801,11 +2863,11 @@ fn render_git_diff(frame: &mut Frame, app: &App, state: &crate::app::GitPanelSta
     );
 }
 
-fn diff_line_to_line(diff_line: &DiffLine) -> Line<'static> {
+fn diff_line_to_line(diff_line: &DiffLine, theme: &crate::theme::Theme) -> Line<'static> {
     match diff_line {
         DiffLine::Context(text) => Line::from(format!("  {text}")),
-        DiffLine::Removed(text, spans) => diff_spans_to_line("- ", text, spans, Color::Red),
-        DiffLine::Added(text, spans) => diff_spans_to_line("+ ", text, spans, Color::Green),
+        DiffLine::Removed(text, spans) => diff_spans_to_line("- ", text, spans, theme.diff_removed),
+        DiffLine::Added(text, spans) => diff_spans_to_line("+ ", text, spans, theme.diff_added),
     }
 }
 
@@ -2910,7 +2972,7 @@ fn render_conflict_side(frame: &mut Frame, title: &str, content: Option<&str>, a
 
 fn focus_style(app: &App, focus: Focus) -> Style {
     if app.focus == focus {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(app.theme.theme().focus_indicator)
     } else {
         Style::default()
     }

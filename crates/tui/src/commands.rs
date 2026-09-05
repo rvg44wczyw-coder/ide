@@ -226,6 +226,7 @@ pub enum Action {
     DismissExternalChange,
     OpenPalette,
     ToggleKeymapSettings,
+    ToggleThemeSettings,
     ResetAllKeybindings,
     NewScratchFile,
     ToggleScratchFiles,
@@ -799,6 +800,15 @@ pub fn commands() -> &'static [Command] {
             // binding to translate (`docs/features/tui-keymap.md` §2.4).
             binding: None,
             action: Action::ToggleKeymapSettings,
+        },
+        Command {
+            id: "ToggleThemeSettings",
+            title: "Theme",
+            // Palette-only -- same reasoning as `ToggleKeymapSettings`
+            // above: a new settings surface with no reference-IDE
+            // keybinding to translate (`docs/features/tui-theme.md` §2.3).
+            binding: None,
+            action: Action::ToggleThemeSettings,
         },
         Command {
             id: "ResetAllKeybindings",

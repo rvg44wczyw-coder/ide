@@ -559,6 +559,13 @@ pub(crate) struct KeymapPopupState {
     pub(crate) capturing: Option<&'static str>,
 }
 
+/// The Theme Settings popup's cursor state (`docs/features/tui-theme.md`
+/// §2.3/`T41`) -- presence is visibility, same convention every other
+/// popup in this crate already follows.
+pub(crate) struct ThemePopupState {
+    pub(crate) selected: usize,
+}
+
 /// The "New Scratch File" name-entry prompt's state (`docs/features/
 /// tui-scratch-files.md` §2.2) -- presence is visibility.
 pub(crate) struct NewScratchFileState {
@@ -814,6 +821,8 @@ pub struct App {
     /// state.json`. Always `None` in production.
     state_path_override: Option<std::path::PathBuf>,
     pub(crate) keymap_popup: Option<KeymapPopupState>,
+    pub(crate) theme: crate::theme::ThemeKind,
+    pub(crate) theme_popup: Option<ThemePopupState>,
     pub(crate) new_scratch_file: Option<NewScratchFileState>,
     pub(crate) scratch_files: Option<ScratchFilesState>,
     pub(crate) claude: ClaudePanel,
@@ -1020,6 +1029,8 @@ impl App {
             keymap_path_override: None,
             state_path_override: None,
             keymap_popup: None,
+            theme: crate::state::load().theme,
+            theme_popup: None,
             new_scratch_file: None,
             scratch_files: None,
             claude: ClaudePanel::default(),
@@ -1919,6 +1930,7 @@ impl App {
         self.recent_files = None;
         self.bookmarks_popup = None;
         self.keymap_popup = None;
+        self.theme_popup = None;
         self.new_scratch_file = None;
         self.scratch_files = None;
         self.claude_panel_open = false;
@@ -5384,6 +5396,9 @@ impl App {
         if self.keymap_popup.is_some() {
             return self.handle_keymap_popup_key(key);
         }
+        if self.theme_popup.is_some() {
+            return self.handle_theme_popup_key(key);
+        }
         if self.new_scratch_file.is_some() {
             return self.handle_new_scratch_file_key(key);
         }
@@ -5460,6 +5475,7 @@ impl App {
             || self.git_panel.is_some()
             || self.clone_panel_open
             || self.keymap_popup.is_some()
+            || self.theme_popup.is_some()
             || self.new_scratch_file.is_some()
             || self.scratch_files.is_some()
             || self.claude_panel_open
@@ -5801,6 +5817,7 @@ impl App {
             Action::DismissExternalChange => self.dismiss_external_change(),
             Action::OpenPalette => self.open_palette(),
             Action::ToggleKeymapSettings => self.toggle_keymap_popup(),
+            Action::ToggleThemeSettings => self.toggle_theme_popup(),
             Action::ResetAllKeybindings => {
                 self.keymap.reset_all();
                 self.persist_keymap();
@@ -6359,6 +6376,7 @@ impl App {
         let state = crate::state::PersistedState {
             last_project: Some(self.project_root.clone()),
             format_on_save: self.format_on_save,
+            theme: self.theme,
         };
         match &self.state_path_override {
             Some(path) => crate::state::save_to(path, &state),
@@ -7222,6 +7240,71 @@ impl App {
         match &self.keymap_path_override {
             Some(path) => keymap::save_to(path, &self.keymap),
             None => keymap::save(&self.keymap),
+        }
+    }
+
+    /// `ToggleThemeSettings` command (`docs/features/tui-theme.md`
+    /// §2.3/`T41`): opens/closes the Theme Settings popup, closing every
+    /// other overlay first (same convention `toggle_keymap_popup` already
+    /// establishes). Opens with the selection on whichever theme is
+    /// currently active.
+    fn toggle_theme_popup(&mut self) {
+        let opening = self.theme_popup.is_none();
+        self.close_all_overlays();
+        if opening {
+            let selected = crate::theme::ThemeKind::ALL
+                .iter()
+                .position(|k| *k == self.theme)
+                .unwrap_or(0);
+            self.theme_popup = Some(ThemePopupState { selected });
+        }
+    }
+
+    pub(crate) fn theme_popup_rows(&self) -> &'static [crate::theme::ThemeKind] {
+        &crate::theme::ThemeKind::ALL
+    }
+
+    fn handle_theme_popup_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.theme_popup.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => self.theme_popup = None,
+            KeyCode::Up => {
+                state.selected = state.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let len = crate::theme::ThemeKind::ALL.len();
+                state.selected = (state.selected + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let kind = crate::theme::ThemeKind::ALL[state.selected];
+                self.theme = kind;
+                self.persist_theme();
+                self.theme_popup = None;
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Same persist-on-change shape `toggle_format_on_save` establishes,
+    /// but reconstructs the full on-disk `PersistedState` from a fresh
+    /// `crate::state::load`/`load_from` read rather than from `self`'s own
+    /// fields, since `App` doesn't independently track `last_project`
+    /// under a name this method could read back out (`self.project_root`
+    /// is the live value, but a rename/typo there would silently diverge
+    /// from what's actually on disk -- reading it back avoids that class
+    /// of bug for this new field).
+    fn persist_theme(&mut self) {
+        let mut state = match &self.state_path_override {
+            Some(path) => crate::state::load_from(path),
+            None => crate::state::load(),
+        };
+        state.theme = self.theme;
+        match &self.state_path_override {
+            Some(path) => crate::state::save_to(path, &state),
+            None => crate::state::save(&state),
         }
     }
 
@@ -15499,6 +15582,143 @@ mod tests {
         app.handle_key(plain_key(KeyCode::Esc));
 
         assert!(app.keymap_popup.is_none());
+    }
+
+    #[test]
+    fn toggle_theme_popup_opens_with_the_current_theme_selected_and_closes() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.theme = crate::theme::ThemeKind::Ember;
+
+        app.run_action(Action::ToggleThemeSettings);
+        let state = app.theme_popup.as_ref().unwrap();
+        assert_eq!(state.selected, 1); // Ember is ThemeKind::ALL[1]
+
+        app.run_action(Action::ToggleThemeSettings);
+        assert!(app.theme_popup.is_none());
+    }
+
+    #[test]
+    fn opening_theme_popup_closes_other_overlays() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.run_action(Action::RecentFiles);
+        assert!(app.recent_files.is_some());
+
+        app.run_action(Action::ToggleThemeSettings);
+        assert!(app.theme_popup.is_some());
+        assert!(app.recent_files.is_none());
+    }
+
+    #[test]
+    fn theme_popup_up_down_clamp_without_wraparound() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleThemeSettings);
+        assert_eq!(app.theme_popup.as_ref().unwrap().selected, 0);
+
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(
+            app.theme_popup.as_ref().unwrap().selected,
+            0,
+            "Up at the first row must not underflow"
+        );
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.theme_popup.as_ref().unwrap().selected, 1);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(
+            app.theme_popup.as_ref().unwrap().selected,
+            1,
+            "Down at the last row must not run past ThemeKind::ALL's end"
+        );
+    }
+
+    #[test]
+    fn theme_popup_enter_applies_and_persists_the_selected_theme() {
+        let dir = sample_project();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state_path = state_dir.path().join("state.json");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.state_path_override = Some(state_path.clone());
+        assert_eq!(app.theme, crate::theme::ThemeKind::Classic);
+
+        app.run_action(Action::ToggleThemeSettings);
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.theme, crate::theme::ThemeKind::Ember);
+        assert!(app.theme_popup.is_none());
+        assert_eq!(
+            crate::state::load_from(&state_path).theme,
+            crate::theme::ThemeKind::Ember
+        );
+    }
+
+    #[test]
+    fn theme_popup_esc_closes_without_changing_the_theme() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleThemeSettings);
+        app.handle_key(plain_key(KeyCode::Down));
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(app.theme_popup.is_none());
+        assert_eq!(app.theme, crate::theme::ThemeKind::Classic);
+    }
+
+    #[test]
+    fn persist_theme_preserves_last_project_and_format_on_save() {
+        let dir = sample_project();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state_path = state_dir.path().join("state.json");
+        crate::state::save_to(
+            &state_path,
+            &crate::state::PersistedState {
+                last_project: Some(PathBuf::from("/tmp/some-other-project")),
+                format_on_save: true,
+                theme: crate::theme::ThemeKind::Classic,
+            },
+        );
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.state_path_override = Some(state_path.clone());
+
+        app.run_action(Action::ToggleThemeSettings);
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        let persisted = crate::state::load_from(&state_path);
+        assert_eq!(persisted.theme, crate::theme::ThemeKind::Ember);
+        assert_eq!(
+            persisted.last_project,
+            Some(PathBuf::from("/tmp/some-other-project"))
+        );
+        assert!(persisted.format_on_save);
+    }
+
+    #[test]
+    fn close_all_overlays_clears_the_theme_popup() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.theme_popup = Some(ThemePopupState { selected: 0 });
+
+        app.close_all_overlays();
+
+        assert!(app.theme_popup.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_reports_true_when_only_the_theme_popup_is_set() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.theme_popup = Some(ThemePopupState { selected: 0 });
+
+        assert!(app.any_popup_open());
     }
 
     #[test]

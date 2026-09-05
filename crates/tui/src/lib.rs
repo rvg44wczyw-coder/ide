@@ -56,6 +56,7 @@ mod scratch;
 mod search_panel;
 mod state;
 mod subprocess;
+mod theme;
 mod todo_panel;
 mod tree;
 mod ui;
@@ -123,13 +124,15 @@ pub fn main(root: Option<PathBuf>) -> ExitCode {
     };
     // Only remembered on a successful open (§4.2 of the doc above) -- a
     // path that fails to open as a project must never overwrite a
-    // previously-good remembered one. `format_on_save` is carried through
-    // from whatever `App::new` itself just loaded (`docs/features/
-    // tui-formatting.md` §2.3), so this startup save never resets a
-    // previously-toggled-on preference back to `false`.
+    // previously-good remembered one. `format_on_save`/`theme` are carried
+    // through from whatever `App::new` itself just loaded (`docs/features/
+    // tui-formatting.md` §2.3, `tui-theme.md` §2.3/`T41`), so this startup
+    // save never resets a previously-toggled-on preference (or a chosen
+    // theme) back to its default.
     state::save(&state::PersistedState {
         last_project: Some(resolved_root),
         format_on_save: app.format_on_save,
+        theme: app.theme,
     });
 
     std::panic::set_hook(Box::new(|info| {
