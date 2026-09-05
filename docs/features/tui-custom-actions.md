@@ -572,3 +572,30 @@ described by §3.2's prose, and not diagram-worthy on its own.
   a long-running dev server alongside a one-off lint check) may not be,
   making this a real first-cut UX limitation rather than a free
   simplification.
+- `rev` (code review, round 1) found one gap, fixed in place: `ui.rs`'s
+  `render_custom_actions_panel` applied `theme.error_text` to the
+  empty-actions-list placeholder instead of to the output pane's
+  `"<program> not found on PATH"`/`"failed to run <program>"` lines this
+  section originally specified — the empty-list placeholder now renders
+  plain, and output lines matching either of `subprocess.rs`'s two
+  spawn-failure message shapes are styled with `error_text` instead.
+- `hacker` (adversarial pass, round 1) found one gap
+  (`[DoS: Medium]`, code-analysis plus a live timing test — see
+  `docs/security-findings/tui-custom-actions-2026-09-05.md`, not committed
+  per this repo's own `.gitignore`d-findings convention), fixed in place:
+  `custom_actions::load` had no cap on how many actions a `.ide/
+  custom_actions.json` could hand back, unlike `docker_panel.rs`'s/
+  `k8s_panel.rs`'s existing 500-item display caps for the same class of
+  untrusted-list-rendered-every-frame surface. A synthetic 1,000,000-action
+  file (~59 MB) was measured, live, at ~100 ms to rebuild
+  `render_custom_actions_panel`'s labels on every single frame the dock tab
+  stayed open — a real, sustained UI hang from nothing more than opening a
+  project containing a crafted file, not a one-time cost. Fixed by adding
+  `MAX_CUSTOM_ACTIONS: usize = 500` and truncating to it in `load`,
+  mirroring the Docker/K8s precedent exactly; covered by a new test
+  (`load_truncates_a_maliciously_oversized_file_to_max_custom_actions`).
+  The one-time JSON-parse cost before truncation runs (~100 ms at the
+  59 MB scale tested) is a property of `ide_core::project_settings::read`
+  itself, shared by every settings slot and out of this feature's scope to
+  fix — noted as an accepted residual, not a blocking gap, since it is a
+  barely-perceptible one-time startup delay rather than a sustained hang.
