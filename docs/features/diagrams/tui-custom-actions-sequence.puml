@@ -1,0 +1,45 @@
+@startuml tui-custom-actions-sequence
+title Custom Actions: run_selected (T42)
+
+actor User
+participant "app.rs\nhandle_custom_actions_panel_key" as Handler
+participant "CustomActionsPanel\n(custom_actions.rs)" as Panel
+participant "subprocess::spawn_streaming" as Spawn
+participant "background thread\n(run_and_stream)" as Thread
+participant "mpsc::Receiver<StreamEvent>" as Chan
+participant "main loop\n(poll, once per frame)" as Loop
+participant "ui.rs\nrender_custom_actions_panel" as Render
+
+User -> Handler: Enter (selected row)
+Handler -> Panel: run_selected(project_root)
+alt already running or list empty
+  Panel --> Handler: no-op
+else
+  Panel -> Panel: running = Some(actions[selected].clone())
+  Panel -> Spawn: spawn_streaming(command, args, Some(project_root))
+  Spawn -> Thread: thread::spawn(run_and_stream)
+  Spawn --> Panel: rx: Receiver<StreamEvent>
+  Thread -> Thread: Command::new(program).args(args).current_dir(project_root).spawn()
+  loop stdout/stderr lines available
+    Thread -> Chan: send(StreamEvent::Line(line))
+  end
+  Thread -> Chan: send(StreamEvent::Done)
+end
+
+loop every main-loop iteration
+  Loop -> Panel: poll()
+  Panel -> Chan: try_recv()
+  alt Line(line)
+    Chan --> Panel: Line(line)
+    Panel -> Panel: output.push(line)
+  else Done
+    Chan --> Panel: Done
+    Panel -> Panel: running = None; rx = None
+  else Empty
+    Chan --> Panel: (nothing yet)
+  end
+  Loop -> Render: draw frame
+  Render -> Panel: read actions/selected/running/output
+  Render --> User: updated dock tab
+end
+@enduml
