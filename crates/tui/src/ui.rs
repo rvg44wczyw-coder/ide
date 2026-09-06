@@ -163,6 +163,12 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.pending_rename_preview.is_some() {
         render_rename_preview(frame, app, size);
     }
+    if app.refactor_menu.is_some() {
+        render_refactor_menu_popup(frame, app, size);
+    }
+    if app.pending_refactor_preview.is_some() {
+        render_refactor_preview(frame, app, size);
+    }
     if app.blame_popup.is_some() {
         render_blame_popup(frame, app, size);
     }
@@ -2320,6 +2326,112 @@ fn render_rename_preview(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title("Rename Preview  (Enter: apply, Esc: cancel)");
     frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// `⌃T`'s popup (`docs/features/tui-refactor-this.md` §2.3/§3.1) --
+/// mirrors `render_generate_menu_popup`'s exact shape, sourcing rows from
+/// the filtered `refactor_menu_actions()` view instead of `lsp.code_
+/// actions` wholesale.
+fn render_refactor_menu_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.refactor_menu.as_ref() else {
+        return;
+    };
+    let actions = app.refactor_menu_actions();
+    let width = area.width.clamp(30, 70);
+    let height = (actions.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = if actions.is_empty() {
+        vec![ListItem::new(Line::from("No refactoring available here."))]
+    } else {
+        actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let style = if i == state.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let label = if action.disabled_reason.is_some() {
+                    format!("{} (disabled)", action.title)
+                } else {
+                    action.title.clone()
+                };
+                ListItem::new(Line::from(Span::styled(label, style)))
+            })
+            .collect()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Refactor This  (Enter: apply, Esc: close)");
+    frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// The Refactor Preview popup (`docs/features/tui-refactor-this.md`
+/// §2.3/§3.5) -- near-fullscreen like `render_git_panel`/`render_cargo_
+/// panel`, not the small centered-box `render_rename_preview` uses above,
+/// since this one shows real multi-file diff content. Flattens each
+/// file's diff into `Line`s the same way `render_git_diff` does, reusing
+/// `diff_line_to_line` verbatim.
+fn render_refactor_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(preview) = app.pending_refactor_preview.as_ref() else {
+        return;
+    };
+    let theme = app.theme.theme();
+    let width = area.width.saturating_sub(4).max(20);
+    let height = area.height.saturating_sub(4).max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Refactor Preview  (Enter: apply, Esc: cancel, \u{2191}\u{2193}/PgUp/PgDn: scroll)");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let file_count = preview.edit.edits.len();
+    let mut lines: Vec<Line> = vec![Line::from(format!(
+        "{}: {file_count} file{}",
+        preview.what,
+        if file_count == 1 { "" } else { "s" }
+    ))];
+    for (file_edit, diff) in preview.edit.edits.iter().zip(preview.diffs.iter()) {
+        lines.push(Line::from(Span::styled(
+            file_edit.path.display().to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        match diff {
+            Some(file_diff) => {
+                for hunk in &file_diff.hunks {
+                    for diff_line in &hunk.lines {
+                        lines.push(diff_line_to_line(diff_line, theme));
+                    }
+                }
+            }
+            None => lines.push(Line::from("(diff unavailable)")),
+        }
+    }
+
+    let start = (preview.scroll as usize).min(lines.len());
+    frame.render_widget(
+        Paragraph::new(lines[start..].to_vec()).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// The Git Panel overlay (`docs/features/tui-git-panel.md` §2.4/§3.2) --
