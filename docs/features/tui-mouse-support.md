@@ -46,9 +46,10 @@ pub struct HitMap {
     pub tree_area: Option<Rect>,
     pub editor_text_area: Option<Rect>,
     pub tab_strip: Vec<(Rect, usize)>,   // per-tab hit rect -> tab index
+    pub screen_tabs: Vec<(Rect, AppScreen)>,  // T44: top screen-tab bar
+    pub left_dock_tabs: Vec<(Rect, LeftDockTab)>,   // revision note 3
+    pub bottom_dock_tabs: Vec<(Rect, BottomDockTab)>, // revision note 3
 }
-
-pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap);
 ```
 
 `render`'s signature changes from `(frame, app)` to `(frame, app, hits)`.
@@ -197,6 +198,20 @@ A click inside `hits.editor_text_area`:
 No click-drag text selection is implemented (§4) — only a single-point
 caret placement.
 
+#### 3.2.4 Dock tab strips (revision note 3)
+
+A click inside one of `hits.left_dock_tabs`' / `hits.bottom_dock_tabs`'
+per-tab rects switches that dock's active tab (`show_left_dock_tab` /
+`show_bottom_dock_tab`) and focuses the dock — the same effect as the
+existing `Focus::LeftDock`/`Focus::BottomDock` keyboard traversal.
+`render_dock_tab_strip` reconstructs per-label rects from the same
+cumulative-width string-building `render_screen_tabs` (T44) uses, which is
+the same class of "must stay in sync with the strip renderer" coupling
+§3.2.2 already documents for the editor tab strip. `screen_tabs` keeps
+first dispatch rank (a screen tab click wins over a dock tab click at the
+same row, matching their separate render rows); the dock rects exist only
+while their dock is actually rendered that frame (§4's HitMap contract).
+
 ### 3.3 Wheel scroll (`ScrollUp` / `ScrollDown`)
 
 One wheel notch = one synthetic arrow-key press (`KeyCode::Up` for
@@ -226,6 +241,24 @@ Routing depends on whether a popup is currently open:
   choice: "Wheel down 3 notches on the Problems list == pressing Down x3
   -> selected += 3 (clamped), same render, same clamp logic."
 
+  One rendering correction (revision note 3, §3.3): these popups were
+  rendered with stateless `List` (always starting at row 0), so a
+  selection moved off-screen by wheel/keyboard was silently clipped from
+  the viewport with no way to bring it back. They now render through
+  `render_scrollable_list`, a `ListState`-backed wrapper that keeps
+  `selected` scrolled into view — no new per-popup scroll *state* is
+  introduced (the wrapper builds a fresh `ListState` each frame and
+  positions it at the existing `selected`), which preserves the "same
+  clamp logic, no independent scroll offset" contract above. The renderer
+  change is shared by every one-shot popup this file draws (problems,
+  go to file/symbol, file structure, recent files, bookmarks, todo,
+  keymap, theme, scratch files, code actions, generate, refactor, manage
+  actions, git changes) plus the tree, the debug panel's threads/stack
+  columns, and the search panel's matches (whose `selected` is offset past
+  its header rows). The Keys screen's separate plain `keys_screen_scroll`
+  is the one list-like view with no selectable rows at all, so it is not a
+  `ListState` client — see the "no popup is open" branch below.
+
 - **No popup is open** (base split-view: tree + editor + optional bottom
   panels): the wheel event **is** position-based — hit-test
   `(event.column, event.row)` against `hits.tree_area` and
@@ -237,6 +270,14 @@ Routing depends on whether a popup is currently open:
   - Over the tree: converts to a synthetic `KeyCode::Up`/`Down` fed
     through `handle_tree_key`, exactly as a popup would (reuses
     `TreeState::move_selection`).
+  - On the Keys screen (revision note 3): no `tree_area`/`editor_text_area`
+    exists while `AppScreen::Keys` is active, so neither position-based
+    branch below would fire. The synthetic key is instead fed straight into
+    `handle_key`, whose `AppScreen::Keys` guard advances
+    `keys_screen_scroll` for these exact Up/Down codes — this is a non
+    -position-based routing, the same class as the popup branch above, for
+    a screen that has a scrollable list but no dock/tree/editor hit
+    regions.
   - Over the editor: **not** a synthetic key press — the editor has no
     existing keyboard action that scrolls the view without moving the
     caret (confirmed: every existing write to `OpenBuffer.scroll` is
@@ -345,8 +386,9 @@ User scrolls wheel down 3 notches while the Problems popup is open.
 - Integrates with `crates/tui/src/tree.rs` (`TreeState`), `crates/tui/
   src/editor.rs` (`offset_for_line_column`, `OpenBuffer.scroll`),
   `crates/tui/src/app.rs` (`handle_key`'s existing popup-priority chain,
-  `GitPanelState`), and `crates/tui/src/ui.rs` (`render`,
-  `render_editor`, `render_tab_strip`) — no other crate is touched;
+  `GitPanelState`, `show_left_dock_tab`/`show_bottom_dock_tab`), and
+  `crates/tui/src/ui.rs` (`render`, `render_editor`, `render_tab_strip`,
+  `render_scrollable_list`) — no other crate is touched;
   `ide-core`/`ide-lsp`/`ide-dap` are unaffected.
 - Reverses the "no mouse" rationale recorded in `docs/roadmap.md` T20 and
   T22 — those entries' own scope (no click-drag Column Selection, no
@@ -358,10 +400,11 @@ User scrolls wheel down 3 notches while the Problems popup is open.
 
 ## Revision notes
 
-Two implementation-discovered corrections, made by `rust-tui-dev` while
-implementing against the approved doc (self-review, same category as
-several `docs/roadmap.md` `T`-phase entries' own "self-review found and
-fixed N bugs" notes):
+Three entries follow. The first two were implementation-discovered
+corrections, made by `rust-tui-dev` while implementing the original feature
+against the approved doc (self-review, same category as several
+`docs/roadmap.md` `T`-phase entries' own "self-review found and fixed N
+bugs" notes); the third is a later post-merge fix round:
 
 1. **§3.2.3 editor click**: dropped the `scroll_to_and_reveal` call from
    the click idiom. That helper top-aligns `buf.scroll` to its target
@@ -377,3 +420,47 @@ fixed N bugs" notes):
    popup branch's synthetic-key mechanism covers it for free. This also
    corrected §2.3's exception count from two to one — only the editor's
    `buf.scroll` needed new code.
+
+3. **Panels fix round (post-merge, `rust-tui-dev`, unnumbered)**: a follow
+   -up fix to this feature discovered three gaps in what the original
+   merge shipped, fixed together since all three are panel-interaction
+   holes of the same nature. Not a roadmap `T`
+   -phase (deliberately unnumbered per the user's call — "its fix for
+   panels, not a feature"):
+   - **Off-screen selection clipping in stateless `List` rendering** —
+     the §3.3 wheel contract says `selected` moves inside a popup but
+     "same render"; in practice every list-shaped popup/panel was drawn
+     with stateless `List`, which starts at row 0, so a selection moved
+     past the visible height silently disappeared from view with no way
+     back. New `render_scrollable_list` wrapper keeps the existing
+     `selected` in view via a fresh per-frame `ListState` (§3.3);
+     mechanically replaces ~20 `render_widget(List::new(...), ...)` sites
+     (all popups + tree + debug threads/stack columns + search panel,
+     whose matches `selected` is offset past its header rows). Documented
+     in §3.3; no new scroll *state* anywhere, so the "no independent
+     per-popup scroll offset" invariant survives.
+   - **Dock tab strips were not clickable** — clicks reached the tree,
+     editor tab strip and text area, but `render_left_dock`/`
+     render_bottom_dock` (T33) drew their `[active]`-bracketed tab labels
+     with no hit regions (§3.2.4 as shipped: "None of the five migrated
+     panels register mouse hit regions today"). New `left_dock_tabs`/
+     `bottom_dock_tabs` in `HitMap`, populated by a shared
+     `render_dock_tab_strip` helper that mirrors `render_screen_tabs`'
+     per-label rect bookkeeping, dispatched in `handle_mouse_click` behind
+     the screen-tab check.
+   - **Keys screen had no wheel path** — `AppScreen::Keys` (T44) renders
+     neither tree nor editor, so `handle_mouse_scroll`'s position-based
+     "no popup is open" branch dropped the wheel event entirely. Keys is
+     also the one scrollable view with no selectable rows (`ListState`
+     has nothing to follow), so it gets a plain `keys_screen_scroll` offset
+     advanced by Up/Down/PageUp/PageDown in `handle_key`'s Keys guard and
+     by the wheel's synthetic Up/Down via a new non-position-based routing
+     branch (§3.3). Keyboard scroll was added in the same round so PgUp/
+     PgDn work on both input paths.
+   Verification: 4 new regression tests (Keys keyboard scroll with
+   saturation, wheel-over-Keys routing, left/bottom dock tab clicks);
+   `app.rs` 95.87% lines / 96.95% functions, `tree.rs` 99.27%, `ui.rs`
+   12.41% (the crate's pre-existing rendering-exclusion). Not
+   security-sensitive per `CLAUDE.md`
+   (ui.rs/app.rs/tree.rs mouse/keyboard dispatch, no listed path touched)
+   — `hacker` skipped per the dev-chain skill's own rule.

@@ -141,6 +141,14 @@ impl TreeState {
         rows.get(self.selected)
     }
 
+    /// The raw selected index, for `ratatui::widgets::ListState`-backed
+    /// rendering to keep the selection scrolled into view -- unlike
+    /// `selected_row`, this needs no `rows` slice since it's just the
+    /// index `render_tree` hands to `ListState::select`.
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
     /// Sets the selection directly to `index`, clamped to the currently
     /// visible row count -- unlike `move_selection`'s relative delta, a
     /// mouse click already knows exactly which row it landed on

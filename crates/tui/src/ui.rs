@@ -88,6 +88,13 @@ pub struct HitMap {
     /// `Vec<(Rect, _)>` shape, keyed by `AppScreen` instead of a buffer
     /// index.
     pub screen_tabs: Vec<(Rect, AppScreen)>,
+    /// Left dock tab strip click regions (mouse-support revision note 3,
+    /// §3.2.4) -- Files/Todos, same shape as `screen_tabs`.
+    pub left_dock_tabs: Vec<(Rect, LeftDockTab)>,
+    /// Bottom dock tab strip click regions (mouse-support revision note 3,
+    /// §3.2.4) -- Docker/Kubernetes/Cargo/
+    /// Custom Actions/Problems/Git Log, same shape as `screen_tabs`.
+    pub bottom_dock_tabs: Vec<(Rect, BottomDockTab)>,
 }
 
 /// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
@@ -266,6 +273,31 @@ pub(crate) fn claude_terminal_grid_size(term_width: u16, term_height: u16) -> (u
     (grid_rows, inner_width)
 }
 
+/// Renders `items` as a scrollable list that keeps `selected` in view via
+/// `ListState`, instead of `List`'s plain (stateless) rendering, which
+/// always starts at row 0 and silently clips everything past the visible
+/// height with no way to bring an off-screen selection back into view
+/// (mouse-support revision note 3, §3.3 -- this bug was
+/// present in every list-shaped popup in this file except
+/// `render_palette`, which already used this exact `ListState` shape).
+/// Every row's highlight style is already baked into its own `ListItem`
+/// span (no `List::highlight_style`/`highlight_symbol` is set anywhere in
+/// this file), so passing a selection here only affects scroll
+/// positioning, never visual style -- safe to call even for a
+/// placeholder-only single-row list with no real selection concept.
+fn render_scrollable_list(
+    frame: &mut Frame,
+    items: Vec<ListItem>,
+    block: Block,
+    area: Rect,
+    selected: usize,
+) {
+    let list = List::new(items).block(block);
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 fn render_tree(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let rows = app.tree_state.visible_rows(&app.tree);
     let selected_path = app.tree_state.selected_row(&rows).map(|r| r.path.clone());
@@ -305,7 +337,7 @@ fn render_tree(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
         .title("Project")
         .border_style(focus_style(app, Focus::LeftDock));
     hits.tree_area = Some(block.inner(area));
-    frame.render_widget(List::new(items).block(block), area);
+    render_scrollable_list(frame, items, block, area, app.tree_state.selected_index());
 }
 
 /// New in `docs/features/tui-tool-window-docking.md` (T33): renders a
@@ -327,22 +359,14 @@ fn render_left_dock(
         .direction(LayoutDirection::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
-    let strip_label = |tab: LeftDockTab, title: &str| {
-        if dock.tab == tab {
-            format!("[{title}]")
-        } else {
-            title.to_string()
-        }
-    };
-    let strip = Line::from(Span::styled(
-        format!(
-            "{}  {}",
-            strip_label(LeftDockTab::Files, "Files"),
-            strip_label(LeftDockTab::Todos, "Todos"),
-        ),
+    render_dock_tab_strip(
+        frame,
+        rows[0],
         focus_style(app, Focus::LeftDock),
-    ));
-    frame.render_widget(Paragraph::new(strip), rows[0]);
+        &mut hits.left_dock_tabs,
+        &[(LeftDockTab::Files, "Files"), (LeftDockTab::Todos, "Todos")],
+        dock.tab,
+    );
 
     match dock.tab {
         LeftDockTab::Files => render_tree(frame, app, rows[1], hits),
@@ -350,44 +374,76 @@ fn render_left_dock(
     }
 }
 
-/// Mirrors `render_left_dock` for the bottom dock's five tabs (`docs/
-/// features/tui-tool-window-docking.md` §2.3, T33). None of the five
-/// migrated panels register mouse hit regions today, so `_hits` is unused
-/// here -- kept as a parameter anyway to match `render_left_dock`'s
-/// signature and `render`'s own call site.
+/// Shared by `render_left_dock`/`render_bottom_dock` (mouse-support
+/// revision note 3, §3.2.4) -- renders a one-row `[active]`-
+/// bracketed tab strip (same convention as before) and populates `hits`
+/// with each label's click region, mirroring `render_screen_tabs`'
+/// per-label `Rect` bookkeeping exactly.
+fn render_dock_tab_strip<T: Copy + PartialEq>(
+    frame: &mut Frame,
+    area: Rect,
+    style: Style,
+    hits: &mut Vec<(Rect, T)>,
+    tabs: &[(T, &'static str)],
+    active: T,
+) {
+    let mut spans = Vec::new();
+    let mut column = area.x;
+    for (i, (tab, label)) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            column += 2;
+        }
+        let text = if *tab == active {
+            format!("[{label}]")
+        } else {
+            (*label).to_string()
+        };
+        let width = Span::raw(text.as_str()).width() as u16;
+        hits.push((
+            Rect {
+                x: column,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            *tab,
+        ));
+        column += width;
+        spans.push(Span::raw(text));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans).style(style)), area);
+}
+
+/// Mirrors `render_left_dock` for the bottom dock's six tabs (`docs/
+/// features/tui-tool-window-docking.md` §2.3, T33).
 fn render_bottom_dock(
     frame: &mut Frame,
     app: &App,
     dock: &BottomDockState,
     area: Rect,
-    _hits: &mut HitMap,
+    hits: &mut HitMap,
 ) {
     let rows = Layout::default()
         .direction(LayoutDirection::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
-    let strip_label = |tab: BottomDockTab, title: &str| {
-        if dock.tab == tab {
-            format!("[{title}]")
-        } else {
-            title.to_string()
-        }
-    };
-    let strip = Line::from(Span::styled(
-        format!(
-            "{}  {}  {}  {}  {}  {}  {}",
-            strip_label(BottomDockTab::Docker, "Docker"),
-            strip_label(BottomDockTab::Ai, "AI"),
-            strip_label(BottomDockTab::Kubernetes, "Kubernetes"),
-            strip_label(BottomDockTab::Cargo, "Cargo"),
-            strip_label(BottomDockTab::CustomActions, "Custom Actions"),
-            strip_label(BottomDockTab::Problems, "Problems"),
-            strip_label(BottomDockTab::GitLog, "Git Log"),
-        ),
+    render_dock_tab_strip(
+        frame,
+        rows[0],
         focus_style(app, Focus::BottomDock),
-    ));
-    frame.render_widget(Paragraph::new(strip), rows[0]);
-
+        &mut hits.bottom_dock_tabs,
+        &[
+            (BottomDockTab::Docker, "Docker"),
+            (BottomDockTab::Ai, "AI"),
+            (BottomDockTab::Kubernetes, "Kubernetes"),
+            (BottomDockTab::Cargo, "Cargo"),
+            (BottomDockTab::CustomActions, "Custom Actions"),
+            (BottomDockTab::Problems, "Problems"),
+            (BottomDockTab::GitLog, "Git Log"),
+        ],
+        dock.tab,
+    );
     match dock.tab {
         BottomDockTab::Docker => render_docker_panel(frame, app, rows[1]),
         BottomDockTab::Ai => render_ai_panel(frame, app, rows[1]),
@@ -855,7 +911,7 @@ fn render_goto_popup(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let block = Block::default().borders(Borders::ALL).title(goto.title);
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, goto.selected);
 }
 
 /// `Ctrl+Shift+N`'s popup (`docs/features/tui-go-to-file-and-symbol.md`
@@ -911,7 +967,7 @@ fn render_go_to_file_popup(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = format!("Go to File: {}  (Enter: open, Esc: close)", state.query);
     let block = Block::default().borders(Borders::ALL).title(title);
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// `Ctrl+Alt+Shift+N`'s popup (`docs/features/tui-go-to-file-and-symbol.md`
@@ -961,7 +1017,7 @@ fn render_go_to_symbol_popup(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = format!("Go to Symbol: {}  (Enter: jump, Esc: close)", state.query);
     let block = Block::default().borders(Borders::ALL).title(title);
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// `F12`'s popup (`docs/features/tui-file-structure-and-breadcrumbs.md`
@@ -1007,7 +1063,7 @@ fn render_file_structure_popup(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = format!("File Structure: {}  (Enter: jump, Esc: close)", state.query);
     let block = Block::default().borders(Borders::ALL).title(title);
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// `Ctrl+E`'s popup (`docs/features/tui-recent-files-and-bookmarks.md`
@@ -1046,7 +1102,7 @@ fn render_recent_files_popup(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = format!("Recent Files: {}  (Enter: open, Esc: close)", state.query);
     let block = Block::default().borders(Borders::ALL).title(title);
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// `Ctrl+F3`'s popup (`docs/features/tui-recent-files-and-bookmarks.md`
@@ -1094,7 +1150,7 @@ fn render_bookmarks_popup(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Show Bookmarks  (Enter: jump, Esc: close)");
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// TODO panel's popup (`docs/features/tui-todo-panel.md` §2.3). Same
@@ -1148,7 +1204,7 @@ fn render_todo_panel(frame: &mut Frame, app: &App, area: Rect, selected: usize) 
     let block = Block::default()
         .borders(Borders::ALL)
         .title("TODO  (Enter: jump)");
-    frame.render_widget(List::new(items).block(block), area);
+    render_scrollable_list(frame, items, block, area, selected);
 }
 
 /// Keymap popup (`docs/features/tui-keymap.md` §2.5). Same shape as
@@ -1206,7 +1262,7 @@ fn render_keymap_popup(frame: &mut Frame, app: &App, area: Rect) {
         "Keymap: {}  (Enter: rebind, Delete: reset, Esc: close)",
         state.query
     ));
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// Keys screen (`docs/features/tui-screen-navigation.md` §2.3, T44) --
@@ -1217,7 +1273,8 @@ fn render_keymap_popup(frame: &mut Frame, app: &App, area: Rect) {
 /// is a plain reference list, editing arrives in a later T-run (T47).
 fn render_keys_screen(frame: &mut Frame, app: &App, area: Rect) {
     let rows = app.keymap_popup_rows();
-    let items: Vec<ListItem> = rows
+    let start = (app.keys_screen_scroll as usize).min(rows.len());
+    let items: Vec<ListItem> = rows[start..]
         .iter()
         .map(|cmd| {
             let binding = app
@@ -1229,9 +1286,9 @@ fn render_keys_screen(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Keys  (reference only -- use the Keymap command to rebind)");
+    let block = Block::default().borders(Borders::ALL).title(
+        "Keys  (reference only -- use the Keymap command to rebind; Up/Down/PgUp/PgDn: scroll)",
+    );
     frame.render_widget(List::new(items).block(block), area);
 }
 
@@ -1275,7 +1332,7 @@ fn render_theme_popup(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Theme  (Enter: apply, Esc: close)");
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// "New Scratch File" prompt (`docs/features/tui-scratch-files.md`
@@ -1343,7 +1400,7 @@ fn render_scratch_files_popup(frame: &mut Frame, app: &App, area: Rect) {
 
     let title = format!("Scratch Files: {}  (Enter: open, Esc: close)", state.query);
     let block = Block::default().borders(Borders::ALL).title(title);
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// Claude chat + terminal panel (`docs/features/tui-claude-panel.md`
@@ -1793,13 +1850,14 @@ fn render_debug_panel(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
-    frame.render_widget(
-        List::new(thread_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(section_title("Threads", DebugPanelFocus::Threads)),
-        ),
+    render_scrollable_list(
+        frame,
+        thread_items,
+        Block::default()
+            .borders(Borders::ALL)
+            .title(section_title("Threads", DebugPanelFocus::Threads)),
         sections[0],
+        app.debug_panel.thread_selected,
     );
 
     let stack_items: Vec<ListItem> = if app.debug.stack.is_empty() {
@@ -1827,13 +1885,14 @@ fn render_debug_panel(frame: &mut Frame, app: &App, area: Rect) {
             })
             .collect()
     };
-    frame.render_widget(
-        List::new(stack_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(section_title("Stack", DebugPanelFocus::Stack)),
-        ),
+    render_scrollable_list(
+        frame,
+        stack_items,
+        Block::default()
+            .borders(Borders::ALL)
+            .title(section_title("Stack", DebugPanelFocus::Stack)),
         sections[1],
+        app.debug_panel.stack_selected,
     );
 
     let visible_rows = sections[2].height.saturating_sub(2) as usize;
@@ -1933,7 +1992,7 @@ fn render_problems_panel(frame: &mut Frame, app: &App, area: Rect, selected: usi
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Problems  (Enter: open)");
-    frame.render_widget(List::new(items).block(block), area);
+    render_scrollable_list(frame, items, block, area, selected);
 }
 
 /// `BottomDockTab::Cargo` (`docs/features/tui-tool-window-docking.md` §2.3,
@@ -2008,7 +2067,7 @@ fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
     let list_block = Block::default()
         .borders(Borders::ALL)
         .title("Custom Actions  (Enter: run)");
-    frame.render_widget(List::new(items).block(list_block), rows[0]);
+    render_scrollable_list(frame, items, list_block, rows[0], selected);
 
     let visible_rows = rows[1].height.saturating_sub(2) as usize;
     let output = &app.custom_actions.output;
@@ -2120,7 +2179,7 @@ fn render_manage_actions_popup(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Manage Custom Actions  (n: add, Enter: edit, d: delete, Esc: close)");
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, selected);
 }
 
 /// `F1`'s popup (`docs/features/tui-hover-and-inlay-hints.md` §3.1) --
@@ -2224,6 +2283,13 @@ fn render_search_panel(frame: &mut Frame, app: &App, area: Rect) {
     )));
 
     let mut items: Vec<ListItem> = header.into_iter().map(ListItem::new).collect();
+    let header_len = items.len();
+    // Only the matches branch below has a real, keyboard-navigable
+    // selection (`app.search_state.selected`) -- every other branch is a
+    // single informational row with nothing to scroll-follow, so `selected`
+    // stays at the header's own top rather than pointing at a stale index
+    // from a previous search.
+    let mut selected = 0;
 
     if app.search.searching {
         items.push(ListItem::new(Line::from("Searching...")));
@@ -2233,6 +2299,7 @@ fn render_search_panel(frame: &mut Frame, app: &App, area: Rect) {
         if results.matches.is_empty() {
             items.push(ListItem::new(Line::from("No results.")));
         } else {
+            selected = header_len + app.search_state.selected.min(results.matches.len() - 1);
             items.extend(results.matches.iter().enumerate().map(|(i, m)| {
                 let style = if i == app.search_state.selected {
                     Style::default().add_modifier(Modifier::REVERSED)
@@ -2269,7 +2336,7 @@ fn render_search_panel(frame: &mut Frame, app: &App, area: Rect) {
         "Find in Path  (Tab: next field, Space: toggle, Enter: search/open, Esc: close)"
     };
     let block = Block::default().borders(Borders::ALL).title(title);
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, selected);
 }
 
 /// The Replace in Path preview (`docs/features/
@@ -2369,7 +2436,7 @@ fn render_code_actions_popup(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Show Intention Actions  (Enter: apply, Esc: close)");
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// `Alt+Insert`'s popup (`docs/features/tui-code-generation.md` §2.3) --
@@ -2417,7 +2484,7 @@ fn render_generate_menu_popup(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Generate  (Enter: apply, Esc: close)");
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// `Shift+F6`'s popup (`docs/features/tui-code-actions-and-rename.md`
@@ -2534,7 +2601,7 @@ fn render_refactor_menu_popup(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title("Refactor This  (Enter: apply, Esc: close)");
-    frame.render_widget(List::new(items).block(block), popup);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 /// The Refactor Preview popup (`docs/features/tui-refactor-this.md`
@@ -2741,7 +2808,7 @@ fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanel
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!("{staged_title}  (Enter: unstage)"));
-    frame.render_widget(List::new(staged_items).block(block), rows[0]);
+    render_scrollable_list(frame, staged_items, block, rows[0], state.staged_selected);
 
     let (unstaged_title, unstaged_items) = status_row(
         "Unstaged",
@@ -2752,7 +2819,13 @@ fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanel
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!("{unstaged_title}  (Enter: stage, x: discard)"));
-    frame.render_widget(List::new(unstaged_items).block(block), rows[1]);
+    render_scrollable_list(
+        frame,
+        unstaged_items,
+        block,
+        rows[1],
+        state.unstaged_selected,
+    );
 
     if let Some(path) = app.git.pending_discard.as_ref() {
         let block = Block::default()

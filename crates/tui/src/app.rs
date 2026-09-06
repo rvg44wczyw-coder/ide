@@ -901,6 +901,12 @@ pub struct App {
     pub(crate) tree_state: TreeState,
     pub(crate) focus: Focus,
     pub(crate) active_screen: AppScreen,
+    /// Plain scroll offset for the Keys screen (mouse-support revision
+    /// note 3, §2.3) -- this content has no
+    /// selectable rows (T44 kept it read-only-reference), so there's
+    /// nothing for a `ListState` to keep in view; mirrors `GitPanelState::
+    /// diff_scroll`'s plain-offset shape instead.
+    pub(crate) keys_screen_scroll: u16,
     pub(crate) tabs: Vec<OpenBuffer>,
     pub(crate) active_tab: Option<usize>,
     pub(crate) palette: Option<PaletteState>,
@@ -1181,6 +1187,7 @@ impl App {
             tree_state: TreeState::new(),
             focus: Focus::LeftDock,
             active_screen: AppScreen::default(),
+            keys_screen_scroll: 0,
             tabs: Vec::new(),
             active_tab: None,
             palette: None,
@@ -6150,6 +6157,21 @@ impl App {
         // silently edit whatever buffer was open before the user switched
         // here (`Focus` is never touched by a screen switch, see §4).
         if self.active_screen == AppScreen::Keys {
+            match key.code {
+                KeyCode::Up => {
+                    self.keys_screen_scroll = self.keys_screen_scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.keys_screen_scroll = self.keys_screen_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.keys_screen_scroll = self.keys_screen_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    self.keys_screen_scroll = self.keys_screen_scroll.saturating_add(10);
+                }
+                _ => {}
+            }
             return LoopSignal::Continue;
         }
         match self.focus {
@@ -6243,6 +6265,18 @@ impl App {
                     AppScreen::Run => self.go_to_run_screen(),
                     AppScreen::Keys => self.go_to_keys_screen(),
                 }
+                return;
+            }
+        }
+        for &(rect, tab) in &hits.left_dock_tabs {
+            if rect.contains(point.into()) {
+                self.show_left_dock_tab(tab);
+                return;
+            }
+        }
+        for &(rect, tab) in &hits.bottom_dock_tabs {
+            if rect.contains(point.into()) {
+                self.show_bottom_dock_tab(tab);
                 return;
             }
         }
@@ -6359,6 +6393,15 @@ impl App {
     ) {
         let synthetic = KeyEvent::new(direction, KeyModifiers::NONE);
         if self.any_popup_open() {
+            self.handle_key(synthetic);
+            return;
+        }
+        // Keys screen (mouse-support revision note 3): it renders no tree
+        // and no editor text area, so the position-based branches below
+        // would drop the wheel event; route the synthetic key into
+        // `handle_key`, whose `AppScreen::Keys` guard moves
+        // `keys_screen_scroll` for exactly these Up/Down codes.
+        if self.active_screen == AppScreen::Keys {
             self.handle_key(synthetic);
             return;
         }
@@ -13524,6 +13567,8 @@ mod tests {
                 },
                 AppScreen::Run,
             )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
@@ -13663,6 +13708,29 @@ mod tests {
     }
 
     #[test]
+    fn keys_screen_scrolls_via_up_down_page_keys() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.keys_screen_scroll, 10);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.keys_screen_scroll, 11);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.keys_screen_scroll, 10);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.keys_screen_scroll, 0);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(
+            app.keys_screen_scroll, 0,
+            "scroll offset saturates, never underflows below zero"
+        );
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        assert_eq!(app.keys_screen_scroll, 0);
+    }
+
+    #[test]
     fn handle_mouse_click_on_a_screen_tab_switches_the_active_screen() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
@@ -13679,6 +13747,8 @@ mod tests {
                 },
                 AppScreen::Run,
             )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
 
         app.handle_mouse(
@@ -13687,6 +13757,70 @@ mod tests {
         );
 
         assert_eq!(app.active_screen, AppScreen::Run);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_left_dock_tab_switches_the_left_dock_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![(
+                Rect {
+                    x: 0,
+                    y: 1,
+                    width: 5,
+                    height: 1,
+                },
+                LeftDockTab::Todos,
+            )],
+            bottom_dock_tabs: vec![],
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
+            &hits,
+        );
+
+        assert_eq!(
+            app.left_dock.as_ref().map(|d| d.tab),
+            Some(LeftDockTab::Todos)
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_bottom_dock_tab_switches_the_bottom_dock_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![(
+                Rect {
+                    x: 40,
+                    y: 24,
+                    width: 8,
+                    height: 1,
+                },
+                BottomDockTab::Cargo,
+            )],
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 42, 24),
+            &hits,
+        );
+
+        assert_eq!(
+            app.bottom_dock.as_ref().map(|d| d.tab),
+            Some(BottomDockTab::Cargo)
+        );
     }
 
     #[test]
@@ -13707,6 +13841,8 @@ mod tests {
                 },
                 AppScreen::Run,
             )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
 
         app.handle_mouse(
@@ -18752,6 +18888,8 @@ mod tests {
             editor_text_area: None,
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -18794,6 +18932,8 @@ mod tests {
                 ),
             ],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
@@ -18816,6 +18956,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -18842,6 +18984,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         // Column 15 is well within the 20-wide hit-test area but past
         // "ab"'s own 2 characters -- must clamp to line end, not no-op.
@@ -18870,6 +19014,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5),
@@ -18891,6 +19037,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
@@ -18913,6 +19061,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert!(app.active_buffer().is_none());
@@ -18932,6 +19082,8 @@ mod tests {
             editor_text_area: None,
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -19132,6 +19284,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -19155,6 +19309,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 4),
@@ -19182,6 +19338,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
@@ -19322,6 +19480,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
@@ -19348,6 +19508,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
@@ -19375,6 +19537,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane, 1),
@@ -19558,6 +19722,8 @@ mod tests {
             editor_text_area: None,
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -19601,6 +19767,8 @@ mod tests {
             editor_text_area: None,
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
 
@@ -19625,6 +19793,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 1);
@@ -19647,9 +19817,30 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 1, 1), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_keys_screen_moves_keys_screen_scroll() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+        let hits = ui::HitMap::default();
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.keys_screen_scroll, 1);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.keys_screen_scroll, 2);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.keys_screen_scroll, 1);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.keys_screen_scroll, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.keys_screen_scroll, 0);
     }
 
     #[test]
@@ -19665,6 +19856,8 @@ mod tests {
             }),
             tab_strip: vec![],
             screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
         };
         for _ in 0..10 {
             app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);
