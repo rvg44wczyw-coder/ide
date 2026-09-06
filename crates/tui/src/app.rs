@@ -2562,22 +2562,30 @@ impl App {
     }
 
     /// `GoToGitScreen` command (`docs/features/tui-screen-navigation.md`
-    /// §2.2/§3.2, T44). Deliberately does not call `toggle_git_panel` (that
-    /// function's own `close_all_overlays()` call would be the wrong thing
-    /// to run unconditionally here, and it's `toggle_git_panel`'s many
-    /// existing test call sites, not this one, that actually need that
-    /// close-other-overlays-first behavior) -- ensures `git_panel` is
-    /// populated without ever resetting it back to a fresh `default()` on
-    /// a screen a user is merely revisiting.
+    /// §2.2/§3.2, T44) -- like every other "open a major view" command
+    /// (`toggle_problems`, `toggle_notifications`, `toggle_git_panel`
+    /// itself), closes every other overlay first. Unlike a plain
+    /// `close_all_overlays()` call, `git_panel`'s own existing state is
+    /// saved before that call (which unconditionally clears it) and
+    /// restored after, rather than calling `toggle_git_panel` directly --
+    /// that function always resets to a fresh `default()` when opening
+    /// from `None`, which would discard a draft commit message/diff
+    /// selection on every revisit to a screen the user never actually
+    /// left the underlying state of.
     fn go_to_git_screen(&mut self) {
-        self.git_panel.get_or_insert_with(GitPanelState::default);
+        let existing = self.git_panel.take();
+        self.close_all_overlays();
+        self.git_panel = Some(existing.unwrap_or_default());
         self.active_screen = AppScreen::Git;
     }
 
     /// `GoToRunScreen` command (`docs/features/tui-screen-navigation.md`
-    /// §2.2/§3.3, T44). `self.cargo` is already an always-alive struct
-    /// (T33) -- nothing to construct.
+    /// §2.2/§3.3, T44) -- like every other "open a major view" command,
+    /// closes every other overlay first. `self.cargo` is already an
+    /// always-alive struct (T33) and isn't touched by `close_all_overlays`
+    /// -- nothing to save/restore here, unlike `go_to_git_screen`.
     fn go_to_run_screen(&mut self) {
+        self.close_all_overlays();
         self.active_screen = AppScreen::Run;
     }
 
@@ -3891,15 +3899,34 @@ impl App {
         state.diff_scroll = 0;
     }
 
-    /// `ToggleGitPanel` command (palette-only, no default binding -- see
-    /// `commands.rs`): opens/closes the Git Panel overlay. `self.git`'s own
-    /// fields persist across the toggle -- only the transient cursor/scroll
-    /// state in `GitPanelState` resets to a fresh `default()` on open.
+    /// Lower-level open/close primitive for `git_panel` -- no `Command`
+    /// dispatches here directly any more (`ToggleGitPanel`'s `Command` is
+    /// repointed to `GoToGitScreen`, `docs/features/
+    /// tui-screen-navigation.md` §2.2, T44); this function is now called
+    /// only by `trigger_git_branches`/`trigger_git_worktrees`/
+    /// `trigger_show_file_history`/the background merge-conflict handler
+    /// (each already followed immediately by `self.active_screen =
+    /// AppScreen::Git`) and directly by its own tests below. `self.git`'s
+    /// own fields persist across the toggle -- only the transient cursor/
+    /// scroll state in `GitPanelState` resets to a fresh `default()` on
+    /// open. Keeps `active_screen` in sync with `git_panel` on both the
+    /// open and close paths: `handle_key`/`any_popup_open` gate Git-panel
+    /// key/popup priority on `active_screen == AppScreen::Git` rather than
+    /// `git_panel.is_some()` (fixing a T44 review-round bug where leaving
+    /// the Git screen via Esc -- which deliberately no longer clears
+    /// `git_panel`, see `handle_git_panel_key`'s own Esc branch -- left
+    /// every subsequent key/click permanently intercepted here instead of
+    /// reaching the editor), so every caller of this toggle must keep the
+    /// two fields' "is Git panel state relevant right now" meaning
+    /// aligned, not just `git_panel` itself.
     fn toggle_git_panel(&mut self) {
         let opening = self.git_panel.is_none();
         self.close_all_overlays();
         if opening {
             self.git_panel = Some(GitPanelState::default());
+            self.active_screen = AppScreen::Git;
+        } else {
+            self.active_screen = AppScreen::Editor;
         }
     }
 
@@ -3980,9 +4007,12 @@ impl App {
         }
     }
 
-    /// Handles every key while `git_panel.is_some()` (`docs/features/
-    /// tui-git-staging-branches-and-log-filters.md` §3.2, extending `T11`'s
-    /// original single-mode dispatch). Checked in this order, first match
+    /// Handles every key while `active_screen == AppScreen::Git`
+    /// (`docs/features/tui-git-staging-branches-and-log-filters.md` §3.2,
+    /// extending `T11`'s original single-mode dispatch; the dispatch gate
+    /// itself moved from `git_panel.is_some()` to `active_screen` in
+    /// `docs/features/tui-screen-navigation.md`'s T44 review round -- see
+    /// `toggle_git_panel`'s own doc comment for why). Checked in this order, first match
     /// wins -- getting this order wrong lets one mode's keys leak into
     /// another's, e.g. `g`/`s`/`b` reaching a commit-message field mid-edit
     /// as a view switch instead of a typed character:
@@ -5824,7 +5854,21 @@ impl App {
         if self.git_gutter_popup_line.is_some() {
             return self.handle_git_gutter_popup_key(key);
         }
-        if self.git_panel.is_some() {
+        // `docs/features/tui-screen-navigation.md`, T44 review round --
+        // gated on `active_screen`, not `git_panel.is_some()`: `git_panel`
+        // deliberately stays `Some` after leaving the Git screen via Esc
+        // (state persists across screen switches, see
+        // `handle_git_panel_key`'s own Esc branch), so gating on
+        // `git_panel.is_some()` here would permanently intercept every key
+        // for the rest of the session the first time the Git screen was
+        // ever visited -- `active_screen`, not `git_panel`, is the actual
+        // "is Git panel key handling active right now" signal. Every
+        // caller that sets `git_panel` (`go_to_git_screen`,
+        // `toggle_git_panel`, and the five call sites documented on
+        // `toggle_git_panel`'s own comment) also keeps `active_screen` in
+        // sync, so this is equivalent whenever the Git screen is actually
+        // showing.
+        if self.active_screen == AppScreen::Git {
             return self.handle_git_panel_key(key);
         }
         if self.clone_panel_open {
@@ -5948,7 +5992,9 @@ impl App {
             || self.pending_refactor_preview.is_some()
             || self.blame_popup.is_some()
             || self.git_gutter_popup_line.is_some()
-            || self.git_panel.is_some()
+            // Gated on `active_screen`, not `git_panel.is_some()` -- see
+            // `handle_key`'s matching check above for why.
+            || self.active_screen == AppScreen::Git
             || self.clone_panel_open
             || self.keymap_popup.is_some()
             || self.theme_popup.is_some()
@@ -13207,6 +13253,83 @@ mod tests {
 
         assert_eq!(app.active_screen, AppScreen::Git);
         assert!(app.git_panel.is_some());
+    }
+
+    #[test]
+    fn go_to_git_screen_closes_other_overlays_but_preserves_git_panel_state() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.notifications_open = true;
+        app.git_panel = Some(GitPanelState {
+            diff_scroll: 7,
+            ..GitPanelState::default()
+        });
+
+        app.go_to_git_screen();
+
+        assert!(!app.notifications_open);
+        assert_eq!(app.active_screen, AppScreen::Git);
+        assert_eq!(app.git_panel.as_ref().unwrap().diff_scroll, 7);
+    }
+
+    #[test]
+    fn go_to_run_screen_closes_other_overlays() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.hover_open = true;
+
+        app.go_to_run_screen();
+
+        assert!(!app.hover_open);
+        assert_eq!(app.active_screen, AppScreen::Run);
+    }
+
+    #[test]
+    fn leaving_the_git_screen_via_esc_does_not_lock_out_further_input() {
+        // Regression test for the T44 review-round bug: `handle_key`/
+        // `any_popup_open` used to gate Git-panel key/popup priority on
+        // `git_panel.is_some()`, which -- since Esc deliberately no longer
+        // clears `git_panel` (state persists across screen switches) --
+        // meant every key and mouse click was permanently swallowed by
+        // `handle_git_panel_key` for the rest of the session after the
+        // very first visit to the Git screen. The gate is now
+        // `active_screen == AppScreen::Git`.
+        let dir = sample_git_project();
+        let mut app = open_committed_tab(dir.path(), "a.txt");
+        app.run_action(Action::GoToGitScreen);
+        app.handle_key(plain_key(KeyCode::Esc));
+        assert_eq!(app.active_screen, AppScreen::Editor);
+        assert!(app.git_panel.is_some());
+
+        let before = app.tabs[app.active_tab.unwrap()].buffer.text().to_string();
+        app.handle_key(plain_key(KeyCode::Char('z')));
+        let after = app.tabs[app.active_tab.unwrap()].buffer.text().to_string();
+        assert_ne!(
+            before, after,
+            "a keystroke must reach the editor buffer after leaving the Git screen"
+        );
+
+        // And the screen tab bar (a mouse click, not a key) must also be
+        // reachable again -- `any_popup_open`'s own gate had the same bug.
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 10,
+                    y: 0,
+                    width: 3,
+                    height: 1,
+                },
+                AppScreen::Run,
+            )],
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
+            &hits,
+        );
+        assert_eq!(app.active_screen, AppScreen::Run);
     }
 
     #[test]
