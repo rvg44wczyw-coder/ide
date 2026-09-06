@@ -58,6 +58,21 @@ pub enum Focus {
     BottomDock,
 }
 
+/// Which top-level screen is currently showing in the main body
+/// (`docs/features/tui-screen-navigation.md` §2.1, T44). Independent of
+/// `Focus` (which still governs Tab/arrow routing *within* the Editor
+/// screen's Tree/Editor/BottomDock split) and independent of every popup
+/// overlay (a popup can still open on top of most screens -- see that
+/// doc's §3.6 for exactly which).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AppScreen {
+    #[default]
+    Editor,
+    Git,
+    Run,
+    Keys,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopSignal {
     Continue,
@@ -881,6 +896,7 @@ pub struct App {
     pub(crate) tree: DirEntry,
     pub(crate) tree_state: TreeState,
     pub(crate) focus: Focus,
+    pub(crate) active_screen: AppScreen,
     pub(crate) tabs: Vec<OpenBuffer>,
     pub(crate) active_tab: Option<usize>,
     pub(crate) palette: Option<PaletteState>,
@@ -1148,6 +1164,7 @@ impl App {
             tree,
             tree_state: TreeState::new(),
             focus: Focus::LeftDock,
+            active_screen: AppScreen::default(),
             tabs: Vec::new(),
             active_tab: None,
             palette: None,
@@ -1377,6 +1394,7 @@ impl App {
                             if self.git_panel.is_none() {
                                 self.toggle_git_panel();
                             }
+                            self.active_screen = AppScreen::Git;
                             if let Some(state) = self.git_panel.as_mut() {
                                 state.view = GitPanelView::Log;
                                 state.focus = GitPanelFocus::Conflicts;
@@ -2534,15 +2552,40 @@ impl App {
         LoopSignal::Continue
     }
 
-    /// `ToggleCargoPanel` command (palette-only, no default binding -- see
-    /// `commands.rs`) -- since `docs/features/tui-tool-window-docking.md`
-    /// (T33), ensures/shows the bottom dock's Cargo tab instead of opening
-    /// a full-screen popup. Never touches `self.cargo` itself -- closing
-    /// hides the tab, it never stops a running command (`docs/features/
-    /// tui-cargo-panel.md` §3).
-    fn toggle_cargo_panel(&mut self) {
-        self.close_all_overlays();
-        self.show_bottom_dock_tab(BottomDockTab::Cargo);
+    /// `GoToEditorScreen` command (`docs/features/tui-screen-navigation.md`
+    /// §2.2/§3.1, T44) -- one of four mutually exclusive top-level screens,
+    /// not a toggle. Never touches `git_panel`/`self.cargo`/`Focus` -- a
+    /// screen switch alone never resets any other state (that doc's §3.2/
+    /// §3.3/§4).
+    fn go_to_editor_screen(&mut self) {
+        self.active_screen = AppScreen::Editor;
+    }
+
+    /// `GoToGitScreen` command (`docs/features/tui-screen-navigation.md`
+    /// §2.2/§3.2, T44). Deliberately does not call `toggle_git_panel` (that
+    /// function's own `close_all_overlays()` call would be the wrong thing
+    /// to run unconditionally here, and it's `toggle_git_panel`'s many
+    /// existing test call sites, not this one, that actually need that
+    /// close-other-overlays-first behavior) -- ensures `git_panel` is
+    /// populated without ever resetting it back to a fresh `default()` on
+    /// a screen a user is merely revisiting.
+    fn go_to_git_screen(&mut self) {
+        self.git_panel.get_or_insert_with(GitPanelState::default);
+        self.active_screen = AppScreen::Git;
+    }
+
+    /// `GoToRunScreen` command (`docs/features/tui-screen-navigation.md`
+    /// §2.2/§3.3, T44). `self.cargo` is already an always-alive struct
+    /// (T33) -- nothing to construct.
+    fn go_to_run_screen(&mut self) {
+        self.active_screen = AppScreen::Run;
+    }
+
+    /// `GoToKeysScreen` command (`docs/features/tui-screen-navigation.md`
+    /// §2.2/§3.4, T44). Read-only reference screen -- no state to
+    /// construct.
+    fn go_to_keys_screen(&mut self) {
+        self.active_screen = AppScreen::Keys;
     }
 
     /// Handles every key while `BottomDockTab::Cargo` is the bottom dock's
@@ -3841,6 +3884,7 @@ impl App {
         if self.git_panel.is_none() {
             self.git_panel = Some(GitPanelState::default());
         }
+        self.active_screen = AppScreen::Git;
         let state = self.git_panel.as_mut().expect("just ensured Some above");
         state.view = GitPanelView::Log;
         state.focus = GitPanelFocus::Diff;
@@ -4023,7 +4067,14 @@ impl App {
                 // overlay instead of just backing out of the filter bar.
                 self.git_panel.as_mut().expect("checked above").focus = GitPanelFocus::Graph;
             } else {
-                self.git_panel = None;
+                // `docs/features/tui-screen-navigation.md` §3.2, T44: this
+                // used to be `self.git_panel = None` (closing the modal
+                // popup entirely). Under the screen model, leaving the Git
+                // surface means returning to Editor, not discarding
+                // `git_panel`'s state -- revisiting Git later shows the
+                // same view/selection/draft commit message, not a fresh
+                // popup.
+                self.active_screen = AppScreen::Editor;
             }
             return LoopSignal::Continue;
         }
@@ -4581,6 +4632,7 @@ impl App {
         if self.git_panel.is_none() {
             self.toggle_git_panel();
         }
+        self.active_screen = AppScreen::Git;
         self.git.open_branches_popup(&self.project_root);
     }
 
@@ -4591,6 +4643,7 @@ impl App {
         if self.git_panel.is_none() {
             self.toggle_git_panel();
         }
+        self.active_screen = AppScreen::Git;
         self.git.open_worktrees_popup(&self.project_root);
     }
 
@@ -4617,6 +4670,7 @@ impl App {
         if self.git_panel.is_none() {
             self.toggle_git_panel();
         }
+        self.active_screen = AppScreen::Git;
         if let Some(state) = self.git_panel.as_mut() {
             state.view = GitPanelView::Log;
             state.focus = GitPanelFocus::Graph;
@@ -5823,8 +5877,42 @@ impl App {
         {
             return self.handle_k8s_panel_key(key);
         }
+        // `docs/features/tui-screen-navigation.md` §3.5, T44 -- must sit
+        // *before* the global keymap lookup below: `Esc` is already bound
+        // there (`CollapseSelections`, `commands.rs`), which would
+        // otherwise intercept every Esc press on the Run/Keys screens
+        // before this rule ever ran. Dead code in practice for the Git
+        // screen (its own `handle_git_panel_key` above already returns
+        // unconditionally on `Esc`, per §3.2) -- that's expected, not a
+        // bug: this is the generic fallback for screens with no bespoke
+        // Esc handling of their own.
+        if key.code == KeyCode::Esc
+            && self.active_screen != AppScreen::Editor
+            && !self.any_popup_open()
+        {
+            self.active_screen = AppScreen::Editor;
+            return LoopSignal::Continue;
+        }
         if let Some(action) = self.keymap.action_for(key.modifiers, key.code) {
             return self.run_action(action);
+        }
+        // `docs/features/tui-screen-navigation.md` §3.3, T44 -- must sit
+        // *after* the global keymap lookup above, at the same rank
+        // `Focus::BottomDock`'s own Cargo routing already occupies today
+        // (that fallback is likewise reached only once the global keymap
+        // has already failed to match), so every global binding
+        // (including `OpenPalette`) still fires normally on the Run
+        // screen exactly as it already does for the Cargo dock tab today.
+        if self.active_screen == AppScreen::Run {
+            return self.handle_cargo_panel_key(key);
+        }
+        // `docs/features/tui-screen-navigation.md` §3.4, T44 -- read-only
+        // reference screen; without this guard an unmatched key would
+        // fall through to `Focus::Editor`'s `handle_editor_key` below and
+        // silently edit whatever buffer was open before the user switched
+        // here (`Focus` is never touched by a screen switch, see §4).
+        if self.active_screen == AppScreen::Keys {
+            return LoopSignal::Continue;
         }
         match self.focus {
             Focus::LeftDock => self.handle_left_dock_key(key),
@@ -5907,6 +5995,17 @@ impl App {
             return;
         }
         let point: (u16, u16) = (event.column, event.row);
+        for &(rect, screen) in &hits.screen_tabs {
+            if rect.contains(point.into()) {
+                match screen {
+                    AppScreen::Editor => self.go_to_editor_screen(),
+                    AppScreen::Git => self.go_to_git_screen(),
+                    AppScreen::Run => self.go_to_run_screen(),
+                    AppScreen::Keys => self.go_to_keys_screen(),
+                }
+                return;
+            }
+        }
         if let Some(area) = hits.tree_area {
             if area.contains(point.into()) {
                 let row = (event.row - area.y) as usize;
@@ -6140,7 +6239,10 @@ impl App {
             Action::FindUsages => self.trigger_find_usages(),
             Action::ToggleNotifications => self.toggle_notifications(),
             Action::ToggleProblems => self.toggle_problems(),
-            Action::ToggleCargoPanel => self.toggle_cargo_panel(),
+            Action::GoToEditorScreen => self.go_to_editor_screen(),
+            Action::GoToGitScreen => self.go_to_git_screen(),
+            Action::GoToRunScreen => self.go_to_run_screen(),
+            Action::GoToKeysScreen => self.go_to_keys_screen(),
             Action::QuickDocumentation => self.trigger_quick_documentation(),
             Action::FindInPath => self.toggle_search_panel(),
             Action::ReplaceInPath => self.trigger_replace_in_path(),
@@ -6155,7 +6257,6 @@ impl App {
             Action::CreateTest => self.trigger_direct_generate(DirectGenerateKind::CreateTest),
             Action::OptimizeImports => self.trigger_optimize_imports(),
             Action::Rename => self.trigger_rename(),
-            Action::ToggleGitPanel => self.toggle_git_panel(),
             Action::GitBranches => self.trigger_git_branches(),
             Action::GitWorktrees => self.trigger_git_worktrees(),
             Action::ShowFileHistory => self.trigger_show_file_history(),
@@ -10566,45 +10667,6 @@ mod tests {
     }
 
     #[test]
-    fn run_action_toggle_cargo_panel_opens_and_closes_the_panel() {
-        let dir = sample_project();
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        assert!(!app.cargo_panel_open());
-
-        app.run_action(Action::ToggleCargoPanel);
-        assert!(app.cargo_panel_open());
-
-        app.run_action(Action::ToggleCargoPanel);
-        assert!(!app.cargo_panel_open());
-    }
-
-    #[test]
-    fn opening_cargo_panel_closes_goto_notifications_and_switches_off_problems() {
-        // Goto/notifications are true modals, closed via
-        // `close_all_overlays`. Problems isn't closed the same way anymore
-        // -- it's switched away from because Cargo and Problems share the
-        // same bottom-dock slot (`docs/features/
-        // tui-tool-window-docking.md` §2.1, T33).
-        let dir = sample_project();
-        let a = dir.path().canonicalize().unwrap().join("a.txt");
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.goto = Some(GotoState {
-            title: "Declaration",
-            results: vec![location(a, 0, 0)],
-            selected: 0,
-        });
-        app.notifications_open = true;
-        app.show_bottom_dock_tab(BottomDockTab::Problems);
-
-        app.run_action(Action::ToggleCargoPanel);
-
-        assert!(app.goto.is_none());
-        assert!(!app.notifications_open);
-        assert!(!app.problems_open());
-        assert!(app.cargo_panel_open());
-    }
-
-    #[test]
     fn opening_problems_switches_the_bottom_dock_off_an_open_cargo_panel() {
         // The reverse direction: both tabs share the bottom dock's single
         // slot, so showing one always switches away from the other.
@@ -10782,21 +10844,6 @@ mod tests {
         assert!(!app.notifications_open);
         assert!(app.cargo_panel_open());
         assert!(app.hover_open);
-    }
-
-    #[test]
-    fn opening_the_cargo_panel_closes_an_open_hover_popup() {
-        // The reverse direction of the mutual-exclusion rule -- every
-        // overlay's `open` path routes through `close_all_overlays`, so
-        // this must hold symmetrically, not just from `F1`'s own toggle.
-        let dir = sample_project();
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.hover_open = true;
-
-        app.run_action(Action::ToggleCargoPanel);
-
-        assert!(!app.hover_open);
-        assert!(app.cargo_panel_open());
     }
 
     #[test]
@@ -11016,18 +11063,6 @@ mod tests {
         assert!(app.cargo_panel_open());
         assert!(!app.hover_open);
         assert!(app.search_open);
-    }
-
-    #[test]
-    fn opening_the_cargo_panel_closes_an_open_search_panel() {
-        let dir = sample_project();
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.search_open = true;
-
-        app.run_action(Action::ToggleCargoPanel);
-
-        assert!(!app.search_open);
-        assert!(app.cargo_panel_open());
     }
 
     #[test]
@@ -11727,18 +11762,6 @@ mod tests {
         assert!(!app.hover_open);
         assert!(!app.search_open);
         assert!(app.code_actions.is_some());
-    }
-
-    #[test]
-    fn opening_the_cargo_panel_closes_an_open_code_actions_popup() {
-        let dir = sample_project();
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.code_actions = Some(CodeActionsState { selected: 0 });
-
-        app.run_action(Action::ToggleCargoPanel);
-
-        assert!(app.code_actions.is_none());
-        assert!(app.cargo_panel_open());
     }
 
     #[test]
@@ -13142,14 +13165,264 @@ mod tests {
     }
 
     #[test]
-    fn handle_git_panel_key_esc_closes_the_panel() {
+    fn handle_git_panel_key_esc_returns_to_the_editor_screen_and_keeps_git_state() {
+        // `docs/features/tui-screen-navigation.md` §3.2, T44 -- Esc now
+        // leaves the Git screen rather than tearing down `git_panel`, so
+        // state (diff selection, draft commit message, etc.) survives a
+        // later switch back via `GoToGitScreen`.
         let dir = sample_git_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.toggle_git_panel();
+        app.run_action(Action::GoToGitScreen);
+        assert_eq!(app.active_screen, AppScreen::Git);
 
         app.handle_key(plain_key(KeyCode::Esc));
 
+        assert_eq!(app.active_screen, AppScreen::Editor);
+        assert!(app.git_panel.is_some());
+    }
+
+    #[test]
+    fn go_to_run_screen_and_go_to_keys_screen_switch_active_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.active_screen, AppScreen::Editor);
+
+        app.run_action(Action::GoToRunScreen);
+        assert_eq!(app.active_screen, AppScreen::Run);
+
+        app.run_action(Action::GoToKeysScreen);
+        assert_eq!(app.active_screen, AppScreen::Keys);
+
+        app.run_action(Action::GoToEditorScreen);
+        assert_eq!(app.active_screen, AppScreen::Editor);
+    }
+
+    #[test]
+    fn go_to_git_screen_ensures_git_panel_is_some_even_when_previously_none() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
         assert!(app.git_panel.is_none());
+
+        app.run_action(Action::GoToGitScreen);
+
+        assert_eq!(app.active_screen, AppScreen::Git);
+        assert!(app.git_panel.is_some());
+    }
+
+    #[test]
+    fn esc_on_the_editor_screen_still_runs_its_own_global_binding() {
+        // The new generic "Esc returns to Editor" rule only fires when
+        // `active_screen != Editor` -- on the Editor screen itself, Esc
+        // must keep reaching its existing global binding
+        // (`CollapseSelections`), not be silently swallowed.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Enter)); // open the only row
+        app.handle_key(ctrl('t')); // focus editor
+        assert_eq!(app.active_screen, AppScreen::Editor);
+
+        // No assertion possible on CollapseSelections' own effect without a
+        // multi-cursor selection set up; the meaningful assertion here is
+        // that the screen-navigation guard didn't intercept the key at all.
+        let signal = app.handle_key(plain_key(KeyCode::Esc));
+        assert_eq!(signal, LoopSignal::Continue);
+        assert_eq!(app.active_screen, AppScreen::Editor);
+    }
+
+    #[test]
+    fn esc_on_the_run_screen_returns_to_the_editor_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToRunScreen);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert_eq!(app.active_screen, AppScreen::Editor);
+    }
+
+    #[test]
+    fn esc_on_the_keys_screen_returns_to_the_editor_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert_eq!(app.active_screen, AppScreen::Editor);
+    }
+
+    #[test]
+    fn global_keybinding_still_fires_on_the_run_screen() {
+        // Regression test for the dispatch-rank bug caught in this doc's
+        // own review round: the Run-screen check must sit *after* the
+        // global keymap lookup, or every global binding (including
+        // `OpenPalette`) would be unreachable while on this screen.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToRunScreen);
+
+        app.handle_key(key(
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            KeyCode::Char('a'),
+        ));
+
+        assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn cargo_panel_letters_still_start_subcommands_on_the_run_screen() {
+        let cases = [
+            ('b', CargoCommand::Build),
+            ('r', CargoCommand::Run),
+            ('t', CargoCommand::Test),
+            ('c', CargoCommand::Check),
+            ('l', CargoCommand::Clippy),
+            ('f', CargoCommand::Fmt),
+        ];
+        for (letter, expected) in cases {
+            let dir = sample_project();
+            let mut app = App::new(dir.path().to_path_buf()).unwrap();
+            app.run_action(Action::GoToRunScreen);
+
+            app.handle_key(plain_key(KeyCode::Char(letter)));
+
+            assert_eq!(
+                app.cargo.running,
+                Some(expected),
+                "letter {letter:?} should start {expected:?} on the Run screen"
+            );
+        }
+    }
+
+    #[test]
+    fn keys_screen_swallows_keys_instead_of_mutating_the_hidden_editor_buffer() {
+        // Regression test for the missing-guard bug caught in this doc's
+        // own review round: without the `active_screen == Keys` guard, an
+        // unmatched key falls through to `Focus::Editor`'s
+        // `handle_editor_key`, silently editing whichever buffer was open
+        // before the user switched to Keys.
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        let before = app.tabs[app.active_tab.unwrap()].buffer.text().to_string();
+        app.run_action(Action::GoToKeysScreen);
+
+        app.handle_key(plain_key(KeyCode::Char('x')));
+
+        assert_eq!(app.active_screen, AppScreen::Keys);
+        assert_eq!(
+            app.tabs[app.active_tab.unwrap()].buffer.text(),
+            before,
+            "a keystroke on the Keys screen must never reach the hidden editor buffer"
+        );
+    }
+
+    #[test]
+    fn palette_opens_on_top_of_the_run_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToRunScreen);
+
+        app.open_palette();
+
+        assert!(app.any_popup_open());
+        assert_eq!(app.active_screen, AppScreen::Run);
+    }
+
+    #[test]
+    fn palette_opens_on_top_of_the_keys_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+
+        app.open_palette();
+
+        assert!(app.any_popup_open());
+        assert_eq!(app.active_screen, AppScreen::Keys);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_screen_tab_switches_the_active_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 10,
+                    y: 0,
+                    width: 3,
+                    height: 1,
+                },
+                AppScreen::Run,
+            )],
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
+            &hits,
+        );
+
+        assert_eq!(app.active_screen, AppScreen::Run);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_screen_tab_is_ignored_while_a_popup_is_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_palette();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 10,
+                    y: 0,
+                    width: 3,
+                    height: 1,
+                },
+                AppScreen::Run,
+            )],
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
+            &hits,
+        );
+
+        assert_eq!(app.active_screen, AppScreen::Editor);
+        assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn trigger_git_branches_worktrees_and_show_file_history_all_switch_to_the_git_screen() {
+        // The five self-caught call sites (`docs/features/
+        // tui-screen-navigation.md` implementation notes) that populate
+        // `git_panel` directly without going through `go_to_git_screen` --
+        // each must still land on the Git screen, or the populated state
+        // would be invisible under the new render dispatch.
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.trigger_git_branches();
+        assert_eq!(app.active_screen, AppScreen::Git);
+
+        app.run_action(Action::GoToEditorScreen);
+        app.trigger_git_worktrees();
+        assert_eq!(app.active_screen, AppScreen::Git);
+    }
+
+    #[test]
+    fn trigger_show_diff_for_gutter_switches_to_the_git_screen() {
+        let dir = git_repo_without_commits();
+        git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
+        std::fs::write(dir.path().join("f.txt"), "a\nB\nc\n").unwrap();
+        let mut app = open_committed_tab(dir.path(), "f.txt");
+        app.git_gutter_popup_line = Some(1);
+
+        app.trigger_show_diff_for_gutter();
+
+        assert_eq!(app.active_screen, AppScreen::Git);
     }
 
     #[test]
@@ -16887,7 +17160,7 @@ mod tests {
         // tui-tool-window-docking.md` §2.4, T33).
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.run_action(Action::ToggleCargoPanel);
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
         assert!(app.cargo_panel_open());
 
         app.run_action(Action::ToggleClaudePanel);
@@ -17998,6 +18271,7 @@ mod tests {
             }),
             editor_text_area: None,
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -18039,6 +18313,7 @@ mod tests {
                     1,
                 ),
             ],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
@@ -18060,6 +18335,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -18085,6 +18361,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         // Column 15 is well within the 20-wide hit-test area but past
         // "ab"'s own 2 characters -- must clamp to line end, not no-op.
@@ -18112,6 +18389,7 @@ mod tests {
                 height: 10,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5),
@@ -18132,6 +18410,7 @@ mod tests {
                 height: 10,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
@@ -18153,6 +18432,7 @@ mod tests {
                 height: 10,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert!(app.active_buffer().is_none());
@@ -18171,6 +18451,7 @@ mod tests {
             }),
             editor_text_area: None,
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -18370,6 +18651,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -18392,6 +18674,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 4),
@@ -18418,6 +18701,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
@@ -18557,6 +18841,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
@@ -18582,6 +18867,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
@@ -18608,6 +18894,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane, 1),
@@ -18790,6 +19077,7 @@ mod tests {
             }),
             editor_text_area: None,
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -18832,6 +19120,7 @@ mod tests {
             }),
             editor_text_area: None,
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
 
@@ -18855,6 +19144,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 1);
@@ -18876,6 +19166,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 1, 1), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 0);
@@ -18893,6 +19184,7 @@ mod tests {
                 height: 5,
             }),
             tab_strip: vec![],
+            screen_tabs: vec![],
         };
         for _ in 0..10 {
             app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);

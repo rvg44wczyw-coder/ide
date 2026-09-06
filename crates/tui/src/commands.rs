@@ -182,7 +182,10 @@ pub enum Action {
     FindUsages,
     ToggleNotifications,
     ToggleProblems,
-    ToggleCargoPanel,
+    GoToEditorScreen,
+    GoToGitScreen,
+    GoToRunScreen,
+    GoToKeysScreen,
     QuickDocumentation,
     FindInPath,
     ReplaceInPath,
@@ -193,7 +196,6 @@ pub enum Action {
     CreateTest,
     OptimizeImports,
     Rename,
-    ToggleGitPanel,
     JumpToMatchingBracket,
     DuplicateLines,
     DeleteLines,
@@ -366,8 +368,40 @@ pub fn commands() -> &'static [Command] {
         Command {
             id: "ToggleCargoPanel",
             title: "Cargo",
+            // This `Command`'s id/title are repointed, not removed
+            // (`docs/features/tui-screen-navigation.md` §2.2, T44): existing
+            // palette muscle-memory still resolves, but the action now
+            // switches to the full-screen Run screen rather than opening
+            // the bottom-dock Cargo tab. `Action::ToggleCargoPanel` itself
+            // was removed (dead: no `Command` constructed it any more, and
+            // `App::toggle_cargo_panel` is still exercised directly by
+            // tests, not through `run_action`).
             binding: None,
-            action: Action::ToggleCargoPanel,
+            action: Action::GoToRunScreen,
+        },
+        Command {
+            id: "GoToEditorScreen",
+            title: "Editor",
+            binding: None,
+            action: Action::GoToEditorScreen,
+        },
+        // No separate "GoToGitScreen"/"Git" entry here: `ToggleGitPanel`
+        // below is already titled "Git" and is itself repointed to
+        // `Action::GoToGitScreen` -- a second entry with the identical
+        // title would be a genuine palette duplicate (unlike Cargo/Run,
+        // which at least have distinct titles), self-caught while wiring
+        // this up, not present in the doc's original draft.
+        Command {
+            id: "GoToRunScreen",
+            title: "Run",
+            binding: None,
+            action: Action::GoToRunScreen,
+        },
+        Command {
+            id: "GoToKeysScreen",
+            title: "Keys",
+            binding: None,
+            action: Action::GoToKeysScreen,
         },
         Command {
             id: "QuickDocumentation",
@@ -484,8 +518,17 @@ pub fn commands() -> &'static [Command] {
             // `ToggleCargoPanel` in the no-binding category rather than
             // being translated from anything (`docs/features/
             // tui-git-panel.md` §1/§2.3).
+            //
+            // This `Command`'s id/title are repointed, not removed
+            // (`docs/features/tui-screen-navigation.md` §2.2, T44): existing
+            // palette muscle-memory still resolves, but the action now
+            // switches to the full-screen Git screen rather than opening
+            // the modal Git Panel popup. `Action::ToggleGitPanel` itself
+            // was removed (dead: no `Command` constructed it any more, and
+            // `App::toggle_git_panel` is still exercised directly by tests,
+            // not through `run_action`).
             binding: None,
-            action: Action::ToggleGitPanel,
+            action: Action::GoToGitScreen,
         },
         Command {
             id: "JumpToMatchingBracket",

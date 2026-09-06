@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 use crate::app::{
-    ActionFormField, App, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView,
+    ActionFormField, App, AppScreen, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView,
     DebugPanelFocus, FilterField, Focus, GitPanelFocus, GitPanelState, GitPanelView, LeftDockState,
     LeftDockTab, SearchInPathField,
 };
@@ -38,7 +38,9 @@ use crate::highlight::{
 };
 use crate::k8s_panel::{K8sPicker, K8sTab};
 
-/// Non-text rows around the editor's visible buffer content: the status
+/// Non-text rows around the editor's visible buffer content: the
+/// permanent screen tab bar (1 row, `docs/features/
+/// tui-screen-navigation.md` §2.3/§4, T44) plus the status
 /// bar (`render`'s own vertical split, 1 row) plus `render_editor`'s
 /// `Block`'s top/bottom borders (2 rows) plus the tab strip (1 row) plus
 /// the breadcrumbs strip (1 row, `docs/features/
@@ -52,14 +54,16 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// change with it -- there is no single source of truth to keep them in
 /// sync automatically, so a `Layout` change here is also a reason to grep
 /// for this constant's uses (`main.rs`) before merging (`docs/features/
-/// tui-scroll-follows-cursor.md` §2.1). The breadcrumbs row is *always*
-/// reserved, whether or not `App::active_breadcrumbs()` is non-empty on
-/// any given frame -- a content-conditional row would desync this
-/// precomputed count from `render_editor`'s actual drawn layout on any
-/// frame where the caret enters/leaves a symbol, since this constant is
-/// read before any `Layout` pass runs (`tui-file-structure-and-
-/// breadcrumbs.md` §3.4 spells out why).
-pub const EDITOR_CHROME_ROWS: u16 = 5;
+/// tui-scroll-follows-cursor.md` §2.1). The breadcrumbs row (like the
+/// screen tab bar) is *always* reserved, whether or not `App::
+/// active_breadcrumbs()` is non-empty on any given frame -- a content-
+/// conditional row would desync this precomputed count from
+/// `render_editor`'s actual drawn layout on any frame where the caret
+/// enters/leaves a symbol, since this constant is read before any
+/// `Layout` pass runs (`tui-file-structure-and-breadcrumbs.md` §3.4
+/// spells out why; the screen tab bar is unconditional by construction
+/// so it never had this failure mode to begin with).
+pub const EDITOR_CHROME_ROWS: u16 = 6;
 
 /// Right-margin guide column (`docs/features/right-margin-guide.md` §1) --
 /// always this literal value in `ide-tui`, unlike `ide-ui` where it's
@@ -78,6 +82,11 @@ pub struct HitMap {
     pub tree_area: Option<Rect>,
     pub editor_text_area: Option<Rect>,
     pub tab_strip: Vec<(Rect, usize)>,
+    /// Screen tab bar click regions (`docs/features/
+    /// tui-screen-navigation.md` §2.3, T44) -- mirrors `tab_strip`'s own
+    /// `Vec<(Rect, _)>` shape, keyed by `AppScreen` instead of a buffer
+    /// index.
+    pub screen_tabs: Vec<(Rect, AppScreen)>,
 }
 
 /// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
@@ -89,48 +98,62 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let size = frame.area();
     let rows = Layout::default()
         .direction(LayoutDirection::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(size);
-    let body = rows[0];
-    let status_area = rows[1];
+    let tab_bar_area = rows[0];
+    let body = rows[1];
+    let status_area = rows[2];
 
-    let left_width = app.left_dock.is_some().then_some(app.left_dock_width_pct);
-    let columns = match left_width {
-        Some(pct) => Layout::default()
-            .direction(LayoutDirection::Horizontal)
-            .constraints([
-                Constraint::Percentage(pct),
-                Constraint::Percentage(100 - pct),
-            ])
-            .split(body),
-        None => Layout::default()
-            .constraints([Constraint::Percentage(0), Constraint::Percentage(100)])
-            .split(body),
-    };
-    if let Some(dock) = &app.left_dock {
-        render_left_dock(frame, app, dock, columns[0], hits);
-    }
+    render_screen_tabs(frame, app, tab_bar_area, hits);
 
-    let right_column = columns[1];
-    let bottom_height = app
-        .bottom_dock
-        .is_some()
-        .then_some(app.bottom_dock_height_pct);
-    let rows2 = match bottom_height {
-        Some(pct) => Layout::default()
-            .direction(LayoutDirection::Vertical)
-            .constraints([
-                Constraint::Percentage(100 - pct),
-                Constraint::Percentage(pct),
-            ])
-            .split(right_column),
-        None => Layout::default()
-            .constraints([Constraint::Percentage(100), Constraint::Percentage(0)])
-            .split(right_column),
-    };
-    render_editor(frame, app, rows2[0], hits);
-    if let Some(dock) = &app.bottom_dock {
-        render_bottom_dock(frame, app, dock, rows2[1], hits);
+    match app.active_screen {
+        AppScreen::Editor => {
+            let left_width = app.left_dock.is_some().then_some(app.left_dock_width_pct);
+            let columns = match left_width {
+                Some(pct) => Layout::default()
+                    .direction(LayoutDirection::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(pct),
+                        Constraint::Percentage(100 - pct),
+                    ])
+                    .split(body),
+                None => Layout::default()
+                    .constraints([Constraint::Percentage(0), Constraint::Percentage(100)])
+                    .split(body),
+            };
+            if let Some(dock) = &app.left_dock {
+                render_left_dock(frame, app, dock, columns[0], hits);
+            }
+
+            let right_column = columns[1];
+            let bottom_height = app
+                .bottom_dock
+                .is_some()
+                .then_some(app.bottom_dock_height_pct);
+            let rows2 = match bottom_height {
+                Some(pct) => Layout::default()
+                    .direction(LayoutDirection::Vertical)
+                    .constraints([
+                        Constraint::Percentage(100 - pct),
+                        Constraint::Percentage(pct),
+                    ])
+                    .split(right_column),
+                None => Layout::default()
+                    .constraints([Constraint::Percentage(100), Constraint::Percentage(0)])
+                    .split(right_column),
+            };
+            render_editor(frame, app, rows2[0], hits);
+            if let Some(dock) = &app.bottom_dock {
+                render_bottom_dock(frame, app, dock, rows2[1], hits);
+            }
+        }
+        AppScreen::Git => render_git_panel(frame, app, body),
+        AppScreen::Run => render_cargo_panel(frame, app, body),
+        AppScreen::Keys => render_keys_screen(frame, app, body),
     }
     render_status(frame, app, status_area);
 
@@ -174,9 +197,6 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     if app.git_gutter_popup_line.is_some() {
         render_git_gutter_popup(frame, app, size);
-    }
-    if app.git_panel.is_some() {
-        render_git_panel(frame, app, size);
     }
     if app.clone_panel_open {
         render_clone_panel(frame, app, size);
@@ -615,6 +635,46 @@ fn blame_lane_prefix(
         _ => String::new(),
     };
     format!("{label:<BLAME_LANE_CHARS$} ")
+}
+
+/// Permanent screen tab bar (`docs/features/tui-screen-navigation.md`
+/// §2.3, T44) -- always rendered, the first row of every frame regardless
+/// of `active_screen`, same "unconditional chrome row" precedent
+/// `render_breadcrumbs`'s own reserved row already established (that one
+/// renders blank when empty; this one always has all four labels).
+fn render_screen_tabs(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    let screens = [
+        (AppScreen::Editor, "Editor"),
+        (AppScreen::Git, "Git"),
+        (AppScreen::Run, "Run"),
+        (AppScreen::Keys, "Keys"),
+    ];
+    let mut spans = Vec::new();
+    let mut column = area.x;
+    for (i, (screen, label)) in screens.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            column += 2;
+        }
+        let style = if *screen == app.active_screen {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let width = Span::raw(*label).width() as u16;
+        hits.screen_tabs.push((
+            Rect {
+                x: column,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            *screen,
+        ));
+        column += width;
+        spans.push(Span::styled(*label, style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
@@ -1144,6 +1204,32 @@ fn render_keymap_popup(frame: &mut Frame, app: &App, area: Rect) {
         state.query
     ));
     frame.render_widget(List::new(items).block(block), popup);
+}
+
+/// Keys screen (`docs/features/tui-screen-navigation.md` §2.3, T44) --
+/// full-screen, read-only reference reusing `keymap_popup_rows`'s content
+/// (which tolerates `app.keymap_popup` being `None`, returning every
+/// command unfiltered). No selection/rebind UI here -- that's the existing
+/// Keymap Settings popup's job (`render_keymap_popup` above); this screen
+/// is a plain reference list, editing arrives in a later T-run (T47).
+fn render_keys_screen(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = app.keymap_popup_rows();
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|cmd| {
+            let binding = app
+                .keymap
+                .effective_binding(cmd.id)
+                .map(crate::keymap::label)
+                .unwrap_or_else(|| "\u{2014}".to_string());
+            ListItem::new(Line::from(format!("{}  {binding}", cmd.title)))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Keys  (reference only -- use the Keymap command to rebind)");
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 /// Theme Settings popup (`docs/features/tui-theme.md` §2.3/`T41`) --
