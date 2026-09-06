@@ -59,6 +59,12 @@ enum DirectRefactorKind {
     ExtractField,
     Inline,
 }
+
+/// `⌃T`'s list-selection state -- see the field doc below for why this
+/// isn't a reuse of `CodeActionsState`.
+pub(crate) struct RefactorMenuState {
+    pub(crate) selected: usize,
+}
 ```
 
 On `App`, alongside the existing `code_actions: Option<CodeActionsState>`
@@ -66,12 +72,16 @@ On `App`, alongside the existing `code_actions: Option<CodeActionsState>`
 String)>` (`app.rs:905`):
 
 ```rust
-/// `⌃T`'s list-selection state. Reuses `CodeActionsState` verbatim
-/// (`selected: usize`) rather than a new type -- the popup this drives
-/// (`render_refactor_menu_popup`) has the exact same list/select/Enter
-/// shape as `render_code_actions_popup`, just sourced from a filtered
-/// view of `lsp.code_actions` instead of the whole thing.
-pub(crate) refactor_menu: Option<CodeActionsState>,
+/// `⌃T`'s list-selection state -- its own type
+/// (`RefactorMenuState { selected: usize }`), not a reuse of `CodeActionsState`.
+/// This mirrors `GenerateMenuState`'s own documented reasoning exactly
+/// (`app.rs:315-318`): it indexes into `refactor_menu_actions()`'s
+/// filtered view, not `lsp.code_actions` wholesale, and the two lists can
+/// have different lengths/orderings, so an index meaningful in one is not
+/// meaningful in the other -- the same reason `GenerateMenuState` isn't a
+/// `CodeActionsState` either, despite an identical `{selected: usize}`
+/// shape.
+pub(crate) refactor_menu: Option<RefactorMenuState>,
 pub(crate) pending_refactor_preview: Option<RefactorPreview>,
 /// Set immediately before this phase's code sends `LspRequest::
 /// ApplyCodeAction`, taken (read-and-cleared) unconditionally at the top
@@ -232,7 +242,7 @@ fn trigger_refactor_this(&mut self) {
         return;
     }
     self.close_all_overlays();
-    self.refactor_menu = Some(CodeActionsState { selected: 0 });
+    self.refactor_menu = Some(RefactorMenuState { selected: 0 });
 }
 ```
 
@@ -480,7 +490,7 @@ refactor-kind actions available:**
 
 ```rust
 app.trigger_refactor_this();
-// refactor_menu = Some(CodeActionsState { selected: 0 }); the popup
+// refactor_menu = Some(RefactorMenuState { selected: 0 }); the popup
 // lists only entries whose kind starts with "refactor" -- e.g. "Extract
 // into function", "Inline variable" -- omitting any quickfix/import-style
 // entries lsp.code_actions might also currently hold.
