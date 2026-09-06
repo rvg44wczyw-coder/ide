@@ -471,17 +471,16 @@ assert!(app.ai.history.iter().any(|m| matches!(m, AiDisplayMessage::Assistant(_)
 
 **New workspace members** (root `Cargo.toml`): `crates/ai`, `crates/sanitizer`.
 
-**Approved deps** (recorded in `CLAUDE.md` 2026-09-06; `hyper-util` and
-`hyper-rustls` below are **pending user approval** — flagged by the rev
-pass as a blocking gap, see `## Revision notes` r4):
+**Approved deps** (all recorded in `CLAUDE.md`, 2026-09-06; `hyper-util`
+and `hyper-rustls` approved by user 2026-09-06 as `hyper` companions):
 
 | Crate | For |
 |---|---|
 | `tokio` (full features) | async HTTP + background thread runtime |
 | `hyper` | hand-rolled HTTP/1.1 client |
 | `http-body-util` + `bytes` | hyper response-body reading (approved as hyper companions, 2026-09-06) |
-| `hyper-util` | `TokioExecutor`/`TokioIo` glue for the hand-rolled hyper 1.x client (**rev finding: pending user approval**, T49) |
-| `hyper-rustls` | native TLS over hyper's HTTP/1.1 client (`with_native_roots`; **rev finding: pending user approval**, T49) |
+| `hyper-util` | `TokioExecutor`/`TokioIo` glue for the hand-rolled hyper 1.x client (approved 2026-09-06) |
+| `hyper-rustls` | native TLS over hyper's HTTP/1.1 client (`with_native_roots`; approved 2026-09-06) |
 | `syn` | Rust string-literal AST masking (feature-gated `rust-ast`) |
 | `regex` (already approved) | sanitizer regex passes |
 
@@ -526,6 +525,10 @@ pass as a blocking gap, see `## Revision notes` r4):
   (delta channel, not ClaudePanel's whole-reply contract); `Ai` settings
   slot now (persisted config, no settings UI); `http-body-util`+`bytes`
   approved as hyper companions.
+- **r5 (2026-09-06, dependency approval):** `hyper-util` and `hyper-rustls`
+  approved by user as necessary `hyper` 1.x companions (same rationale as
+  the `http-body-util`+`bytes` approval); recorded in `CLAUDE.md` deps table
+  and §6. Resolves the r4-listed blocking dependency gap.
 - **r4 (2026-09-06, rev-pass doc corrections):** §2.3 `Provider` enum
   corrected from `{ Ollama { transport: HttpTransport }, … }` to unit
   variants (transport is stateless, constructed per-call); `endpoint`
