@@ -149,8 +149,8 @@ pub fn mask_rust_strings(s: &mut Sanitizer, input: &str) -> String;
 ### 2.3 `ide-ai` (`crates/ai`, second role, `rust-tui-dev`)
 
 Depends on `ide-core` (for `ProjectSettingsFile::Ai` read) and optionally
-`ide-sanitizer` (feature `sanitizer`, default on; cloud dispatch enforces
-it at runtime):
+`ide-sanitizer` (feature `sanitizer`, default on; when compiled **out**,
+`stream_chat` refuses cloud dispatch at runtime — `AiError::Message`):
 
 ```rust
 // Provider identity + enablement.
@@ -204,14 +204,16 @@ panel's "background thread + std mpsc" model (`claude_panel.rs`) and
 thread choreography.
 
 ```rust
-/// Full provider surface; implemented per provider, sharing one hyper
-/// client. No trait object, no async-trait: each provider is a struct
-/// (one variant per `ProviderId`) behind `enum Provider` dispatch.
+/// Full provider surface; implemented per provider via `enum Provider`
+/// dispatch (one unit variant per `ProviderId`). No trait object, no
+/// async-trait, no held transport state: the shared `HttpTransport` is
+/// constructed per call inside `stream_chat`/`complete_fim`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
-    Ollama { transport: HttpTransport },
-    Gemini { transport: HttpTransport },
-    Groq { transport: HttpTransport },
-    GitHubModels { transport: HttpTransport },
+    Ollama,
+    Gemini,
+    Groq,
+    GitHubModels,
 }
 ```
 
@@ -233,7 +235,7 @@ Gemini's `role: "model"`; `ChatMessage::User` maps to `role: "user"`
 ```rust
 impl Provider {
     /// URL + auth header source for this provider (`key=this credential`).
-    pub fn endpoint(&self) -> String;
+    pub fn endpoint(self) -> &'static str;
     /// POST `request`, stream SSE `data:` deltas into `tx`. Resolves when
     /// the stream closes or errors. Non-blocking to the caller.
     pub async fn stream_chat(
@@ -380,9 +382,12 @@ lists an assistant panel; `commands.rs:895-901`). No invented binding.
 
 ### 3.3 Sanitizer wiring (dispatch boundary)
 
-- Outgoing payload is **always** passed through the sanitizer on cloud
-  routes (enforced in `ide-ai`'s dispatch: a cloud route with the
-  `sanitizer` feature disabled refuses to send — `AiError::Message`).
+- Outgoing payload is passed through the sanitizer before dispatch. The
+  panel's `mask_outgoing` helper (in `run_request`, before `stream_chat`
+  is called) handles masking; `stream_chat` itself does **not** enforce
+  masking — correctness relies on the panel wiring, and on the compile-time
+  `sanitizer` feature gate: when the feature is compiled **out**, `stream_chat`
+  refuses to send to any cloud provider (`AiError::Message`).
 - Local route: sanitize if `AiConfig::sanitize_local` (default true) with
   `local_sanitize_threshold`; cloud always uses `cloud_sanitize_threshold`.
   The route picks the threshold and calls `Sanitizer::mask_with_threshold`
@@ -466,13 +471,17 @@ assert!(app.ai.history.iter().any(|m| matches!(m, AiDisplayMessage::Assistant(_)
 
 **New workspace members** (root `Cargo.toml`): `crates/ai`, `crates/sanitizer`.
 
-**Approved deps** (all recorded in `CLAUDE.md` 2026-09-06):
+**Approved deps** (recorded in `CLAUDE.md` 2026-09-06; `hyper-util` and
+`hyper-rustls` below are **pending user approval** — flagged by the rev
+pass as a blocking gap, see `## Revision notes` r4):
 
 | Crate | For |
 |---|---|
 | `tokio` (full features) | async HTTP + background thread runtime |
 | `hyper` | hand-rolled HTTP/1.1 client |
 | `http-body-util` + `bytes` | hyper response-body reading (approved as hyper companions, 2026-09-06) |
+| `hyper-util` | `TokioExecutor`/`TokioIo` glue for the hand-rolled hyper 1.x client (**rev finding: pending user approval**, T49) |
+| `hyper-rustls` | native TLS over hyper's HTTP/1.1 client (`with_native_roots`; **rev finding: pending user approval**, T49) |
 | `syn` | Rust string-literal AST masking (feature-gated `rust-ast`) |
 | `regex` (already approved) | sanitizer regex passes |
 
@@ -517,6 +526,14 @@ assert!(app.ai.history.iter().any(|m| matches!(m, AiDisplayMessage::Assistant(_)
   (delta channel, not ClaudePanel's whole-reply contract); `Ai` settings
   slot now (persisted config, no settings UI); `http-body-util`+`bytes`
   approved as hyper companions.
+- **r4 (2026-09-06, rev-pass doc corrections):** §2.3 `Provider` enum
+  corrected from `{ Ollama { transport: HttpTransport }, … }` to unit
+  variants (transport is stateless, constructed per-call); `endpoint`
+  signature corrected from `&self → String` to `self → &'static str`;
+  §3.3 enforcement framing softened: `stream_chat` does **not** enforce
+  masking — correctness relies on the panel's `mask_outgoing` wiring plus
+  the compile-time `sanitizer` feature gate (when the feature is compiled
+  out, `stream_chat` refuses cloud dispatch).
 - **r3 (2026-09-06, impl vs doc alignment):** `complete_fim` is
   **Ollama-only** — the doc's claim that "Gemini supports FIM" was wrong;
   Gemini returns `AiError::Unsupported` like the other cloud providers, so
