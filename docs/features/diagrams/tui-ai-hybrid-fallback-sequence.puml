@@ -1,0 +1,41 @@
+@startuml tui-ai-hybrid-fallback-sequence
+title TUI AI Hybrid — sanitize → route → stream → restore
+
+actor User
+participant "AiPanel (frame loop)" as Panel
+participant "AiPanel thread\n(owns tokio Runtime)" as Thread
+participant Router as Router
+participant "Local (Ollama)" as Local
+participant "Cloud (Gemini\n/Groq/GH Models)" as Cloud
+participant Sanitizer as San
+
+User -> Panel : Enter (input + selection context)
+Panel -> Thread : submit(prompt, ctx) via std::sync::mpsc
+activate Thread
+Thread -> San : mask(payload)
+activate San
+San --> Thread : masked + placeholder map
+Thread -> Router : route(request, tx)
+activate Router
+Router -> Local : provider_order[0]
+Local -->x Router : ConnectionRefused/Timeout
+Router -> Local : retry (max 1, 500ms backoff)
+Local -->x Router : RateLimited/5xx
+Router -> Cloud : enabled_providers()[1]
+activate Cloud
+Cloud --> Router : SSE data: deltas
+Router --> Thread : ChatDelta -> tx
+Thread --> Panel : StreamingDelta -> std mpsc
+loop per delta
+  Panel <- Thread : poll_ai() drains mpsc
+end
+Cloud --> Router : stream closed
+Router --> Thread : Ok
+Thread -> San : restore_originals(reply, map)
+San --> Thread : restored text
+deactivate Cloud
+deactivate Router
+Thread --> Panel : Assistant(restored) / Error
+deactivate Thread
+Panel --> User : render history + ProviderServing + sanitized
+@enduml

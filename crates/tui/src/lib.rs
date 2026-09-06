@@ -29,6 +29,7 @@
 //! non-supporting terminal is simply ignored, the same as any other
 //! sequence this crate already sends such a terminal.
 
+mod ai_panel;
 mod app;
 mod blame_gutter;
 mod cargo_panel;
@@ -294,6 +295,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // closed (the exact DoS shape `ide-ui`'s own `hacker` pass found
         // and fixed for this same feature).
         app.poll_claude();
+        // Same reasoning, for the hybrid AI dock tab and any in-flight FIM
+        // autocomplete (`docs/features/tui-ai-hybrid-fallback.md` §3.2):
+        // a streaming reply keeps settling into history and a FIM result
+        // lands in the buffer even while the dock shows another tab.
+        app.poll_ai();
         // Same reasoning, for the debug session's DAP event stream
         // (`docs/features/tui-debugger.md` §2.3) -- unconditional so a
         // `Stopped`/`Terminated` event lands even while the Debug tool

@@ -233,6 +233,8 @@ pub enum Action {
     NewScratchFile,
     ToggleScratchFiles,
     ToggleClaudePanel,
+    ToggleAiPanel,
+    TriggerFimAutocomplete,
     ToggleDockerPanel,
     ToggleK8sPanel,
     ManageCustomActions,
@@ -898,6 +900,26 @@ pub fn commands() -> &'static [Command] {
             // assistant panel (`docs/features/tui-claude-panel.md` §1.1).
             binding: None,
             action: Action::ToggleClaudePanel,
+        },
+        Command {
+            id: "AiPanel",
+            title: "AI Assistant",
+            // Palette-only, same reasoning as `ClaudePanel` immediately
+            // above -- no JetBrains-keymap entry covers the hybrid
+            // assistant dock tab (`docs/features/tui-ai-hybrid-fallback.md`
+            // §3.5).
+            binding: None,
+            action: Action::ToggleAiPanel,
+        },
+        Command {
+            id: "TriggerFimAutocomplete",
+            title: "FIM Autocomplete",
+            // Palette-only, same reasoning as the `AiPanel` command above --
+            // the reference keymaps this project tracks bind nothing to
+            // inline completion
+            // (`docs/features/tui-ai-hybrid-fallback.md` §3.4).
+            binding: None,
+            action: Action::TriggerFimAutocomplete,
         },
         Command {
             id: "ToggleDockerPanel",

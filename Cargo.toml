@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ai",
     "crates/core",
     "crates/dap",
     "crates/lsp",
+    "crates/sanitizer",
     "crates/tui",
     "crates/ui",
 ]

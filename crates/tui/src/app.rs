@@ -21,6 +21,7 @@ use ide_core::{
 };
 use ide_lsp::{Diagnostic, Location, LspRequest, Position, Symbol};
 
+use crate::ai_panel::{AiContext, AiPanel};
 use crate::cargo_panel::{CargoCommand, CargoPanel};
 use crate::claude_panel::ClaudePanel;
 use crate::claude_terminal::{self, ClaudeTerminalPanel};
@@ -782,6 +783,7 @@ pub(crate) struct LeftDockState {
 pub(crate) enum BottomDockTab {
     #[default]
     Docker,
+    Ai,
     Kubernetes,
     Cargo,
     CustomActions,
@@ -792,7 +794,8 @@ pub(crate) enum BottomDockTab {
 impl BottomDockTab {
     pub(crate) fn next(self) -> Self {
         match self {
-            BottomDockTab::Docker => BottomDockTab::Kubernetes,
+            BottomDockTab::Docker => BottomDockTab::Ai,
+            BottomDockTab::Ai => BottomDockTab::Kubernetes,
             BottomDockTab::Kubernetes => BottomDockTab::Cargo,
             BottomDockTab::Cargo => BottomDockTab::CustomActions,
             BottomDockTab::CustomActions => BottomDockTab::Problems,
@@ -804,7 +807,8 @@ impl BottomDockTab {
     pub(crate) fn previous(self) -> Self {
         match self {
             BottomDockTab::Docker => BottomDockTab::GitLog,
-            BottomDockTab::Kubernetes => BottomDockTab::Docker,
+            BottomDockTab::Ai => BottomDockTab::Docker,
+            BottomDockTab::Kubernetes => BottomDockTab::Ai,
             BottomDockTab::Cargo => BottomDockTab::Kubernetes,
             BottomDockTab::CustomActions => BottomDockTab::Cargo,
             BottomDockTab::Problems => BottomDockTab::CustomActions,
@@ -996,6 +1000,18 @@ pub struct App {
     /// features/tui-claude-panel.md` §1.1's TUI-only two-mode split.
     pub(crate) claude_terminal_focus: bool,
     pub(crate) new_claude_terminal: Option<NewClaudeTerminalState>,
+    /// `docs/features/tui-ai-hybrid-fallback.md` §2.4: the AI assistant
+    /// dock tab. `ai_panel_open` is a derived dock-tab visibility, kept on
+    /// the mirror-the-Claude-panel shape that doc requests.
+    pub(crate) ai: AiPanel,
+    pub(crate) ai_panel_open: bool,
+    /// A FIM autocomplete request currently awaiting its background thread
+    /// (`docs/features/tui-ai-hybrid-fallback.md` §3.4): the receiver and
+    /// the (path, offset) to insert into once it lands, matched against
+    /// the then-active buffer so a tab switch mid-request drops the stale
+    /// insertion.
+    fim_rx: Option<std::sync::mpsc::Receiver<Result<String, ide_ai::AiError>>>,
+    fim_target: Option<(PathBuf, usize)>,
     pub(crate) code_actions: Option<CodeActionsState>,
     /// The `(path, position)` `sync_code_actions` most recently fired a
     /// `CodeAction` query for -- mirrors `last_highlighted_target`
@@ -1218,6 +1234,10 @@ impl App {
             claude_view: ClaudeView::Chat,
             claude_terminal_focus: false,
             new_claude_terminal: None,
+            ai: AiPanel::new(project.root().to_path_buf()),
+            ai_panel_open: false,
+            fim_rx: None,
+            fim_target: None,
             code_actions: None,
             last_code_actions_target: None,
             generate_menu: None,
@@ -1468,6 +1488,97 @@ impl App {
     pub fn poll_claude(&mut self) {
         self.claude.poll();
         self.claude_terminals.poll();
+    }
+
+    /// Called once per frame (`lib.rs`'s main loop), unconditionally --
+    /// same "keeps streaming into state while the panel is closed" shape
+    /// `poll_claude`/`poll_cargo` already use, and so an in-flight AI
+    /// request keeps settling into history even if the dock tab was
+    /// switched away mid-stream (`docs/features/tui-ai-hybrid-fallback.md`
+    /// §3.2: the dock tab is never the requester's only reader). Also
+    /// settles any FIM autocomplete result into the buffer it was
+    /// recorded against.
+    pub fn poll_ai(&mut self) {
+        self.ai.poll();
+        self.poll_fim();
+    }
+
+    fn poll_fim(&mut self) {
+        let Some(rx) = self.fim_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(text)) => {
+                let target = self.fim_target.take();
+                self.fim_rx = None;
+                if let Some((path, offset)) = target {
+                    self.apply_fim_insert(&path, offset, &text);
+                }
+            }
+            Ok(Err(e)) => {
+                self.fim_target = None;
+                self.fim_rx = None;
+                self.notify(format!("FIM autocomplete failed: {e}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.fim_target = None;
+                self.fim_rx = None;
+                self.notify("FIM autocomplete thread ended unexpectedly");
+            }
+        }
+    }
+
+    fn apply_fim_insert(&mut self, path: &Path, offset: usize, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(buf) = self.active_buffer_mut() else {
+            return;
+        };
+        if buf.path != *path {
+            return; // A tab switch mid-request drops the stale insertion.
+        }
+        let transaction = Transaction::insert(offset, text.to_string());
+        buf.buffer.apply(transaction);
+    }
+
+    /// `Action::TriggerFimAutocomplete` (palette-only,
+    /// `docs/features/tui-ai-hybrid-fallback.md` §3.4): sends the text
+    /// before and after the caret to the local Ollama FIM endpoint in a
+    /// background thread, capped at `MAX_FIM_CONTEXT_CHARS` per side
+    /// inside `ide-ai`. One request at a time; a non-Ollama local config
+    /// surfaces the adapter's `Unsupported` error through `notify`.
+    fn trigger_fim_autocomplete(&mut self) {
+        if self.fim_rx.is_some() {
+            self.notify("FIM autocomplete already in progress");
+            return;
+        }
+        let Some(buf) = self.active_buffer() else {
+            self.notify("no active file to complete");
+            return;
+        };
+        let path = buf.path.clone();
+        let text = buf.buffer.text().to_string();
+        let offset = self.active_caret_offset();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.fim_rx = Some(rx);
+        self.fim_target = Some((path, offset));
+        let prefix = text[..offset].to_string();
+        let suffix = text[offset..].to_string();
+        std::thread::spawn(move || {
+            let provider = ide_ai::Provider::from_id(ide_ai::ProviderId::OllamaLocal);
+            let response = Self::fim_runtime().block_on(provider.complete_fim(&prefix, &suffix));
+            let _ = tx.send(response);
+        });
+    }
+
+    fn fim_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("current-thread tokio runtime builds")
     }
 
     /// Called once per frame (`lib.rs`'s main loop), unconditionally --
@@ -2286,6 +2397,72 @@ impl App {
                 self.claude.input.push(c);
             }
             _ => {}
+        }
+    }
+
+    /// `Action::ToggleAiPanel` (`docs/features/tui-ai-hybrid-fallback.md`
+    /// §2.4): the AI panel is a normal bottom-dock tab, so toggling drives
+    /// the same `show_bottom_dock_tab` path `toggle_custom_actions_panel`
+    /// uses. `ai_panel_open` mirrors on/off so the key dispatcher and
+    /// palette gate on one flag.
+    fn toggle_ai_panel(&mut self) {
+        let opening = !matches!(
+            self.bottom_dock.as_ref().map(|dock| dock.tab),
+            Some(BottomDockTab::Ai)
+        );
+        self.ai_panel_open = opening;
+        if opening {
+            self.show_bottom_dock_tab(BottomDockTab::Ai);
+            self.focus = Focus::BottomDock;
+        } else {
+            self.bottom_dock = None;
+            self.focus = Focus::Editor;
+        }
+    }
+
+    /// The AI dock tab's single-line text field (`docs/features/
+    /// tui-ai-hybrid-fallback.md` §2.4): `Esc` closes the dock, `Enter`
+    /// submits (refuses while a reply is streaming -- one request at a
+    /// time), `Backspace` and ordinary chars edit the input. Same shape
+    /// as `handle_claude_chat_key`.
+    fn handle_ai_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => {
+                self.toggle_ai_panel();
+            }
+            KeyCode::Backspace => {
+                self.ai.input.pop();
+            }
+            KeyCode::Enter => {
+                if self.ai.is_in_flight() {
+                    self.notify("one AI request at a time");
+                } else {
+                    let prompt = std::mem::take(&mut self.ai.input);
+                    let context = self.current_ai_context();
+                    self.ai.submit(prompt, context);
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.ai.input.push(c);
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// The active buffer's selection feeds the AI context (§3.2: copied at
+    /// submit time, never read live mid-request): a non-empty primary
+    /// selection is sent as a selection, otherwise the whole file.
+    fn current_ai_context(&self) -> AiContext {
+        let Some(buf) = self.active_buffer() else {
+            return AiContext::None;
+        };
+        let text = buf.buffer.text().to_string();
+        let selection = buf.buffer.text_buffer().selections().primary();
+        if selection.is_empty() {
+            AiContext::WholeFile(text)
+        } else {
+            AiContext::Selection(text[selection.start()..selection.end()].to_string())
         }
     }
 
@@ -5921,6 +6098,23 @@ impl App {
         {
             return self.handle_k8s_panel_key(key);
         }
+        // The AI dock tab's own `Esc`-closes rule (`docs/features/
+        // tui-ai-hybrid-fallback.md` §2.4) can't be reached through the
+        // post-keymap dispatch below: `Esc` is already globally bound to
+        // `CollapseSelections`, so it never reaches `handle_bottom_dock
+        // _key`'s `Ai` arm. Intercept it at the same rank the Docker/K8s
+        // nested confirm modals occupy two blocks up (T33's own precedent
+        // for a key that a dock tab needs but the keymap already owns).
+        if key.code == KeyCode::Esc
+            && self.ai_panel_open
+            && self.focus == Focus::BottomDock
+            && matches!(
+                self.bottom_dock.as_ref().map(|dock| dock.tab),
+                Some(BottomDockTab::Ai)
+            )
+        {
+            return self.handle_ai_panel_key(key);
+        }
         // `docs/features/tui-screen-navigation.md` §3.5, T44 -- must sit
         // *before* the global keymap lookup below: `Esc` is already bound
         // there (`CollapseSelections`, `commands.rs`), which would
@@ -6364,6 +6558,8 @@ impl App {
             Action::NewScratchFile => self.toggle_new_scratch_file(),
             Action::ToggleScratchFiles => self.toggle_scratch_files(),
             Action::ToggleClaudePanel => self.toggle_claude_panel(),
+            Action::ToggleAiPanel => self.toggle_ai_panel(),
+            Action::TriggerFimAutocomplete => self.trigger_fim_autocomplete(),
             Action::Debug => self.trigger_debug(),
             Action::ResumeProgram => self.debug.resume(),
             Action::StepOver => self.debug.step_over(),
@@ -6434,6 +6630,9 @@ impl App {
                 match tab {
                     BottomDockTab::Docker => {
                         self.handle_docker_panel_key(key);
+                    }
+                    BottomDockTab::Ai => {
+                        self.handle_ai_panel_key(key);
                     }
                     BottomDockTab::Kubernetes => {
                         self.handle_k8s_panel_key(key);
@@ -8595,6 +8794,7 @@ fn workspace_text_edits_to_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_panel::{AiDisplayMessage, PreparedRequest};
     use crate::commands::binding_for;
     use crate::ui;
     use crossterm::event::KeyEventState;
@@ -17264,6 +17464,162 @@ mod tests {
         Ok(format!("ack: {prompt}"))
     }
 
+    fn ai_fake(prepared: PreparedRequest) {
+        let _ = prepared.tx.send(AiDisplayMessage::Assistant(format!(
+            "echo:{}",
+            prepared.payload
+        )));
+    }
+
+    #[test]
+    fn toggle_ai_panel_opens_and_closes_the_dock_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.ai_panel_open);
+
+        app.run_action(Action::ToggleAiPanel);
+        assert!(app.ai_panel_open);
+        assert_eq!(app.bottom_dock.as_ref().unwrap().tab, BottomDockTab::Ai);
+        assert_eq!(app.focus, Focus::BottomDock);
+
+        app.run_action(Action::ToggleAiPanel);
+        assert!(!app.ai_panel_open);
+        assert!(app.bottom_dock.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn ai_panel_esc_closes_the_dock_from_any_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAiPanel);
+        assert!(app.ai_panel_open);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.ai_panel_open);
+        assert!(app.bottom_dock.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn ai_panel_typing_edits_input_and_enter_submits() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.ai = AiPanel::with_runner(dir.path().to_path_buf(), ai_fake);
+        let file = dir.path().canonicalize().unwrap().join("a.txt");
+        app.open_or_focus_tab(file).unwrap();
+        app.run_action(Action::ToggleAiPanel);
+
+        for c in "summarize".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.ai.input, "summariz");
+
+        app.handle_key(plain_key(KeyCode::Char('e')));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.ai.input, "", "input clears after submit");
+        assert!(app.ai.is_in_flight());
+        let mut settled = false;
+        for _ in 0..100 {
+            if app.ai.poll() {
+                settled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(settled, "fake runner's reply settles on a poll");
+        assert_eq!(app.ai.history.len(), 2);
+        assert!(matches!(
+            &app.ai.history[1],
+            AiDisplayMessage::Assistant(a) if a.starts_with("echo:summarize")
+        ));
+    }
+
+    #[test]
+    fn ai_panel_enter_while_in_flight_is_rejected() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.ai = AiPanel::with_runner(dir.path().to_path_buf(), ai_fake);
+        app.run_action(Action::ToggleAiPanel);
+
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        app.handle_key(plain_key(KeyCode::Enter));
+        let in_flight = app.ai.is_in_flight();
+        assert!(in_flight);
+
+        app.handle_key(plain_key(KeyCode::Char('y')));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.ai.history.len(), 1, "second submit is refused");
+        assert!(app
+            .notifications
+            .last()
+            .unwrap()
+            .message
+            .contains("one AI request at a time"));
+    }
+
+    #[test]
+    fn poll_fim_applies_insertion_into_the_recorded_buffer() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let file = dir.path().canonicalize().unwrap().join("a.txt");
+        app.open_or_focus_tab(file.clone()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok("_suffix".to_string())).unwrap();
+        app.fim_rx = Some(rx);
+        app.fim_target = Some((file, 0));
+
+        app.poll_fim();
+
+        assert!(app.fim_rx.is_none());
+        let text = app.active_buffer().unwrap().buffer.text().to_string();
+        assert!(
+            text.starts_with("_suffixhello"),
+            "insertion landed at the recorded offset"
+        );
+    }
+
+    #[test]
+    fn poll_fim_drops_a_stale_insertion_when_the_buffer_changed() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_or_focus_tab(dir.path().canonicalize().unwrap().join("a.txt"))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok("_suffix".to_string())).unwrap();
+        app.fim_rx = Some(rx);
+        app.fim_target = Some((dir.path().canonicalize().unwrap().join("b.txt"), 0));
+
+        app.poll_fim();
+
+        assert!(app.fim_rx.is_none(), "finished even though it was dropped");
+        let text = app.active_buffer().unwrap().buffer.text().to_string();
+        assert_eq!(text, "hello\nworld", "wrong-buffer insertion is discarded");
+    }
+
+    #[test]
+    fn poll_fim_error_notifies() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(ide_ai::AiError::Unsupported)).unwrap();
+        app.fim_rx = Some(rx);
+
+        app.poll_fim();
+
+        assert!(app.fim_rx.is_none());
+        assert!(app
+            .notifications
+            .last()
+            .unwrap()
+            .message
+            .contains("FIM autocomplete failed"));
+    }
+
     #[test]
     fn toggle_claude_panel_opens_and_closes() {
         let dir = sample_project();
@@ -18029,13 +18385,14 @@ mod tests {
     }
 
     #[test]
-    fn handle_bottom_dock_key_tab_cycles_through_all_six_tabs_and_back() {
+    fn handle_bottom_dock_key_tab_cycles_through_all_seven_tabs_and_back() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
         assert_eq!(app.bottom_dock.as_ref().unwrap().tab, BottomDockTab::Docker);
 
         let forward = [
+            BottomDockTab::Ai,
             BottomDockTab::Kubernetes,
             BottomDockTab::Cargo,
             BottomDockTab::CustomActions,

@@ -21,6 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::ai_panel::AiDisplayMessage;
 use crate::app::{
     ActionFormField, App, AppScreen, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView,
     DebugPanelFocus, FilterField, Focus, GitPanelFocus, GitPanelState, GitPanelView, LeftDockState,
@@ -374,8 +375,9 @@ fn render_bottom_dock(
     };
     let strip = Line::from(Span::styled(
         format!(
-            "{}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  {}",
             strip_label(BottomDockTab::Docker, "Docker"),
+            strip_label(BottomDockTab::Ai, "AI"),
             strip_label(BottomDockTab::Kubernetes, "Kubernetes"),
             strip_label(BottomDockTab::Cargo, "Cargo"),
             strip_label(BottomDockTab::CustomActions, "Custom Actions"),
@@ -388,6 +390,7 @@ fn render_bottom_dock(
 
     match dock.tab {
         BottomDockTab::Docker => render_docker_panel(frame, app, rows[1]),
+        BottomDockTab::Ai => render_ai_panel(frame, app, rows[1]),
         BottomDockTab::Kubernetes => render_k8s_panel(frame, app, rows[1]),
         BottomDockTab::Cargo => render_cargo_panel(frame, app, rows[1]),
         BottomDockTab::CustomActions => render_custom_actions_panel(frame, app, rows[1]),
@@ -1445,6 +1448,78 @@ fn render_claude_chat(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(format!("{prefix}{}", app.claude.input)),
         input_area,
     );
+}
+
+/// The AI dock tab (`docs/features/tui-ai-hybrid-fallback.md` §2.4): one
+/// status line (last serving provider + whether the outgoing payload was
+/// masked), tail-only history, and the single input line -- the same
+/// no-scroll-back shape `render_claude_chat` uses (§1.1 precedent).
+fn render_ai_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let theme = app.theme.theme();
+
+    let mut status = String::new();
+    if let Some(provider) = &app.ai.provider {
+        status.push_str(&format!("serving {provider}"));
+    }
+    if app.ai.sanitized {
+        if !status.is_empty() {
+            status.push_str("  |  ");
+        }
+        status.push_str("payload masked");
+    }
+    if status.is_empty() {
+        status = "idle".to_string();
+    }
+    let status_style = if app.ai.is_in_flight() {
+        Style::default().fg(theme.chip_fg)
+    } else {
+        Style::default().fg(theme.gutter_fg)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(status, status_style))),
+        rows[0],
+    );
+
+    let lines: Vec<Line> = app
+        .ai
+        .history
+        .iter()
+        .map(|m| ai_message_line(m, theme))
+        .collect();
+    let visible_rows = rows[1].height as usize;
+    let start = lines.len().saturating_sub(visible_rows);
+    frame.render_widget(Paragraph::new(lines[start..].to_vec()), rows[1]);
+
+    let prefix = if app.ai.is_in_flight() {
+        "(streaming) > "
+    } else {
+        "> "
+    };
+    frame.render_widget(Paragraph::new(format!("{prefix}{}", app.ai.input)), rows[2]);
+}
+
+fn ai_message_line(message: &AiDisplayMessage, theme: &crate::theme::Theme) -> Line<'static> {
+    match message {
+        AiDisplayMessage::User(t) => Line::from(format!("> {t}")),
+        AiDisplayMessage::Assistant(t) => Line::from(t.clone()),
+        AiDisplayMessage::StreamingDelta(d) => Line::from(d.clone()),
+        AiDisplayMessage::ProviderServing(p) => Line::from(Span::styled(
+            format!("-- {p} --"),
+            Style::default().fg(theme.gutter_fg),
+        )),
+        AiDisplayMessage::Error(t) => Line::from(Span::styled(
+            format!("error: {t}"),
+            Style::default().fg(theme.error_text),
+        )),
+    }
 }
 
 fn claude_message_line(message: &ClaudeMessage, theme: &crate::theme::Theme) -> Line<'static> {

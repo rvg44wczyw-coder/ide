@@ -1,0 +1,12 @@
+[package]
+name = "ide-sanitizer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+regex = "1"
+syn = { version = "2", features = ["full", "visit"], optional = true }
+
+[features]
+default = ["rust-ast"]
+rust-ast = ["dep:syn"]
