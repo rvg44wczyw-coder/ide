@@ -139,3 +139,133 @@ This list isn't exhaustive and terminal support for the protocol is
 actively growing — if in doubt, just run `ide-tui` and press
 `Ctrl+Shift+A`: if the command palette opens, the full keybinding set is
 active.
+
+## `ide-tui` keymap reference
+
+Every command `ide-tui` registers, generated from its single source of
+truth (`crates/tui/src/commands.rs::commands()`) — the running binary's
+own command palette (`Ctrl+Shift+A`) is always authoritative if this list
+ever drifts. Bindings marked `†` use `Ctrl+Shift+<key>` and need a
+[Kitty-protocol-capable terminal](#ide-tui-supported-terminals) — see that
+section above for which terminals qualify and how to reach the same
+command from the palette otherwise. The default keymap otherwise follows
+the JetBrains macOS keymap verbatim (`docs/roadmap.md` §5); commands with
+no reference-IDE binding to translate are registered palette-only by
+design, not omitted by accident.
+
+### Default key bindings
+
+| Command | Binding |
+|---|---|
+| Add Selection for Next Occurrence | `Ctrl+G` |
+| Close Tab | `Ctrl+W` |
+| Collapse | `Ctrl+-` |
+| Collapse All | `Ctrl+Shift+- †` |
+| Collapse Selections to the Primary Caret | `Esc` |
+| Comment with Block Comment | `Ctrl+Alt+/` |
+| Comment with Line Comment | `Ctrl+/` |
+| Create Test... | `Ctrl+Shift+T †` |
+| Debug (start debugging) | `Alt+Shift+F9` |
+| Delete Line | `Ctrl+Backspace` |
+| Duplicate Line or Selection | `Ctrl+D` |
+| Expand | `Ctrl++` |
+| Expand All | `Ctrl+Shift++ †` |
+| Extend Selection | `Alt+Up` |
+| Extract Constant | `Ctrl+Alt+C` |
+| Extract Field | `Ctrl+Alt+F` |
+| Extract Method | `Ctrl+Alt+M` |
+| Extract Variable | `Ctrl+Alt+V` |
+| File Structure | `F12` |
+| Find | `Ctrl+F` |
+| Find Action | `Ctrl+Shift+A †` |
+| Find in Path | `Ctrl+Shift+F †` |
+| Find Usages | `Ctrl+U` |
+| Generate... | `Alt+Insert` |
+| Go to Declaration | `Ctrl+B` |
+| Go to File | `Ctrl+Shift+N †` |
+| Go to Symbol | `Ctrl+Alt+Shift+N` |
+| Implement Methods... | `Ctrl+I` |
+| Inline | `Ctrl+Alt+N` |
+| Join Lines | `Ctrl+Shift+J †` |
+| Move Line Down | `Alt+Shift+Down` |
+| Move Line Up | `Alt+Shift+Up` |
+| Move Statement Down | `Ctrl+Shift+Down †` |
+| Move Statement Up | `Ctrl+Shift+Up †` |
+| Navigate Back | `Ctrl+Alt+Left` |
+| Navigate Forward | `Ctrl+Alt+Right` |
+| Next Tab | `Ctrl+Shift+] †` |
+| Override Methods... | `Ctrl+O` |
+| Previous Tab | `Ctrl+Shift+[ †` |
+| Problems | `Ctrl+P` |
+| Project | `Ctrl+T` |
+| Push | `Ctrl+Shift+K †` |
+| Quick Documentation | `F1` |
+| Recent Files | `Ctrl+E` |
+| Redo | `Ctrl+Shift+Z †` |
+| Reformat Code | `Ctrl+Alt+L` |
+| Rename | `Shift+F6` |
+| Replace | `Ctrl+R` |
+| Replace in Path | `Ctrl+Shift+R †` |
+| Resume Program | `F9` |
+| Save | `Ctrl+S` |
+| Select All Occurrences | `Ctrl+Alt+Shift+J` |
+| Show Bookmarks | `Ctrl+F3` |
+| Show Intention Actions | `Alt+Enter` |
+| Shrink Selection | `Alt+Down` |
+| Step Into | `F7` |
+| Step Out | `Shift+F8` |
+| Step Over | `F8` |
+| Stop Debugging | `Ctrl+F2` |
+| Toggle Bookmark | `F3` |
+| Toggle Case | `Ctrl+Shift+U †` |
+| Toggle Line Breakpoint | `Ctrl+F8` |
+| Undo | `Ctrl+Z` |
+| Unselect Occurrence | `Ctrl+Shift+G †` |
+
+### Palette-only commands (no default binding)
+
+Reach these via `Ctrl+Shift+A` → type the command name. No default key
+because either the reference IDE has no keyboard shortcut for this action
+either, or `ide-tui` has no existing binding it could safely reuse without
+colliding with one already on this list (`CLAUDE.md`'s "never invent a
+binding" rule).
+
+| Command |
+|---|
+| Cargo |
+| Claude |
+| Clone Repository |
+| Configure Debug Adapter |
+| Custom Actions |
+| Custom Actions: Manage |
+| Debug (tool window) |
+| Dismiss External Change Notice (Keep Mine) |
+| Docker |
+| Exit |
+| Fetch |
+| Git |
+| Git Branches... |
+| Git Worktrees... |
+| Grow Focused Dock Panel |
+| Jump to Matching Bracket |
+| Keymap |
+| Kubernetes |
+| New Scratch File |
+| Notifications |
+| Optimize Imports |
+| Pause Program |
+| Refactor This |
+| Reload from Disk |
+| Reset All Keybindings to Default |
+| Scratch Files |
+| Show Blame Details for Current Line |
+| Show History for File |
+| Shrink Focused Dock Panel |
+| Theme |
+| TODO |
+| Toggle Blame Annotations |
+| Toggle Bottom Dock |
+| Toggle Bottom Dock Focus |
+| Toggle Format on Save |
+| Toggle Left Dock |
+| Update Project |
