@@ -13,11 +13,11 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ide_core::{
-    all_occurrences, detect_language, editorconfig, fuzzy_score, newline_indent, next_occurrence,
-    splits_a_pair, syntax_for_path, word_at, Buffer, BufferError, Change, Charset, DirEntry,
-    EditorConfig, FileWatcher, IndentUnit, LanguageConfig, LineDirection, MergeOutcome, Project,
-    ProjectError, ReplaceResult, Selection, Selections, SyntaxRules, TextBuffer, Transaction,
-    WatchEvent,
+    all_occurrences, apply_transaction, detect_language, diff_text, editorconfig, fuzzy_score,
+    newline_indent, next_occurrence, splits_a_pair, syntax_for_path, word_at, Buffer, BufferError,
+    Change, Charset, DirEntry, EditorConfig, FileDiff, FileWatcher, IndentUnit, LanguageConfig,
+    LineDirection, MergeOutcome, Project, ProjectError, ReplaceResult, Selection, Selections,
+    SyntaxRules, TextBuffer, Transaction, WatchEvent,
 };
 use ide_lsp::{Diagnostic, Location, LspRequest, Position, Symbol};
 
@@ -320,6 +320,93 @@ pub(crate) struct CodeActionsState {
 /// meaningful in the other.
 pub(crate) struct GenerateMenuState {
     pub(crate) selected: usize,
+}
+
+/// `⌃T`'s list-selection state (`docs/features/tui-refactor-this.md`
+/// §2.1) -- its own type for the exact same reason `GenerateMenuState`
+/// isn't a `CodeActionsState` either: it indexes into `refactor_menu_
+/// actions()`'s filtered view, not `lsp.code_actions` wholesale.
+pub(crate) struct RefactorMenuState {
+    pub(crate) selected: usize,
+}
+
+/// One entry per `FileEdit` in `edit.edits`, same order (`docs/features/
+/// tui-refactor-this.md` §2.1/§3.3). `None` means the diff itself
+/// couldn't be computed (unreadable file, or `apply_transaction` rejected
+/// an out-of-range edit) -- the row still renders (path + "(diff
+/// unavailable)"), never dropped from the list.
+pub(crate) struct RefactorPreview {
+    pub(crate) what: String,
+    pub(crate) edit: ide_lsp::WorkspaceEdit,
+    pub(crate) diffs: Vec<Option<FileDiff>>,
+    /// Plain scroll offset into the flattened diff lines, mirrors
+    /// `GitPanelState::diff_scroll`.
+    pub(crate) scroll: u16,
+}
+
+/// The five direct Refactor commands, one heuristic each (`docs/features/
+/// tui-refactor-this.md` §3.2) -- a closed enum rather than five
+/// near-identical methods, ported from `ide-ui`'s own `DirectRefactorKind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectRefactorKind {
+    ExtractVariable,
+    ExtractMethod,
+    ExtractConstant,
+    ExtractField,
+    Inline,
+}
+
+impl DirectRefactorKind {
+    fn name(self) -> &'static str {
+        match self {
+            DirectRefactorKind::ExtractVariable => "Extract Variable",
+            DirectRefactorKind::ExtractMethod => "Extract Method",
+            DirectRefactorKind::ExtractConstant => "Extract Constant",
+            DirectRefactorKind::ExtractField => "Extract Field",
+            DirectRefactorKind::Inline => "Inline",
+        }
+    }
+
+    /// `kind`-prefix check first so an unrelated `quickfix` action never
+    /// matches by title alone, then a case-insensitive substring check
+    /// against `title` (`docs/features/tui-refactor-this.md` §3.2).
+    fn matches(self, action: &ide_lsp::CodeAction) -> bool {
+        let title = action.title.to_lowercase();
+        match self {
+            DirectRefactorKind::ExtractVariable => {
+                action
+                    .kind
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("refactor.extract"))
+                    && title.contains("variable")
+            }
+            DirectRefactorKind::ExtractMethod => {
+                action
+                    .kind
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("refactor.extract"))
+                    && (title.contains("function") || title.contains("method"))
+            }
+            DirectRefactorKind::ExtractConstant => {
+                action
+                    .kind
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("refactor.extract"))
+                    && title.contains("constant")
+            }
+            DirectRefactorKind::ExtractField => {
+                action
+                    .kind
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("refactor.extract"))
+                    && title.contains("field")
+            }
+            DirectRefactorKind::Inline => action
+                .kind
+                .as_deref()
+                .is_some_and(|k| k.starts_with("refactor.inline")),
+        }
+    }
 }
 
 /// The three Generate-menu actions that also have their own direct
@@ -903,6 +990,18 @@ pub struct App {
     /// `(edit, new_name)` awaiting Apply/Cancel -- presence is visibility,
     /// same reasoning `rename_popup` documents.
     pub(crate) pending_rename_preview: Option<(ide_lsp::WorkspaceEdit, String)>,
+    pub(crate) refactor_menu: Option<RefactorMenuState>,
+    pub(crate) pending_refactor_preview: Option<RefactorPreview>,
+    /// Set immediately before this phase's code sends `LspRequest::
+    /// ApplyCodeAction`, taken (read-and-cleared) unconditionally at the
+    /// top of `handle_workspace_edit_ready`, every call (`docs/features/
+    /// tui-refactor-this.md` §3.4/§4) -- routes that one `WorkspaceEdit
+    /// Ready` into `show_refactor_preview` instead of the method's
+    /// existing apply-immediately body. Deliberately excluded from
+    /// `close_all_overlays`/`any_popup_open`: it is not itself a visible
+    /// overlay, and is only ever meaningfully read/cleared inside
+    /// `handle_workspace_edit_ready`, never in response to a keypress.
+    via_refactor_preview: bool,
     pub(crate) lsp: LspBridge,
     pub(crate) git: GitPanel,
     pub(crate) git_panel: Option<GitPanelState>,
@@ -1107,6 +1206,9 @@ impl App {
             generate_menu: None,
             rename_popup: None,
             pending_rename_preview: None,
+            refactor_menu: None,
+            pending_refactor_preview: None,
+            via_refactor_preview: false,
             lsp,
             git,
             git_panel: None,
@@ -1995,6 +2097,8 @@ impl App {
         self.generate_menu = None;
         self.rename_popup = None;
         self.pending_rename_preview = None;
+        self.refactor_menu = None;
+        self.pending_refactor_preview = None;
         self.git_panel = None;
         self.recent_files = None;
         self.bookmarks_popup = None;
@@ -4943,6 +5047,199 @@ impl App {
         self.lsp.request_organize_imports(&path);
     }
 
+    fn is_refactor_kind(action: &ide_lsp::CodeAction) -> bool {
+        action
+            .kind
+            .as_deref()
+            .is_some_and(|k| k.starts_with("refactor"))
+    }
+
+    /// `⌃T`'s filtered view of `lsp.code_actions` (`docs/features/
+    /// tui-refactor-this.md` §2.1/§3.1) -- mirrors `generate_menu_actions`
+    /// exactly, same reason: the popup's list position is not the same
+    /// thing as `CodeAction::index` once the list is filtered, so every
+    /// reader of this filtered view (render, Up/Down clamping, Enter's
+    /// lookup) goes through this one method.
+    pub(crate) fn refactor_menu_actions(&self) -> Vec<&ide_lsp::CodeAction> {
+        self.lsp
+            .code_actions
+            .iter()
+            .filter(|action| Self::is_refactor_kind(action))
+            .collect()
+    }
+
+    /// `⌃T`'s entry point (`docs/features/tui-refactor-this.md` §3.1).
+    /// Mirrors `trigger_generate_menu`'s shape exactly.
+    fn trigger_refactor_this(&mut self) {
+        if self.refactor_menu_actions().is_empty() {
+            self.status = Some("Refactor This: no refactoring available here".to_string());
+            return;
+        }
+        self.close_all_overlays();
+        self.refactor_menu = Some(RefactorMenuState { selected: 0 });
+    }
+
+    /// Mirrors `handle_generate_menu_key` exactly -- not `handle_code_
+    /// actions_key`'s simpler direct-index shape, which only works because
+    /// its own popup shows the *unfiltered* `lsp.code_actions` list.
+    fn handle_refactor_menu_key(&mut self, key: KeyEvent) -> LoopSignal {
+        if self.refactor_menu.is_none() {
+            return LoopSignal::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.refactor_menu = None;
+            }
+            KeyCode::Up => {
+                if let Some(state) = self.refactor_menu.as_mut() {
+                    if state.selected > 0 {
+                        state.selected -= 1;
+                    }
+                }
+            }
+            KeyCode::Down => {
+                let len = self.refactor_menu_actions().len();
+                if let Some(state) = self.refactor_menu.as_mut() {
+                    if state.selected + 1 < len {
+                        state.selected += 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let selected = self.refactor_menu.as_ref().map(|s| s.selected);
+                self.refactor_menu = None;
+                if let Some(selected) = selected {
+                    let actions = self.refactor_menu_actions();
+                    if let Some(action) = actions.get(selected) {
+                        let index = action.index;
+                        self.select_refactor_action(index);
+                    }
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// A `⌃T` popup row's Enter (`docs/features/tui-refactor-this.md`
+    /// §3.1) -- routes through `apply_code_action_via_preview`. The popup
+    /// is already closed by `handle_refactor_menu_key` before this runs.
+    fn select_refactor_action(&mut self, index: usize) {
+        self.apply_code_action_via_preview(index);
+    }
+
+    /// The five direct commands' shared entry point (`docs/features/
+    /// tui-refactor-this.md` §3.2) -- mirrors `trigger_direct_generate`'s
+    /// shape exactly, including the `disabled_reason`-skip.
+    fn trigger_direct_refactor(&mut self, kind: DirectRefactorKind) {
+        let found = self
+            .lsp
+            .code_actions
+            .iter()
+            .find(|action| action.disabled_reason.is_none() && kind.matches(action));
+        match found {
+            Some(action) => {
+                let index = action.index;
+                self.apply_code_action_via_preview(index);
+            }
+            None => {
+                self.status = Some(format!("{}: not available here", kind.name()));
+            }
+        }
+    }
+
+    /// Shared by `select_refactor_action` and `trigger_direct_refactor`
+    /// (`docs/features/tui-refactor-this.md` §2.1).
+    fn apply_code_action_via_preview(&mut self, index: usize) {
+        self.via_refactor_preview = true;
+        self.lsp.apply_code_action(index);
+    }
+
+    /// Builds `pending_refactor_preview` from a ready `WorkspaceEdit`
+    /// (`docs/features/tui-refactor-this.md` §3.3) -- read-only, mirrors
+    /// `apply_workspace_edit`'s own old-text source selection but never
+    /// writes anything.
+    fn show_refactor_preview(&mut self, what: String, edit: ide_lsp::WorkspaceEdit) {
+        let mut diffs: Vec<Option<FileDiff>> = Vec::with_capacity(edit.edits.len());
+        for file_edit in &edit.edits {
+            let open_tab = self.tabs.iter().position(|tab| tab.path == file_edit.path);
+            let old_text = match open_tab {
+                Some(idx) => Some(self.tabs[idx].buffer.text().to_string()),
+                None => std::fs::read_to_string(&file_edit.path).ok(),
+            };
+            let diff = old_text.and_then(|old_text| {
+                let transaction =
+                    workspace_text_edits_to_transaction(&old_text, &file_edit.text_edits)?;
+                let new_text = apply_transaction(&old_text, &transaction)?;
+                diff_text(&file_edit.path, &old_text, &new_text)
+            });
+            diffs.push(diff);
+        }
+        self.pending_refactor_preview = Some(RefactorPreview {
+            what,
+            edit,
+            diffs,
+            scroll: 0,
+        });
+    }
+
+    /// Mirrors `handle_rename_preview_key`'s Esc/Enter shape, plus
+    /// scrolling since this preview can hold real multi-file diff content
+    /// (`docs/features/tui-refactor-this.md` §3.5).
+    fn handle_refactor_preview_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => self.cancel_refactor_preview(),
+            KeyCode::Enter => self.confirm_refactor_preview(),
+            KeyCode::Up => {
+                if let Some(preview) = self.pending_refactor_preview.as_mut() {
+                    preview.scroll = preview.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(preview) = self.pending_refactor_preview.as_mut() {
+                    preview.scroll = preview.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(preview) = self.pending_refactor_preview.as_mut() {
+                    preview.scroll = preview.scroll.saturating_sub(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(preview) = self.pending_refactor_preview.as_mut() {
+                    preview.scroll = preview.scroll.saturating_add(10);
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// The preview's Apply (`docs/features/tui-refactor-this.md` §3.5) --
+    /// reuses the existing shared `apply_workspace_edit`, same success/
+    /// failure `self.status` shape every other apply path already uses.
+    fn confirm_refactor_preview(&mut self) {
+        let Some(preview) = self.pending_refactor_preview.take() else {
+            return;
+        };
+        match self.apply_workspace_edit(preview.edit, &preview.what) {
+            Ok(file_count) => {
+                self.status = Some(format!(
+                    "{}: applied to {file_count} file{}",
+                    preview.what,
+                    if file_count == 1 { "" } else { "s" }
+                ));
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// The preview's Cancel / window close -- no I/O (`docs/features/
+    /// tui-refactor-this.md` §3.5).
+    fn cancel_refactor_preview(&mut self) {
+        self.pending_refactor_preview = None;
+    }
+
     /// Shared apply primitive, ported from `ide-ui`'s own `apply_workspace_
     /// edit` with no behavioural change (`docs/features/
     /// tui-code-actions-and-rename.md` §2.3/§3.1): partitions `edit.edits`
@@ -5041,6 +5338,11 @@ impl App {
         if !self.lsp.workspace_edit_ready {
             return;
         }
+        // Unconditional take-and-reset on *every* real event this method
+        // processes, not only ones with a usable edit, so a stray `true`
+        // can never leak into a later, unrelated apply (`docs/features/
+        // tui-refactor-this.md` §3.4/§4).
+        let via_preview = std::mem::take(&mut self.via_refactor_preview);
         let what = self
             .lsp
             .workspace_edit_label
@@ -5050,6 +5352,11 @@ impl App {
             self.status = Some(format!("{what}: nothing to apply"));
             return;
         };
+
+        if via_preview {
+            self.show_refactor_preview(what, edit);
+            return;
+        }
 
         let file_count = match self.apply_workspace_edit(edit, &what) {
             Ok(n) => n,
@@ -5451,6 +5758,12 @@ impl App {
         if self.pending_rename_preview.is_some() {
             return self.handle_rename_preview_key(key);
         }
+        if self.refactor_menu.is_some() {
+            return self.handle_refactor_menu_key(key);
+        }
+        if self.pending_refactor_preview.is_some() {
+            return self.handle_refactor_preview_key(key);
+        }
         if self.blame_popup.is_some() {
             return self.handle_blame_popup_key(key);
         }
@@ -5543,6 +5856,8 @@ impl App {
             || self.generate_menu.is_some()
             || self.rename_popup.is_some()
             || self.pending_rename_preview.is_some()
+            || self.refactor_menu.is_some()
+            || self.pending_refactor_preview.is_some()
             || self.blame_popup.is_some()
             || self.git_gutter_popup_line.is_some()
             || self.git_panel.is_some()
@@ -5917,6 +6232,18 @@ impl App {
             Action::ToggleClonePanel => self.toggle_clone_panel(),
             Action::ReformatCode => self.trigger_reformat_code(),
             Action::ToggleFormatOnSave => self.toggle_format_on_save(),
+            Action::RefactorThis => self.trigger_refactor_this(),
+            Action::ExtractVariable => {
+                self.trigger_direct_refactor(DirectRefactorKind::ExtractVariable)
+            }
+            Action::ExtractMethod => {
+                self.trigger_direct_refactor(DirectRefactorKind::ExtractMethod)
+            }
+            Action::ExtractConstant => {
+                self.trigger_direct_refactor(DirectRefactorKind::ExtractConstant)
+            }
+            Action::ExtractField => self.trigger_direct_refactor(DirectRefactorKind::ExtractField),
+            Action::Inline => self.trigger_direct_refactor(DirectRefactorKind::Inline),
             Action::Exit => return LoopSignal::Exit,
         }
         LoopSignal::Continue
@@ -19579,5 +19906,528 @@ mod tests {
 
         assert!(app.generate_menu.is_some());
         assert!(app.code_actions.is_none());
+    }
+
+    // -- T43: Refactor This (`tui-refactor-this.md`) --
+
+    fn refactor_action(index: usize, kind: &str, title: &str) -> ide_lsp::CodeAction {
+        ide_lsp::CodeAction {
+            index,
+            title: title.to_string(),
+            kind: Some(kind.to_string()),
+            is_preferred: false,
+            disabled_reason: None,
+        }
+    }
+
+    #[test]
+    fn is_refactor_kind_matches_only_a_refactor_prefixed_kind() {
+        assert!(App::is_refactor_kind(&refactor_action(
+            0,
+            "refactor.extract",
+            "Extract into variable"
+        )));
+        assert!(App::is_refactor_kind(&refactor_action(
+            0,
+            "refactor.inline",
+            "Inline variable"
+        )));
+        assert!(!App::is_refactor_kind(&quickfix_action(0, "Add import")));
+        assert!(!App::is_refactor_kind(&generate_action(0, "Add derive")));
+    }
+
+    #[test]
+    fn refactor_menu_actions_filters_out_non_refactor_actions_and_keeps_order() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(quickfix_action(0, "Add import"));
+        app.lsp.code_actions.push(refactor_action(
+            1,
+            "refactor.extract",
+            "Extract into variable",
+        ));
+        app.lsp
+            .code_actions
+            .push(refactor_action(2, "refactor.inline", "Inline variable"));
+
+        let actions = app.refactor_menu_actions();
+
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].index, 1);
+        assert_eq!(actions[1].index, 2);
+    }
+
+    #[test]
+    fn trigger_refactor_this_with_no_refactor_kind_action_sets_status_and_does_not_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(quickfix_action(0, "Add import"));
+
+        app.trigger_refactor_this();
+
+        assert_eq!(
+            app.status(),
+            Some("Refactor This: no refactoring available here")
+        );
+        assert!(app.refactor_menu.is_none());
+    }
+
+    #[test]
+    fn trigger_refactor_this_with_a_refactor_action_opens_the_popup_without_a_new_request() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(refactor_action(
+            0,
+            "refactor.extract",
+            "Extract into variable",
+        ));
+
+        app.trigger_refactor_this();
+
+        assert!(app.refactor_menu.is_some());
+        assert_eq!(app.refactor_menu.as_ref().unwrap().selected, 0);
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn up_and_down_move_the_refactor_menu_selection_clamped_to_the_filtered_count() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(quickfix_action(0, "Add import"));
+        app.lsp.code_actions.push(refactor_action(
+            1,
+            "refactor.extract",
+            "Extract into variable",
+        ));
+        app.lsp
+            .code_actions
+            .push(refactor_action(2, "refactor.inline", "Inline variable"));
+        app.refactor_menu = Some(RefactorMenuState { selected: 0 });
+
+        app.handle_refactor_menu_key(plain_key(KeyCode::Up));
+        assert_eq!(app.refactor_menu.as_ref().unwrap().selected, 0);
+
+        app.handle_refactor_menu_key(plain_key(KeyCode::Down));
+        assert_eq!(app.refactor_menu.as_ref().unwrap().selected, 1);
+
+        // Clamped to the FILTERED length (2), not `lsp.code_actions.len()`
+        // (3) -- the bug class this doc's own Revision notes fixed.
+        app.handle_refactor_menu_key(plain_key(KeyCode::Down));
+        assert_eq!(app.refactor_menu.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn enter_on_the_refactor_menu_resolves_the_real_index_through_a_filtered_list() {
+        // A non-refactor action sits before the refactor ones in `lsp.
+        // code_actions`, so filtered-list position (1) and `CodeAction::
+        // index` (2) genuinely diverge -- exactly the scenario the doc's
+        // Revision notes fixed `handle_refactor_menu_key` for.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(quickfix_action(0, "Add import"));
+        app.lsp.code_actions.push(refactor_action(
+            1,
+            "refactor.extract",
+            "Extract into variable",
+        ));
+        app.lsp
+            .code_actions
+            .push(refactor_action(2, "refactor.inline", "Inline variable"));
+        app.refactor_menu = Some(RefactorMenuState { selected: 1 });
+
+        app.handle_refactor_menu_key(plain_key(KeyCode::Enter));
+
+        assert!(app.refactor_menu.is_none());
+        assert!(app.via_refactor_preview);
+    }
+
+    #[test]
+    fn esc_closes_the_refactor_menu() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.refactor_menu = Some(RefactorMenuState { selected: 0 });
+
+        app.handle_refactor_menu_key(plain_key(KeyCode::Esc));
+
+        assert!(app.refactor_menu.is_none());
+    }
+
+    #[test]
+    fn apply_code_action_via_preview_sets_the_flag() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.apply_code_action_via_preview(0);
+
+        assert!(app.via_refactor_preview);
+    }
+
+    #[test]
+    fn trigger_direct_refactor_extract_variable_matches_kind_and_title() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(refactor_action(
+            3,
+            "refactor.extract",
+            "Extract into variable",
+        ));
+
+        app.trigger_direct_refactor(DirectRefactorKind::ExtractVariable);
+
+        assert!(app.via_refactor_preview);
+    }
+
+    #[test]
+    fn trigger_direct_refactor_skips_a_disabled_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let mut disabled = refactor_action(0, "refactor.extract", "Extract into variable");
+        disabled.disabled_reason = Some("not available".to_string());
+        app.lsp.code_actions.push(disabled);
+
+        app.trigger_direct_refactor(DirectRefactorKind::ExtractVariable);
+
+        assert!(!app.via_refactor_preview);
+        assert_eq!(app.status(), Some("Extract Variable: not available here"));
+    }
+
+    #[test]
+    fn trigger_direct_refactor_inline_matches_any_title_under_refactor_inline() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(refactor_action(
+            0,
+            "refactor.inline",
+            "Inline function `foo`",
+        ));
+
+        app.trigger_direct_refactor(DirectRefactorKind::Inline);
+
+        assert!(app.via_refactor_preview);
+    }
+
+    #[test]
+    fn trigger_direct_refactor_with_no_match_sets_an_error_and_does_not_set_via_preview() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(quickfix_action(0, "Add import"));
+
+        app.trigger_direct_refactor(DirectRefactorKind::ExtractMethod);
+
+        assert!(!app.via_refactor_preview);
+        assert_eq!(app.status(), Some("Extract Method: not available here"));
+    }
+
+    #[test]
+    fn show_refactor_preview_diffs_an_open_tabs_buffer_without_writing_anything() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt"); // "hello\nworld"
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        app.show_refactor_preview(
+            "Extract Variable".to_string(),
+            workspace_edit(vec![ide_lsp::FileEdit {
+                path: a.clone(),
+                text_edits: vec![text_edit((0, 0), (0, 5), "goodbye")],
+            }]),
+        );
+
+        let preview = app.pending_refactor_preview.as_ref().unwrap();
+        assert_eq!(preview.diffs.len(), 1);
+        assert!(preview.diffs[0].is_some());
+        assert_eq!(app.tabs[0].buffer.text(), "hello\nworld", "read-only");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "hello\nworld", "read-only");
+    }
+
+    #[test]
+    fn show_refactor_preview_diffs_a_file_with_no_open_tab_via_a_fresh_disk_read() {
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt"); // "second file"
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.show_refactor_preview(
+            "Extract Variable".to_string(),
+            workspace_edit(vec![ide_lsp::FileEdit {
+                path: b.clone(),
+                text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+            }]),
+        );
+
+        let preview = app.pending_refactor_preview.as_ref().unwrap();
+        assert_eq!(preview.diffs.len(), 1);
+        assert!(preview.diffs[0].is_some());
+        assert_eq!(fs::read_to_string(&b).unwrap(), "second file", "read-only");
+    }
+
+    #[test]
+    fn show_refactor_preview_with_an_unreadable_file_yields_a_none_diff_entry_not_dropped() {
+        let dir = sample_project();
+        let missing = dir.path().join("does-not-exist.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.show_refactor_preview(
+            "Extract Variable".to_string(),
+            workspace_edit(vec![ide_lsp::FileEdit {
+                path: missing,
+                text_edits: vec![text_edit((0, 0), (0, 1), "x")],
+            }]),
+        );
+
+        let preview = app.pending_refactor_preview.as_ref().unwrap();
+        assert_eq!(preview.diffs.len(), 1, "row kept, not dropped");
+        assert!(preview.diffs[0].is_none());
+    }
+
+    #[test]
+    fn confirm_refactor_preview_applies_the_edit_and_clears_the_preview() {
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_refactor_preview(
+            "Extract Variable".to_string(),
+            workspace_edit(vec![ide_lsp::FileEdit {
+                path: b.clone(),
+                text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+            }]),
+        );
+
+        app.confirm_refactor_preview();
+
+        assert!(app.pending_refactor_preview.is_none());
+        assert_eq!(app.status(), Some("Extract Variable: applied to 1 file"));
+        assert_eq!(fs::read_to_string(&b).unwrap(), "REPLACED file");
+    }
+
+    #[test]
+    fn confirm_refactor_preview_with_nothing_pending_is_a_noop() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.confirm_refactor_preview();
+
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn cancel_refactor_preview_clears_without_writing_anything() {
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_refactor_preview(
+            "Extract Variable".to_string(),
+            workspace_edit(vec![ide_lsp::FileEdit {
+                path: b.clone(),
+                text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+            }]),
+        );
+
+        app.cancel_refactor_preview();
+
+        assert!(app.pending_refactor_preview.is_none());
+        assert_eq!(fs::read_to_string(&b).unwrap(), "second file");
+    }
+
+    #[test]
+    fn handle_refactor_preview_key_esc_cancels_enter_confirms() {
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_refactor_preview(
+            "Extract Variable".to_string(),
+            workspace_edit(vec![ide_lsp::FileEdit {
+                path: b,
+                text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+            }]),
+        );
+
+        app.handle_refactor_preview_key(plain_key(KeyCode::Esc));
+
+        assert!(app.pending_refactor_preview.is_none());
+    }
+
+    #[test]
+    fn handle_refactor_preview_key_scrolls_up_and_down_clamped_at_zero() {
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_refactor_preview(
+            "Extract Variable".to_string(),
+            workspace_edit(vec![ide_lsp::FileEdit {
+                path: b,
+                text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+            }]),
+        );
+
+        app.handle_refactor_preview_key(plain_key(KeyCode::Up));
+        assert_eq!(app.pending_refactor_preview.as_ref().unwrap().scroll, 0);
+
+        app.handle_refactor_preview_key(plain_key(KeyCode::Down));
+        assert_eq!(app.pending_refactor_preview.as_ref().unwrap().scroll, 1);
+
+        app.handle_refactor_preview_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.pending_refactor_preview.as_ref().unwrap().scroll, 11);
+
+        app.handle_refactor_preview_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.pending_refactor_preview.as_ref().unwrap().scroll, 1);
+    }
+
+    #[test]
+    fn handle_workspace_edit_ready_via_preview_shows_the_preview_instead_of_applying() {
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.via_refactor_preview = true;
+        app.lsp.workspace_edit_ready = true;
+        app.lsp.workspace_edit_label = Some("Extract Variable".to_string());
+        app.lsp.workspace_edit = Some(workspace_edit(vec![ide_lsp::FileEdit {
+            path: b.clone(),
+            text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+        }]));
+
+        app.handle_workspace_edit_ready();
+
+        assert!(!app.via_refactor_preview, "must be reset");
+        assert!(app.pending_refactor_preview.is_some());
+        assert!(app.status().is_none(), "not applied yet");
+        assert_eq!(
+            fs::read_to_string(&b).unwrap(),
+            "second file",
+            "not written yet"
+        );
+    }
+
+    #[test]
+    fn handle_workspace_edit_ready_without_preview_applies_immediately_as_before() {
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.workspace_edit_ready = true;
+        app.lsp.workspace_edit_label = Some("Code action".to_string());
+        app.lsp.workspace_edit = Some(workspace_edit(vec![ide_lsp::FileEdit {
+            path: b.clone(),
+            text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+        }]));
+
+        app.handle_workspace_edit_ready();
+
+        assert!(app.pending_refactor_preview.is_none());
+        assert_eq!(app.status(), Some("Code action: applied to 1 file"));
+        assert_eq!(fs::read_to_string(&b).unwrap(), "REPLACED file");
+    }
+
+    #[test]
+    fn a_stale_via_refactor_preview_never_leaks_into_a_second_unrelated_apply() {
+        // Mirrors `formatting.md`'s own `format_ready` post-review fix:
+        // the flag must be taken-and-reset on *every* call, even one with
+        // no usable edit, or a stray `true` would leak into the next,
+        // unrelated `WorkspaceEditReady` this method processes.
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.via_refactor_preview = true;
+        app.lsp.workspace_edit_ready = true;
+        app.lsp.workspace_edit_label = Some("Refactor This".to_string());
+        app.lsp.workspace_edit = None; // the "nothing to apply" branch
+
+        app.handle_workspace_edit_ready();
+
+        assert!(!app.via_refactor_preview, "must be reset even with no edit");
+
+        // A second, unrelated event must apply immediately, not detour
+        // into a preview it never asked for.
+        app.lsp.workspace_edit_ready = true;
+        app.lsp.workspace_edit_label = Some("Code action".to_string());
+        app.lsp.workspace_edit = Some(workspace_edit(vec![ide_lsp::FileEdit {
+            path: b.clone(),
+            text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+        }]));
+
+        app.handle_workspace_edit_ready();
+
+        assert!(app.pending_refactor_preview.is_none());
+        assert_eq!(app.status(), Some("Code action: applied to 1 file"));
+        assert_eq!(fs::read_to_string(&b).unwrap(), "REPLACED file");
+    }
+
+    #[test]
+    fn deleting_the_underlying_action_definition_never_affects_a_pending_preview() {
+        // `pending_refactor_preview` holds a full `WorkspaceEdit` clone,
+        // not an index back into `lsp.code_actions` -- mutating that list
+        // after the preview was built must never disturb it.
+        let dir = sample_project();
+        let b = dir.path().canonicalize().unwrap().join("b.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_refactor_preview(
+            "Extract Variable".to_string(),
+            workspace_edit(vec![ide_lsp::FileEdit {
+                path: b,
+                text_edits: vec![text_edit((0, 0), (0, 6), "REPLACED")],
+            }]),
+        );
+
+        app.lsp.code_actions.clear();
+
+        assert!(app.pending_refactor_preview.is_some());
+        assert_eq!(
+            app.pending_refactor_preview.as_ref().unwrap().diffs.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn close_all_overlays_clears_the_refactor_menu_and_preview() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.refactor_menu = Some(RefactorMenuState { selected: 0 });
+        app.pending_refactor_preview = Some(RefactorPreview {
+            what: "Extract Variable".to_string(),
+            edit: workspace_edit(vec![]),
+            diffs: vec![],
+            scroll: 0,
+        });
+
+        app.close_all_overlays();
+
+        assert!(app.refactor_menu.is_none());
+        assert!(app.pending_refactor_preview.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_refactor_menu_and_preview() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.refactor_menu = Some(RefactorMenuState { selected: 0 });
+        assert!(app.any_popup_open());
+        app.refactor_menu = None;
+
+        app.pending_refactor_preview = Some(RefactorPreview {
+            what: "Extract Variable".to_string(),
+            edit: workspace_edit(vec![]),
+            diffs: vec![],
+            scroll: 0,
+        });
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn run_action_refactor_this_and_extract_variable_dispatch_correctly() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.code_actions.push(refactor_action(
+            0,
+            "refactor.extract",
+            "Extract into variable",
+        ));
+
+        app.run_action(Action::RefactorThis);
+        assert!(app.refactor_menu.is_some());
+        app.refactor_menu = None;
+
+        app.run_action(Action::ExtractVariable);
+        assert!(app.via_refactor_preview);
     }
 }

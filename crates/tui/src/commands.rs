@@ -258,6 +258,12 @@ pub enum Action {
     ToggleClonePanel,
     ReformatCode,
     ToggleFormatOnSave,
+    RefactorThis,
+    ExtractVariable,
+    ExtractMethod,
+    ExtractConstant,
+    ExtractField,
+    Inline,
     Exit,
 }
 
@@ -1121,6 +1127,67 @@ pub fn commands() -> &'static [Command] {
             // action (`docs/features/tui-formatting.md` §2.3).
             binding: None,
             action: Action::ToggleFormatOnSave,
+        },
+        Command {
+            id: "RefactorThis",
+            title: "Refactor This",
+            // Palette-only, not an invented gap: `ide-ui`'s own binding is
+            // a literal `Ctrl+T`, but `Ctrl+T` is already `ToggleProject
+            // ToolWindow`'s binding above -- a genuine occupied slot, not
+            // a maskable byte collision to work around
+            // (`docs/features/tui-refactor-this.md` §2.2).
+            binding: None,
+            action: Action::RefactorThis,
+        },
+        Command {
+            id: "ExtractVariable",
+            title: "Extract Variable",
+            // `⌘⌥V` translated.
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                KeyCode::Char('v'),
+            )),
+            action: Action::ExtractVariable,
+        },
+        Command {
+            id: "ExtractMethod",
+            title: "Extract Method",
+            // `⌘⌥M` translated.
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                KeyCode::Char('m'),
+            )),
+            action: Action::ExtractMethod,
+        },
+        Command {
+            id: "ExtractConstant",
+            title: "Extract Constant",
+            // `⌘⌥C` translated.
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                KeyCode::Char('c'),
+            )),
+            action: Action::ExtractConstant,
+        },
+        Command {
+            id: "ExtractField",
+            title: "Extract Field",
+            // `⌘⌥F` translated.
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                KeyCode::Char('f'),
+            )),
+            action: Action::ExtractField,
+        },
+        Command {
+            id: "Inline",
+            title: "Inline",
+            // `⌘⌥N` translated.
+            binding: Some((
+                KeyModifiers::CONTROL.union(KeyModifiers::ALT),
+                KeyCode::Char('n'),
+            )),
+            action: Action::Inline,
         },
         Command {
             id: "Exit",
