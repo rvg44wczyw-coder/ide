@@ -20035,6 +20035,19 @@ mod tests {
             .push(refactor_action(2, "refactor.inline", "Inline variable"));
         app.refactor_menu = Some(RefactorMenuState { selected: 1 });
 
+        // `apply_code_action` is a no-op with no LSP client running (see
+        // `LspBridge::apply_code_action`), so the index it was actually
+        // called with can't be observed through `via_refactor_preview`
+        // alone -- that flag would end up `true` even from the wrong
+        // index. Assert the mapping the Enter handler depends on
+        // directly instead, the same fix `tui-code-generation.md` (T39)
+        // already applied to its own analogous test.
+        assert_eq!(
+            app.refactor_menu_actions()[1].index,
+            2,
+            "filtered position 1 must resolve to CodeAction::index 2, not 1"
+        );
+
         app.handle_refactor_menu_key(plain_key(KeyCode::Enter));
 
         assert!(app.refactor_menu.is_none());
