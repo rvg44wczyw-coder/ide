@@ -177,14 +177,28 @@ screen never discards that screen's own state (§3.2/§3.3) — only popups
 `git_panel: Option<GitPanelState>` keeps its existing shape and every
 existing field/behavior (`GitPanelView`, `GitPanelFocus`, branches/
 worktrees/conflicts popups nested inside it, etc.) untouched.
-`GoToGitScreen`'s handler:
+
+**Round-2 correction**: `GoToGitScreen`'s handler must close every other
+overlay first, the same "opening a major view" convention every sibling
+command (`toggle_problems`, `toggle_notifications`, `toggle_git_panel`
+itself) already follows — an earlier draft of this doc deliberately
+skipped that call, and a `rev` pass flagged it as a real, if not
+blocking, inconsistency. Since `close_all_overlays()` unconditionally
+sets `git_panel = None`, the handler saves the existing state first and
+restores it afterward, rather than calling `close_all_overlays()` and
+then re-inserting a fresh `default()`:
 
 ```rust
 fn go_to_git_screen(&mut self) {
-    self.git_panel.get_or_insert_with(GitPanelState::default);
+    let existing = self.git_panel.take();
+    self.close_all_overlays();
+    self.git_panel = Some(existing.unwrap_or_default());
     self.active_screen = AppScreen::Git;
 }
 ```
+
+`GoToRunScreen`'s handler gets the same `close_all_overlays()` call (no
+save/restore needed — `self.cargo` isn't touched by it).
 
 `git_panel` is **never** set back to `None` by a screen switch — only by
 an explicit future "reset" affordance if one is ever added (none exists
@@ -206,22 +220,59 @@ just navigates back to Editor. Every other branch of that function
 (Tab/`g`/`s`/`b` sub-navigation, log/changes/conflicts handling) is
 untouched.
 
-`handle_key`'s existing dispatch already checks `if self.git_panel.is_some() { return self.handle_git_panel_key(key); }`
-near the top of its popup-priority chain (verify the exact current
-position against source — it sits alongside the other `Option`-gated
-popup checks). Since `git_panel` is now `Some` for the entire time
-`active_screen == Git` (not just while a popup is open), this existing
-check continues to route every key on the Git screen to
-`handle_git_panel_key` with **no change to that check itself** — it was
-already exactly the right shape, because "is `git_panel` populated" was
-always the real gate, "is a popup open" was just what that used to mean.
+`handle_key`'s existing dispatch checks `if self.git_panel.is_some() { return self.handle_git_panel_key(key); }`
+near the top of its popup-priority chain, alongside the other
+`Option`-gated popup checks. **This check must change, not stay as-is —
+a round-2 review round caught this as a real, live bug**: because
+`git_panel` deliberately stays `Some` after leaving the Git screen via
+Esc (state persists, see above), gating dispatch on `git_panel.is_some()`
+means every key — and, via `any_popup_open()`'s identical
+`self.git_panel.is_some()` term, every mouse click too, including
+clicking the "Editor" tab itself — gets permanently intercepted by
+`handle_git_panel_key` for the rest of the session, the very first time
+the Git screen is ever visited. There is no longer any code path that
+sets `git_panel` back to `None`, so once this triggers it is a true
+dead end: not a rare edge case, but the outcome of the single most
+ordinary way to leave the Git screen. Confirmed live in the round-2
+review by adding a temporary regression test (open a tab, visit Git,
+press Esc, then type a character — the buffer was unchanged, proving the
+keystroke never reached the editor) before this fix, and confirming the
+same test passes after it.
+
+The fix: both checks must gate on `self.active_screen ==
+AppScreen::Git` instead of `self.git_panel.is_some()`. Every place that
+sets `git_panel` must also keep `active_screen` in sync: `go_to_git_screen`
+(above), `toggle_git_panel` (now sets `active_screen = AppScreen::Git`
+when opening and `active_screen = AppScreen::Editor` when closing, so
+its own ~40 existing test call sites — which set up state by calling it
+directly, not through `run_action` — keep reaching
+`handle_git_panel_key` correctly under the corrected gate), and five
+existing command handlers that populate `git_panel` directly without
+going through either of the above: `trigger_git_branches`,
+`trigger_git_worktrees`, `trigger_show_file_history`,
+`trigger_show_diff_for_gutter`, and the background merge-conflict
+auto-open path (`RemoteOpOutcome::Merged`'s `is_conflicts` branch). This
+doc's original draft never listed these five at all — a real coverage
+gap in the doc, caught only by grepping `app.rs` for every
+`git_panel = Some(...)`/`toggle_git_panel()` call site during
+implementation. Each one now also sets
+`self.active_screen = AppScreen::Git;` immediately after populating
+`git_panel`.
 
 ### 3.3 Run screen state
 
 `self.cargo: CargoPanel` is already an always-alive struct (per T33's
 "always-alive struct + derived dock visibility" convention, same as
 Docker/Kubernetes) — nothing new to construct. `GoToRunScreen`'s handler
-is just `self.active_screen = AppScreen::Run;`.
+(round-2 correction, §3.2's `close_all_overlays()` convention applies
+here too):
+
+```rust
+fn go_to_run_screen(&mut self) {
+    self.close_all_overlays();
+    self.active_screen = AppScreen::Run;
+}
+```
 
 **Dispatch rank — verified against actual source, not assumed**: unlike
 every popup check above it, `BottomDockTab`/Cargo key handling today is
@@ -336,7 +387,7 @@ meaningless to run while that buffer isn't even the visible screen, so
 stealing `Esc` away from it specifically while `active_screen !=
 Editor` is safe.
 
-This rule is placed *after* the existing `git_panel` check in the
+This rule is placed *after* the existing Git-screen check in the
 dispatch chain (that check is itself very early, well before this rule
 and before the global keymap lookup too), so it never actually fires for
 the Git screen at all — `handle_git_panel_key` already returns
@@ -347,13 +398,19 @@ on top of the Run screen) — that guard defers to whichever popup's own
 check already ran earlier in the chain. In practice this rule is what
 actually moves `active_screen` back to `Editor` for the Run and Keys
 screens (§3.3/§3.4); for Git it's dead code in the sense that
-`git_panel`'s own handling always wins first, which is fine and expected.
+`handle_git_panel_key`'s own handling always wins first, which is fine
+and expected.
 
 ### 3.6 Popups on top of each screen
 
-`any_popup_open()` and `close_all_overlays()` are **unchanged** — every
-existing `Option`/`bool` popup field they already check/reset keeps
-being checked/reset exactly as today, regardless of `active_screen`.
+`close_all_overlays()` is **unchanged** — every existing `Option`/`bool`
+popup field it resets keeps being reset exactly as today, regardless of
+`active_screen`. `any_popup_open()` has **one** change from today,
+covered by §3.2's fix above: its `self.git_panel.is_some()` term becomes
+`self.active_screen == AppScreen::Git`, for the same reason `handle_key`'s
+own check needed the identical change — every other `Option`/`bool` term
+it checks is untouched.
+
 `render()`'s popup-overlay block at the end (palette, code actions,
 rename, blame, go-to-file, keymap settings, theme settings, etc.) is
 unchanged and keeps rendering on top of whatever screen's body was just
@@ -369,8 +426,8 @@ holds once §3.3's corrected rank (global keymap lookup *before* the
 requirement, not a bonus, since getting that rank backwards would
 silently break every global binding on this one screen only. On the
 **Git** screen, the *existing, pre-existing* limitation carries forward
-unchanged: `git_panel.is_some()` causes `handle_git_panel_key` to
-intercept every key before the global lookup ever runs, exactly as it
+unchanged: `active_screen == AppScreen::Git` causes `handle_git_panel_key`
+to intercept every key before the global lookup ever runs, exactly as it
 already does today for the modal Git Panel popup — a user must return to
 `Editor` (or another screen) before opening most other popups. This is
 not a regression T44 introduces; T44 only extends how long that
@@ -396,9 +453,15 @@ order.
   not add an `AppScreen`-keyed `Focus` variant; keep the two concepts
   separate, since Git/Run/Keys have no internal dock split to focus
   between (yet — that's T47's per-edge model).
-- `git_panel`/`self.cargo` are never `None`/reset by navigation alone,
-  only by their own internal logic (currently: never, for either) — see
-  §3.2/§3.3's explicit statement that this is intended, not a leak.
+- `self.cargo` is never reset by navigation alone. `git_panel`'s *value*
+  is never lost to navigation either, but (round-2 correction) its
+  mechanism is no longer "left completely untouched": `GoToGitScreen`
+  now round-trips it through `close_all_overlays()` (take, close
+  everything including `git_panel`, restore what was taken) to close
+  other overlays the same way every sibling command does — see §3.2's
+  corrected handler. The net effect for a caller is identical to "never
+  touched," which is what matters and what §3.2/§3.3 explicitly state is
+  intended, not a leak.
 - The new tab bar's one row is **unconditional** screen real estate
   (`Constraint::Length(1)`, always present) — do not make it
   conditionally hidden; a screen switcher that disappears defeats the
@@ -432,8 +495,10 @@ Launch ide-tui on a Rust project.
 Click "Git" in the tab bar (or run GoToGitScreen from the palette).
   -> Tab bar: Editor [Git] Run  Keys
   -> Body: full-screen Git Panel (Log/Changes view, same as opening the
-     old ToggleGitPanel popup used to show) -- borders now flush against
-     the tab bar above, no popup margin.
+     old ToggleGitPanel popup used to show) -- `render_git_panel` is
+     reused unchanged, so it still insets its own small margin within the
+     body area exactly like it did as a popup; only the row it's given
+     (below the permanent tab bar, above the status bar) changed.
   -> Press `g`/`s`/`b` etc.: identical to today's Git Panel behavior.
 
 Press Esc.
@@ -467,8 +532,13 @@ While on the Git screen, press Ctrl+Shift+A.
   token, mirrored not duplicated).
 - `app.rs`'s existing `git_panel`/`self.cargo`/`any_popup_open`/
   `close_all_overlays`/`handle_git_panel_key`/`handle_cargo_panel_key`/
-  `handle_bottom_dock_key`, all reused, only `handle_git_panel_key`'s
-  final Esc line actually changes.
+  `handle_bottom_dock_key`/`toggle_git_panel`, all reused. Round-2
+  corrections touch more of these than the original draft expected:
+  `handle_git_panel_key`'s final Esc line, `handle_key`'s and
+  `any_popup_open`'s `git_panel`-gating terms (now `active_screen ==
+  AppScreen::Git`, §3.2), `toggle_git_panel` (now keeps `active_screen`
+  in sync on both open and close), and `go_to_git_screen`/
+  `go_to_run_screen` (now call `close_all_overlays`, §3.2/§3.3).
 - `commands.rs`'s `Command`/`Action` registry and the
   `no_two_bound_commands_share_the_same_chord` test (all four new
   commands are `binding: None`, so this test is unaffected but must
@@ -511,3 +581,43 @@ modal popup). The corrected §3.6 states this as a carried-forward,
 pre-existing limitation specific to Git, not a regression, and points
 implementation at the two interactions (Run/Keys + palette) that
 genuinely need a passing test.
+
+### Round 2 (`rev` code review, post-implementation)
+
+Two findings, both fixed in place; the first blocked approval.
+
+1. **[Critical, blocking] Permanent input lockup after the first visit to
+   the Git screen.** §3.2's original text claimed `handle_key`'s existing
+   `if self.git_panel.is_some() { ... }` check "needed no change" once
+   `git_panel` started persisting across screen switches — this was
+   wrong, and it was the single most severe bug this feature could have
+   shipped with. Since Esc no longer clears `git_panel` (that's the whole
+   point of the persistence design), `git_panel` stays `Some` forever
+   after the first Git-screen visit, and because that same
+   `git_panel.is_some()` term also gates `any_popup_open()` (which in
+   turn gates `handle_mouse_click`), **every subsequent key press and
+   every subsequent mouse click — including clicking the "Editor" tab —
+   was permanently swallowed by `handle_git_panel_key` for the rest of
+   the session.** No code path was left that ever reset `git_panel` back
+   to `None`, so this was not a rare edge case but the outcome of the
+   single most ordinary way to leave the Git screen. Confirmed live
+   during review with a temporary regression test (visit Git, press Esc,
+   type a character — the buffer was unchanged before the fix, changed
+   after it). Fixed by gating `handle_key` and `any_popup_open` on
+   `self.active_screen == AppScreen::Git` instead, with `toggle_git_panel`
+   (and every other `git_panel`-populating call site) updated to keep
+   `active_screen` in sync. §3.2, §3.5, §3.6, and §4 above are all updated
+   to describe the corrected gate; §3.2 also now documents the five
+   existing command handlers (`trigger_git_branches` and siblings) that
+   this doc's original draft never mentioned at all.
+2. **[controversial → fixed] `go_to_git_screen`/`go_to_run_screen`
+   deliberately skipped `close_all_overlays()`, unlike every sibling
+   "open a major view" command (`toggle_problems`, `toggle_notifications`,
+   `toggle_git_panel` itself).** Raised as a devil's-advocate design
+   disagreement, not a blocking defect, but the user asked for it to be
+   fixed rather than left as accepted debt. Both handlers now call
+   `close_all_overlays()`; `go_to_git_screen` saves and restores
+   `git_panel`'s own value around that call so the persistence goal from
+   finding 1 above is preserved (only *other* overlays close, not
+   `git_panel`'s own state). §3.2/§3.3/§4 above are updated with the
+   corrected handler bodies.
