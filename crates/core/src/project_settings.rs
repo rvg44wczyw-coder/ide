@@ -33,6 +33,12 @@ pub enum ProjectSettingsFile {
     /// `Navigation` already is. `ide-tui` is this slot's first user too;
     /// nothing about the name or file ties it to one frontend.
     CustomActions,
+    /// AI provider config: order + per-provider sanitize flags
+    /// (`docs/features/tui-ai-hybrid-fallback.md`, T49). Content-named,
+    /// not frontend-named, like `Navigation`/`CustomActions` — `ide-tui`
+    /// is the first user; nothing about the name or file ties it to one
+    /// frontend.
+    Ai,
 }
 
 impl ProjectSettingsFile {
@@ -42,6 +48,7 @@ impl ProjectSettingsFile {
             ProjectSettingsFile::Workspace => "workspace.json",
             ProjectSettingsFile::Navigation => "navigation.json",
             ProjectSettingsFile::CustomActions => "custom_actions.json",
+            ProjectSettingsFile::Ai => "ai.json",
         }
     }
 }
@@ -268,6 +275,26 @@ mod tests {
             .join(SETTINGS_DIR_NAME)
             .join("navigation.json")
             .exists());
+    }
+
+    #[test]
+    fn ai_slot_uses_its_own_file_and_stays_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ProjectSettingsFile::Ai, &Example { count: 7 }).unwrap();
+
+        assert_eq!(
+            read::<Example>(dir.path(), ProjectSettingsFile::Ai).unwrap(),
+            Some(Example { count: 7 })
+        );
+        assert_eq!(
+            read::<Example>(dir.path(), ProjectSettingsFile::CustomActions).unwrap(),
+            None
+        );
+        assert_eq!(
+            read::<Example>(dir.path(), ProjectSettingsFile::Navigation).unwrap(),
+            None
+        );
+        assert!(dir.path().join(SETTINGS_DIR_NAME).join("ai.json").exists());
     }
 
     #[test]
