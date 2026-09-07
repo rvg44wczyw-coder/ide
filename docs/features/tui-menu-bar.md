@@ -107,9 +107,18 @@ New methods:
 fn open_menu_bar(&mut self, index: usize);
 fn close_menu_bar(&mut self);
 fn handle_menu_bar_key(&mut self, key: KeyEvent) -> LoopSignal;
-fn handle_menu_bar_click(&mut self, event: MouseEvent, hits: &ui::HitMap);
-fn menu_mnemonic_index(key: KeyEvent) -> Option<usize>; // Alt+<letter> -> menu_groups() index
+fn handle_menu_bar_click(&mut self, point: (u16, u16), hits: &ui::HitMap);
+fn run_action_by_id(&mut self, id: &str) -> LoopSignal; // looks `id` up in `commands()` and runs it
 ```
+
+No separate `menu_mnemonic_index` helper -- the `Alt+<letter> -> menu_groups()`
+index` lookup (`groups.iter().position(|g| g.mnemonic.eq_ignore_ascii_case(&c))`)
+is inlined at both of its call sites (`handle_key`'s opening trigger,
+`handle_menu_bar_key`'s "jump to another menu while already open" branch)
+rather than factored into a shared function -- it's a one-line `position`
+call at each site, and `handle_menu_bar_click` takes the already-extracted
+`(u16, u16)` point rather than the full `MouseEvent`, matching how
+`handle_mouse_click` itself extracts `point` once at its own top.
 
 `close_all_overlays` gains `self.menu_bar = MenuBarState::default();`
 (same reasoning as `colon_command`/`unified_finder`: no toggle-function
@@ -288,3 +297,37 @@ label`/`effective_binding` (T48), the `HitMap`/click-and-scroll-priority
 patterns from `tui-panel-focus-and-scroll.md` (T51) and `tui-panel-pane-
 scroll.md` (T53), and `go_to_git_screen`'s save/restore-around-`close_
 all_overlays` pattern (T44 round-1 review fix).
+
+## Revision notes
+
+Self-review round (post-implementation, same session) caught two real
+deviations from this doc, both fixed in place rather than left as known
+gaps:
+
+1. **§3.1/§3.3's "clicking the already-open menu's own label closes it
+   (toggle)" was documented but not implemented** -- `handle_menu_bar_
+   click`'s bar-label branch unconditionally reopened at `selected = 0`
+   regardless of whether the clicked label was already the open one.
+   Fixed: compares the clicked index against `menu_bar.open` and calls
+   `close_menu_bar()` on a match. New regression test:
+   `mouse_click_on_the_already_open_menus_own_label_closes_it`.
+2. **§2.3's flyout anchoring ("`y` = the highlighted `Submenu` row's own
+   `y`") was implemented as the dropdown box's top border instead** --
+   every flyout rendered flush with the top of its dropdown regardless of
+   which row was highlighted, visually misaligned for any menu where the
+   `Submenu` isn't the first entry (e.g. Edit's Move/Comment/Selection,
+   Run's Debug at index 2). Fixed: `render_menu_submenu` now looks up the
+   highlighted row's actual `y` from `hits.menu_dropdown_items` (already
+   populated by this frame's earlier `render_menu_dropdown` call) instead
+   of reusing the dropdown's own top edge. Rendering-only, not caught by
+   any test (`ui.rs` is excluded from the coverage target per this
+   crate's convention) -- caught by re-reading the code against the doc's
+   own wording, not by a failing test.
+
+§2.2's `menu_mnemonic_index`/`handle_menu_bar_click(event: MouseEvent,
+...)` signatures in the original draft above were never actually
+implemented that way -- the real code inlines the mnemonic lookup at its
+two call sites and takes an already-extracted `(u16, u16)` point instead
+of the full `MouseEvent`. Functionally identical, arguably cleaner; the
+snippet above has been updated to match the real code rather than the
+other way around.

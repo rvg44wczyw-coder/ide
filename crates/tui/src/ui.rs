@@ -1087,9 +1087,22 @@ fn render_menu_submenu(
     let width = (content_width + 4).clamp(16, area.width.saturating_sub(2).max(16));
     let height = (ids.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
     let x = (dropdown_rect.x + dropdown_rect.width).min(area.width.saturating_sub(width));
+    // `tui-menu-bar.md` §2.3: anchors to the highlighted `Submenu` row's
+    // own `y`, not the dropdown box's top border -- `hits.menu_dropdown_
+    // items` was already populated by this frame's earlier `render_menu_
+    // dropdown` call, keyed by entry index, so the row's real position is
+    // just a lookup, not a recomputation. Falls back to `dropdown_rect.y`
+    // defensively (should never miss: `app.menu_bar.selected` is always a
+    // valid `entries` index while a flyout is open).
+    let y = hits
+        .menu_dropdown_items
+        .iter()
+        .find(|(_, i)| *i == app.menu_bar.selected)
+        .map(|(rect, _)| rect.y)
+        .unwrap_or(dropdown_rect.y);
     let popup = Rect {
         x,
-        y: dropdown_rect.y,
+        y,
         width,
         height,
     };

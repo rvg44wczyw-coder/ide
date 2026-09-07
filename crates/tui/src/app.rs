@@ -6901,9 +6901,16 @@ impl App {
             .iter()
             .find(|(rect, _)| rect.contains(point.into()))
         {
-            self.menu_bar.open = Some(group_index);
-            self.menu_bar.selected = 0;
-            self.menu_bar.submenu_selected = None;
+            // `tui-menu-bar.md` §3.1/§3.3: clicking the *already-open*
+            // menu's own label closes it (toggle) -- a different bar
+            // label switches without closing.
+            if group_index == open {
+                self.close_menu_bar();
+            } else {
+                self.menu_bar.open = Some(group_index);
+                self.menu_bar.selected = 0;
+                self.menu_bar.submenu_selected = None;
+            }
             return;
         }
         self.close_menu_bar();
@@ -25134,6 +25141,35 @@ mod tests {
         assert_eq!(app.menu_bar.open, Some(1));
         assert_eq!(app.menu_bar.selected, 0);
         assert_eq!(app.menu_bar.submenu_selected, None);
+    }
+
+    #[test]
+    fn mouse_click_on_the_already_open_menus_own_label_closes_it() {
+        // `docs/features/tui-menu-bar.md` §3.1/§3.3: clicking a *different*
+        // bar label switches menus (previous test); clicking the same,
+        // already-open one's own label is a toggle-close instead.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        let hits = ui::HitMap {
+            menu_bar_labels: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                0,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar, MenuBarState::default());
     }
 
     #[test]
