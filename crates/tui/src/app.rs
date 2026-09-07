@@ -190,6 +190,35 @@ pub(crate) struct ColonCommandState {
     pub(crate) selected: usize,
 }
 
+/// One row in the unified finder's merged result list (`docs/features/
+/// tui-unified-finder.md` §2.1, T46).
+#[derive(Clone)]
+pub(crate) enum FinderRow {
+    /// Carries the whole `FuzzyFileMatch`, not just its `path`, so
+    /// rendering can show `relative` (the same project-relative display
+    /// `render_go_to_file_popup` already uses) without re-deriving it.
+    File(ide_core::FuzzyFileMatch),
+    Symbol(Symbol),
+    Command(&'static Command),
+}
+
+/// The unified finder's ("Search Everywhere") typed query and list
+/// selection (`docs/features/tui-unified-finder.md` §2.2) -- same
+/// "UI-local state only, results live elsewhere" convention `GoToFileState`/
+/// `GoToSymbolState` establish. `ran_query` gates the shared `files_search`
+/// trigger exactly like `GoToFileState::ran_query`; `last_workspace_query`
+/// gates the shared `lsp.query_workspace_symbols` trigger exactly like
+/// `GoToSymbolState::last_workspace_query`. No `requested_for`/empty-query
+/// `document_symbols` fallback -- see `sync_unified_finder`'s doc comment
+/// for why the empty-query case is simply "no rows" here.
+#[derive(Default)]
+pub(crate) struct UnifiedFinderState {
+    pub(crate) query: String,
+    pub(crate) selected: usize,
+    ran_query: Option<String>,
+    last_workspace_query: Option<String>,
+}
+
 /// Zero-or-many result picker shared by Go to Declaration and Find Usages
 /// (`docs/features/tui-goto-and-usages.md` §2.2) -- exactly one result
 /// jumps immediately and never creates this; this only exists while the
@@ -925,6 +954,15 @@ pub struct App {
     pub(crate) palette: Option<PaletteState>,
     /// `docs/features/tui-colon-command.md` §2.1, T45.
     pub(crate) colon_command: Option<ColonCommandState>,
+    /// `docs/features/tui-unified-finder.md` §2.2, T46.
+    pub(crate) unified_finder: Option<UnifiedFinderState>,
+    /// `docs/features/tui-unified-finder.md` §2.3, T46 -- the `⇧⇧` gesture's
+    /// double-tap tracker. A process-lifetime field, not per-overlay state
+    /// (must keep ticking regardless of whether `unified_finder` is open).
+    shift_double_tap: crate::double_tap::DoubleTap,
+    /// The monotonic clock `shift_double_tap`'s `now: f64` argument is
+    /// measured against (`docs/features/tui-unified-finder.md` §2.3).
+    created_at: std::time::Instant,
     pub(crate) find: Option<FindState>,
     pub(crate) goto: Option<GotoState>,
     /// The `(path, position)` a `Ctrl+B` press actually fired from --
@@ -1219,6 +1257,9 @@ impl App {
             active_tab: None,
             palette: None,
             colon_command: None,
+            unified_finder: None,
+            shift_double_tap: crate::double_tap::DoubleTap::default(),
+            created_at: std::time::Instant::now(),
             find: None,
             goto: None,
             goto_declaration_origin: None,
@@ -2256,6 +2297,11 @@ impl App {
         // it out would let it linger open underneath a newly-opened popup
         // (`docs/features/tui-colon-command.md` §2.3, T45).
         self.colon_command = None;
+        // Included here for the same reason `colon_command` is, right
+        // above (`docs/features/tui-unified-finder.md` §2.4, T46): no
+        // toggle-function precedent guarantees it's already `None` by the
+        // time some other overlay opens.
+        self.unified_finder = None;
         self.goto = None;
         self.notifications_open = false;
         self.hover_open = false;
@@ -6019,11 +6065,44 @@ impl App {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return LoopSignal::Continue;
         }
+        // `⇧⇧` Search Everywhere (`docs/features/tui-unified-finder.md`
+        // §3.3, T46). A pure side effect, checked before the popup-
+        // priority chain below reads any state -- it never itself returns,
+        // so the same key event still flows into the rest of `handle_key`
+        // afterward exactly as it would without this check. Gated on
+        // `!is_text_editing_focused()` for the same reason `ide-ui`'s own
+        // Search Everywhere gates on `!ctx.text_edit_focused()`: without
+        // it, two quick `Shift+Down` (selection-extend) keystrokes while
+        // actually editing code would spuriously pop this open. Gated on
+        // `!any_popup_open()` (checked pre-toggle, before this call could
+        // have changed it) so the gesture can't fire out from under an
+        // already-open, unrelated overlay. `key.modifiers == SHIFT` --
+        // exactly Shift, not merely "contains" it -- is required, not
+        // `ide-ui`'s own looser `i.modifiers.shift` check: this crate binds
+        // many real chords as `CONTROL.union(SHIFT)` (`NextTab`, `Redo`,
+        // ...), and `contains(SHIFT)` would count every one of those as a
+        // tap too, so two quick presses of any single such chord (e.g.
+        // repeatedly cycling tabs with `Ctrl+Shift+]`) would spuriously
+        // pop this open -- caught by `ctrl_shift_close_bracket_cycles_to_
+        // the_next_tab_and_wraps`'s own regression test failing outright,
+        // not by inspection.
+        if !self.is_text_editing_focused()
+            && key.kind == KeyEventKind::Press
+            && key.modifiers == KeyModifiers::SHIFT
+        {
+            let now = self.created_at.elapsed().as_secs_f64();
+            if self.shift_double_tap.press(now) && !self.any_popup_open() {
+                self.toggle_unified_finder();
+            }
+        }
         if self.palette.is_some() {
             return self.handle_palette_key(key);
         }
         if self.colon_command.is_some() {
             return self.handle_colon_command_key(key);
+        }
+        if self.unified_finder.is_some() {
+            return self.handle_unified_finder_key(key);
         }
         if self.find.is_some() {
             return self.handle_find_key(key);
@@ -6251,6 +6330,7 @@ impl App {
     fn any_popup_open(&self) -> bool {
         self.palette.is_some()
             || self.colon_command.is_some()
+            || self.unified_finder.is_some()
             || self.find.is_some()
             || self.goto.is_some()
             || self.notifications_open
@@ -8069,6 +8149,157 @@ impl App {
     /// `handle_key`'s colon-command trigger must not fire.
     fn is_text_editing_focused(&self) -> bool {
         self.active_screen == AppScreen::Editor && self.focus == Focus::Editor
+    }
+
+    /// `⇧⇧` entry point (`docs/features/tui-unified-finder.md` §2.4, T46).
+    fn toggle_unified_finder(&mut self) {
+        let opening = self.unified_finder.is_none();
+        self.close_all_overlays();
+        if opening {
+            self.unified_finder = Some(UnifiedFinderState::default());
+        }
+    }
+
+    /// Handles every key while `unified_finder.is_some()` (§3 of that
+    /// doc). Same shape as `handle_go_to_file_key`/`handle_colon_command_
+    /// key`.
+    fn handle_unified_finder_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.unified_finder.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.unified_finder = None;
+                LoopSignal::Continue
+            }
+            KeyCode::Up => {
+                if state.selected > 0 {
+                    state.selected -= 1;
+                }
+                LoopSignal::Continue
+            }
+            KeyCode::Down => {
+                let len = self.unified_finder_rows().len();
+                let state = self.unified_finder.as_mut().unwrap();
+                if state.selected + 1 < len {
+                    state.selected += 1;
+                }
+                LoopSignal::Continue
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                state.selected = 0;
+                LoopSignal::Continue
+            }
+            KeyCode::Enter => self.confirm_unified_finder(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.query.push(c);
+                state.selected = 0;
+                LoopSignal::Continue
+            }
+            _ => LoopSignal::Continue,
+        }
+    }
+
+    /// Resolves the selected row and dispatches by variant (§2.4). Closes
+    /// the overlay unconditionally first -- matching `handle_palette_key`'s
+    /// own `Enter` arm shape, not `confirm_go_to_file`'s early-return-
+    /// without-closing one.
+    fn confirm_unified_finder(&mut self) -> LoopSignal {
+        let Some(state) = self.unified_finder.as_ref() else {
+            return LoopSignal::Continue;
+        };
+        let row = self.unified_finder_rows().get(state.selected).cloned();
+        self.unified_finder = None;
+        match row {
+            Some(FinderRow::File(m)) => {
+                if let Err(err) = self.open_or_focus_tab(m.path) {
+                    self.notify(err.to_string());
+                    return LoopSignal::Continue;
+                }
+                if let Some(buf) = self.active_buffer_mut() {
+                    buf.desired_column = None;
+                    buf.buffer
+                        .text_buffer_mut()
+                        .set_selections(Selections::single(Selection::caret(0)));
+                }
+                self.push_nav_location(0);
+                LoopSignal::Continue
+            }
+            Some(FinderRow::Symbol(symbol)) => {
+                self.open_location(symbol.location);
+                LoopSignal::Continue
+            }
+            Some(FinderRow::Command(cmd)) => self.run_action(cmd.action),
+            None => LoopSignal::Continue,
+        }
+    }
+
+    /// The unified finder's currently-merged, ranked rows (`docs/features/
+    /// tui-unified-finder.md` §3.2). An empty (trimmed) query is always
+    /// `vec![]` -- unlike `go_to_symbol_rows`, this never falls back to
+    /// `lsp.document_symbols` for an empty query: a merged list has no
+    /// single active file to key that fallback off, and mixing "the
+    /// current file's outline, unranked" with "nothing, because there's no
+    /// file/command query yet" would be a visibly inconsistent row set.
+    pub(crate) fn unified_finder_rows(&self) -> Vec<FinderRow> {
+        let query = self
+            .unified_finder
+            .as_ref()
+            .map(|s| s.query.trim())
+            .unwrap_or("");
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(i64, FinderRow)> = Vec::new();
+        if let Some(results) = &self.files_search.results {
+            for m in &results.matches {
+                scored.push((m.score, FinderRow::File(m.clone())));
+            }
+        }
+        for symbol in &self.lsp.workspace_symbols {
+            if let Some(m) = ide_core::fuzzy_score(query, &symbol.name) {
+                scored.push((m.score, FinderRow::Symbol(symbol.clone())));
+            }
+        }
+        for cmd in commands() {
+            if let Some(m) = ide_core::fuzzy_score(query, cmd.title) {
+                scored.push((m.score, FinderRow::Command(cmd)));
+            }
+        }
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored.into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// Called once per frame, right alongside `sync_go_to_file`/`sync_go_
+    /// to_symbol` (§3.1). No-op unless `unified_finder.is_some()`. Reuses
+    /// `self.files_search`/`self.lsp.workspace_symbols` -- the same fields
+    /// `GoToFile`/`GoToSymbol` themselves drive, safe because only one
+    /// overlay is ever open at a time (`close_all_overlays`).
+    pub(crate) fn sync_unified_finder(&mut self) {
+        let Some(state) = &self.unified_finder else {
+            return;
+        };
+        let query = state.query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        if !self.files_search.searching {
+            let ran_already =
+                self.unified_finder.as_ref().unwrap().ran_query.as_ref() == Some(&query);
+            if !ran_already {
+                self.files_search.run(self.tree.clone(), query.clone());
+                let state = self.unified_finder.as_mut().unwrap();
+                state.ran_query = Some(query.clone());
+                state.selected = 0;
+            }
+        }
+        let state = self.unified_finder.as_mut().unwrap();
+        if Some(&query) != state.last_workspace_query.as_ref() {
+            state.last_workspace_query = Some(query.clone());
+            state.selected = 0;
+            self.lsp.query_workspace_symbols(&query);
+        }
     }
 
     /// `ToggleKeymapSettings` command (`docs/features/tui-keymap.md`
@@ -10007,6 +10238,333 @@ mod tests {
         assert!(!app.any_popup_open());
         app.open_colon_command();
         assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn shift_shift_opens_the_unified_finder_outside_text_editing_focus() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.unified_finder.is_none());
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        assert!(app.unified_finder.is_some());
+    }
+
+    #[test]
+    fn a_single_shift_tap_does_not_open_it() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn ctrl_shift_taps_never_count_toward_the_double_tap() {
+        // Regression for the bug this doc's own §3.3 records: gating on
+        // `contains(SHIFT)` instead of `== SHIFT` made two quick presses of
+        // any `Ctrl+Shift+X` chord (e.g. repeatedly cycling tabs with
+        // `Ctrl+Shift+]`) spuriously open the finder.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(key(
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            KeyCode::Char(']'),
+        ));
+        app.handle_key(key(
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            KeyCode::Char(']'),
+        ));
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn the_gesture_is_suppressed_while_text_editing_focused() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        assert!(app.is_text_editing_focused());
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn the_gesture_does_not_fire_while_another_popup_is_already_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_colon_command();
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn toggle_unified_finder_opens_with_a_reset_state_and_closes() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_unified_finder();
+        assert!(app.unified_finder.is_some());
+        app.unified_finder.as_mut().unwrap().query = "x".to_string();
+
+        app.toggle_unified_finder();
+        assert!(app.unified_finder.is_none());
+
+        app.toggle_unified_finder();
+        assert_eq!(app.unified_finder.as_ref().unwrap().query, "");
+    }
+
+    #[test]
+    fn close_all_overlays_closes_the_unified_finder() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_unified_finder();
+        assert!(app.unified_finder.is_some());
+        app.close_all_overlays();
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_unified_finder() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+        app.toggle_unified_finder();
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn unified_finder_rows_is_empty_for_an_empty_query() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.workspace_symbols = vec![symbol("Whatever", PathBuf::from("/other"))];
+        app.unified_finder = Some(UnifiedFinderState::default());
+        assert!(app.unified_finder_rows().is_empty());
+    }
+
+    #[test]
+    fn unified_finder_rows_merges_and_ranks_files_symbols_and_commands_by_score() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.files_search.results = Some(ide_core::FuzzyFileResults {
+            matches: vec![ide_core::FuzzyFileMatch {
+                path: a.clone(),
+                relative: "a.txt".to_string(),
+                score: 100,
+                indices: vec![0],
+            }],
+            truncated: false,
+        });
+        app.lsp.workspace_symbols = vec![symbol("save_all", a.clone())];
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "sa".to_string(),
+            ..Default::default()
+        });
+
+        let rows = app.unified_finder_rows();
+        assert!(!rows.is_empty());
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, FinderRow::File(m) if m.relative == "a.txt")));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, FinderRow::Symbol(s) if s.name == "save_all")));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, FinderRow::Command(c) if c.title == "Save")));
+        // The file match's seeded score (100) is far above any real
+        // `fuzzy_score` result for a 2-character pattern against "save_all"
+        // or "Save", so it must rank first -- one ranked list, not three
+        // sections concatenated in source order.
+        assert!(matches!(rows.first().unwrap(), FinderRow::File(_)));
+    }
+
+    #[test]
+    fn handle_unified_finder_key_up_down_clamp_against_the_row_count() {
+        // "al" also fuzzy-matches plenty of command titles as a subsequence
+        // (e.g. anything with an 'a' followed later by an 'l'), so this
+        // clamps against the actual observed row count rather than
+        // asserting the two seeded symbols are the only rows -- the point
+        // being tested is the clamp itself, not the merge's exact size.
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.workspace_symbols = vec![symbol("alpha", a.clone()), symbol("alsorun", a)];
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "al".to_string(),
+            ..Default::default()
+        });
+        let len = app.unified_finder_rows().len();
+        assert!(len >= 2);
+
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.unified_finder.as_ref().unwrap().selected, 0);
+
+        for _ in 0..len + 5 {
+            app.handle_key(plain_key(KeyCode::Down));
+        }
+        assert_eq!(app.unified_finder.as_ref().unwrap().selected, len - 1);
+    }
+
+    #[test]
+    fn handle_unified_finder_key_backspace_and_char_update_the_query() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState::default());
+        app.handle_key(plain_key(KeyCode::Char('a')));
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        assert_eq!(app.unified_finder.as_ref().unwrap().query, "ab");
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.unified_finder.as_ref().unwrap().query, "a");
+    }
+
+    #[test]
+    fn confirm_unified_finder_with_no_rows_just_closes() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState::default());
+        app.confirm_unified_finder();
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn confirm_unified_finder_on_a_file_row_opens_it_at_offset_zero() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.files_search.results = Some(ide_core::FuzzyFileResults {
+            matches: vec![ide_core::FuzzyFileMatch {
+                path: a,
+                relative: "a.txt".to_string(),
+                score: 10,
+                indices: vec![],
+            }],
+            truncated: false,
+        });
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "a".to_string(),
+            ..Default::default()
+        });
+        // "a" also fuzzy-matches plenty of command titles -- select the
+        // seeded file row explicitly rather than assuming it ranks first.
+        let rows = app.unified_finder_rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, FinderRow::File(m) if m.relative == "a.txt"))
+            .unwrap();
+        app.unified_finder.as_mut().unwrap().selected = idx;
+
+        app.confirm_unified_finder();
+
+        assert!(app.unified_finder.is_none());
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(caret(&app), 0);
+    }
+
+    #[test]
+    fn confirm_unified_finder_on_a_symbol_row_jumps_to_its_location() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        fs::write(&a, "one\ntwo\nthree\n").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.workspace_symbols = vec![Symbol {
+            name: "target".to_string(),
+            kind: ide_lsp::SymbolKind::Function,
+            container_name: None,
+            location: location(a, 1, 0),
+        }];
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "target".to_string(),
+            ..Default::default()
+        });
+        let rows = app.unified_finder_rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, FinderRow::Symbol(s) if s.name == "target"))
+            .unwrap();
+        app.unified_finder.as_mut().unwrap().selected = idx;
+
+        app.confirm_unified_finder();
+
+        assert!(app.unified_finder.is_none());
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn confirm_unified_finder_on_a_command_row_runs_its_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "gotofile".to_string(),
+            ..Default::default()
+        });
+        let rows = app.unified_finder_rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, FinderRow::Command(c) if c.id == "GoToFile"))
+            .expect("GoToFile command should fuzzy-match \"gotofile\"");
+        app.unified_finder.as_mut().unwrap().selected = idx;
+
+        app.confirm_unified_finder();
+
+        assert!(app.unified_finder.is_none());
+        assert!(app.go_to_file.is_some());
+    }
+
+    #[test]
+    fn confirm_unified_finder_propagates_exit_for_the_exit_command() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "Exit".to_string(),
+            ..Default::default()
+        });
+        let rows = app.unified_finder_rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, FinderRow::Command(c) if c.id == "Exit"))
+            .expect("Exit command should fuzzy-match \"Exit\"");
+        app.unified_finder.as_mut().unwrap().selected = idx;
+
+        let signal = app.confirm_unified_finder();
+        assert_eq!(signal, LoopSignal::Exit);
+    }
+
+    #[test]
+    fn sync_unified_finder_triggers_the_shared_files_search_and_workspace_query() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "a.txt".to_string(),
+            ..Default::default()
+        });
+
+        app.sync_unified_finder();
+
+        assert!(app.files_search.searching);
+        assert_eq!(
+            app.unified_finder.as_ref().unwrap().last_workspace_query,
+            Some("a.txt".to_string())
+        );
+
+        // A second call with the same, still-in-flight query must not
+        // start a second background search.
+        app.sync_unified_finder();
+
+        wait_until(|| {
+            app.poll_search();
+            !app.files_search.searching
+        });
+        let matches = &app.files_search.results.as_ref().unwrap().matches;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].relative, "a.txt");
+    }
+
+    #[test]
+    fn sync_unified_finder_is_a_noop_with_an_empty_query() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState::default());
+        app.sync_unified_finder();
+        assert!(!app.files_search.searching);
     }
 
     #[test]

@@ -24,8 +24,8 @@ use ratatui::Frame;
 use crate::ai_panel::AiDisplayMessage;
 use crate::app::{
     ActionFormField, App, AppScreen, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView,
-    DebugPanelFocus, FilterField, Focus, GitPanelFocus, GitPanelState, GitPanelView, LeftDockState,
-    LeftDockTab, SearchInPathField,
+    DebugPanelFocus, FilterField, FinderRow, Focus, GitPanelFocus, GitPanelState, GitPanelView,
+    LeftDockState, LeftDockTab, SearchInPathField,
 };
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
@@ -170,6 +170,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     if app.colon_command.is_some() {
         render_colon_command(frame, app, size);
+    }
+    if app.unified_finder.is_some() {
+        render_unified_finder(frame, app, size);
     }
     if app.goto.is_some() {
         render_goto_popup(frame, app, size);
@@ -927,6 +930,68 @@ fn render_colon_command(frame: &mut Frame, app: &App, area: Rect) {
     let mut list_state = ListState::default();
     list_state.select(Some(state.selected));
     frame.render_stateful_widget(list, popup, &mut list_state);
+}
+
+/// `⇧⇧`'s popup (`docs/features/tui-unified-finder.md` §3.4). Same
+/// near-fullscreen-minus-margin geometry `render_go_to_file_popup` uses
+/// (not the small fixed-height box `render_palette`/`render_colon_command`
+/// use) -- a merged three-source list needs the room a single-category one
+/// doesn't. Reuses `render_scrollable_list` verbatim; no new list-
+/// rendering logic.
+fn render_unified_finder(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.unified_finder.as_ref() else {
+        return;
+    };
+    let rows = app.unified_finder_rows();
+    let width = area.width.saturating_sub(4).max(20);
+    let height = area.height.saturating_sub(4).max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = if state.query.trim().is_empty() {
+        vec![ListItem::new(Line::from(
+            "Type to search files, symbols, and actions.",
+        ))]
+    } else if rows.is_empty() {
+        vec![ListItem::new(Line::from("No results."))]
+    } else {
+        rows.iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let style = if i == state.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let text = match row {
+                    FinderRow::File(m) => m.relative.clone(),
+                    FinderRow::Symbol(s) => {
+                        let container = s
+                            .container_name
+                            .as_deref()
+                            .map(|c| format!(" -- {c}"))
+                            .unwrap_or_default();
+                        format!("{} ({:?}){container}", s.name, s.kind)
+                    }
+                    FinderRow::Command(cmd) => format!("{}  ({})", cmd.title, cmd.id),
+                };
+                ListItem::new(Line::from(Span::styled(text, style)))
+            })
+            .collect()
+    };
+
+    let title = format!(
+        "Search Everywhere: {}  (Enter: open, Esc: close)",
+        state.query
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 fn render_goto_popup(frame: &mut Frame, app: &App, area: Rect) {

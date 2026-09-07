@@ -41,6 +41,7 @@ mod custom_actions;
 mod debug_config;
 mod debug_panel;
 mod docker_panel;
+mod double_tap;
 mod editor;
 mod file_structure;
 mod files_search;
@@ -253,6 +254,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // tui-go-to-file-and-symbol.md` §3.1/§3.2).
         app.sync_go_to_file();
         app.sync_go_to_symbol();
+        // Same reasoning, for the unified finder's live per-keystroke
+        // refresh (`docs/features/tui-unified-finder.md` §3.1, T46).
+        app.sync_unified_finder();
         // Polled unconditionally, not just while the Cargo panel is open,
         // so a build/test run keeps streaming into `output` in the
         // background even while the panel is closed (`docs/features/
