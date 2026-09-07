@@ -18,11 +18,13 @@ mod files_search;
 mod find_bar;
 mod git_panel;
 mod keymap;
+mod log_viewer;
 mod lsp_bridge;
 mod nav_history;
 mod search_in_path_panel;
 mod search_panel;
 mod theme;
+mod todo_panel;
 mod tree_scan;
 
 /// `initial_project`, when given, opens that path directly (skipping the

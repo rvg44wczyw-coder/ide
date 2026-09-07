@@ -3523,6 +3523,197 @@ impl IdeApp {
             });
     }
 
+    fn render_todo_panel(&mut self, ui: &mut egui::Ui) {
+        self.todo.poll();
+        let tokens = self.theme.tokens();
+
+        ui.horizontal(|ui| {
+            if ui.button("Refresh").clicked() {
+                if let Some(tree) = self.tree.clone() {
+                    self.todo.run(tree);
+                }
+            }
+            if self.todo.searching {
+                ui.spinner();
+            }
+            if let Some(results) = &self.todo.results {
+                let count = results.matches.len();
+                let label = if results.truncated {
+                    format!("{count}+ (truncated)")
+                } else {
+                    count.to_string()
+                };
+                ui.label(
+                    egui::RichText::new(label)
+                        .color(tokens.color.fg_muted)
+                        .small(),
+                );
+            }
+        });
+        ui.separator();
+
+        let Some(results) = &self.todo.results else {
+            if self.todo.searching {
+                ui.label("Searching...");
+            } else {
+                ui.label("No TODOs found. Click Refresh to scan.");
+            }
+            return;
+        };
+
+        if results.matches.is_empty() {
+            ui.label("No TODOs/FIXMEs/HACKs found.");
+            return;
+        }
+
+        let danger = tokens.color.danger;
+        let warning = tokens.color.warning;
+        let info = tokens.color.info;
+        let project_root = self.project.as_ref().map(|p| p.root().to_path_buf());
+
+        let mut clicked: Option<(PathBuf, Position)> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("todo_panel_scroll")
+            .show(ui, |ui| {
+                for m in &results.matches {
+                    let rel_path = project_root
+                        .as_ref()
+                        .and_then(|root| m.inner.path.strip_prefix(root).ok())
+                        .unwrap_or(&m.inner.path)
+                        .to_string_lossy()
+                        .to_string();
+                    let line_text = if m.inner.line_text.len() > 80 {
+                        format!("{}…", &m.inner.line_text[..79])
+                    } else {
+                        m.inner.line_text.clone()
+                    };
+                    let color = match m.pattern {
+                        "FIXME" => danger,
+                        "HACK" => warning,
+                        _ => info,
+                    };
+                    let label = format!("[{}] {}:{}", m.pattern, rel_path, m.inner.line);
+                    let resp = ui.add(
+                        egui::Label::new(egui::RichText::new(&label).color(color).monospace())
+                            .sense(egui::Sense::click()),
+                    );
+                    ui.label(
+                        egui::RichText::new(&line_text)
+                            .color(tokens.color.fg_muted)
+                            .monospace()
+                            .small(),
+                    );
+                    if resp.clicked() && clicked.is_none() {
+                        clicked = Some((
+                            m.inner.path.clone(),
+                            Position {
+                                line: m.inner.line,
+                                character: m.inner.column,
+                            },
+                        ));
+                    }
+                }
+            });
+        if let Some((path, pos)) = clicked {
+            self.open_diagnostic(&path, pos);
+        }
+    }
+
+    fn render_log_viewer(&mut self, ui: &mut egui::Ui) {
+        self.log_viewer.poll();
+        let tokens = self.theme.tokens();
+
+        ui.horizontal(|ui| {
+            if ui.button("Refresh").clicked() {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    let filter = self.log_viewer.filter.clone();
+                    self.log_viewer.run(root, filter);
+                }
+            }
+            if self.log_viewer.loading {
+                ui.spinner();
+            }
+            ui.label(
+                egui::RichText::new(format!("{} commits", self.log_viewer.commits.len()))
+                    .color(tokens.color.fg_muted)
+                    .small(),
+            );
+        });
+        ui.separator();
+
+        if self.log_viewer.commits.is_empty() {
+            if self.log_viewer.loading {
+                ui.label("Loading...");
+            } else if !self.log_viewer.has_repo() {
+                ui.label("Not a git repository.");
+            } else {
+                ui.label("No commits found. Click Refresh to load.");
+            }
+            return;
+        }
+
+        let detail = self.log_viewer.detail.clone();
+        let diff = self.log_viewer.diff.clone();
+
+        let mut clicked_index: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_salt("log_commits_scroll")
+            .max_height(200.0)
+            .show(ui, |ui| {
+                for (i, commit) in self.log_viewer.commits.iter().enumerate() {
+                    let short = &commit.short_id;
+                    let summary = &commit.summary;
+                    let author = &commit.author;
+                    let label = format!("{short} {summary}  ({author})");
+                    let resp = ui.add(
+                        egui::Label::new(egui::RichText::new(&label).monospace())
+                            .sense(egui::Sense::click()),
+                    );
+                    if resp.clicked() && clicked_index.is_none() {
+                        clicked_index = Some(i);
+                    }
+                }
+            });
+        if let Some(i) = clicked_index {
+            self.log_viewer.select_commit(i);
+        }
+
+        if let Some(detail) = &detail {
+            ui.separator();
+            ui.label(egui::RichText::new(&detail.short_id).monospace().strong());
+            ui.label(format!("{} <{}>", detail.author, detail.email));
+            ui.label(format!("Timestamp: {}", detail.timestamp));
+            if !detail.body.is_empty() {
+                ui.label(&detail.body);
+            }
+
+            if let Some(diff) = &diff {
+                ui.separator();
+                ui.label("Files changed:");
+                for fd in diff {
+                    let path_str = fd
+                        .new_path
+                        .as_ref()
+                        .or(fd.old_path.as_ref())
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let status = if fd.old_path.is_none() {
+                        "A"
+                    } else if fd.new_path.is_none() {
+                        "D"
+                    } else {
+                        "M"
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("  {status} {path_str}"))
+                            .monospace()
+                            .small(),
+                    );
+                }
+            }
+        }
+    }
+
     fn render_claude_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         self.render_claude_tab_strip(ui);
         match self.claude_view {
@@ -4603,6 +4794,26 @@ impl IdeApp {
                     {
                         self.bottom_view = BottomView::CustomActions;
                     }
+                    if Self::render_boxed_tab(
+                        ui,
+                        tokens,
+                        self.bottom_view == BottomView::Todo,
+                        "TODO",
+                    )
+                    .clicked()
+                    {
+                        self.bottom_view = BottomView::Todo;
+                    }
+                    if Self::render_boxed_tab(
+                        ui,
+                        tokens,
+                        self.bottom_view == BottomView::Log,
+                        "Log",
+                    )
+                    .clicked()
+                    {
+                        self.bottom_view = BottomView::Log;
+                    }
                 });
                 ui.separator();
                 match self.bottom_view {
@@ -4612,6 +4823,8 @@ impl IdeApp {
                     BottomView::Search => self.render_search_panel(ui),
                     BottomView::Debug => self.render_debug_panel(ui),
                     BottomView::CustomActions => self.render_custom_actions_panel(ui),
+                    BottomView::Todo => self.render_todo_panel(ui),
+                    BottomView::Log => self.render_log_viewer(ui),
                 }
             });
     }
