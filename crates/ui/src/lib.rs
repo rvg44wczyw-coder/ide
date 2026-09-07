@@ -18,6 +18,7 @@ mod files_search;
 mod find_bar;
 mod git_panel;
 mod keymap;
+mod log_viewer;
 mod lsp_bridge;
 mod nav_history;
 mod search_in_path_panel;

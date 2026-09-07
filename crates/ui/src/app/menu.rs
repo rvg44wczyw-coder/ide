@@ -75,6 +75,7 @@ const MENU_GROUPS: &[MenuGroup] = &[
             Some("ToggleClaudeToolWindow"),
             Some("ToggleCustomActionsToolWindow"),
             Some("ToggleTodoToolWindow"),
+            Some("ShowLogPanel"),
         ],
     },
     MenuGroup {

@@ -225,6 +225,9 @@ pub enum BottomView {
     /// TODO/FIXME/HACK panel (`docs/features/gui-todo-panel.md`, `G5`)
     /// -- extends the row above to seven-way.
     Todo,
+    /// Git log viewer (`docs/features/gui-log-viewer.md`, `E3`)
+    /// -- extends the row above to eight-way.
+    Log,
 }
 
 /// The Manage Custom Actions popup's state (`docs/features/
@@ -859,6 +862,7 @@ pub struct IdeApp {
     custom_actions: crate::custom_actions::CustomActionsPanel,
     custom_actions_popup: CustomActionsPopupState,
     todo: crate::todo_panel::TodoPanel,
+    log_viewer: crate::log_viewer::LogViewerPanel,
     clone: CloneState,
     /// `Some` only between startup and `resolve_startup_restore` clearing
     /// it, and only when the registry had 2+ entries (`git-worktrees.md`
@@ -1240,6 +1244,7 @@ impl IdeApp {
             custom_actions: crate::custom_actions::CustomActionsPanel::default(),
             custom_actions_popup: CustomActionsPopupState::default(),
             todo: crate::todo_panel::TodoPanel::default(),
+            log_viewer: crate::log_viewer::LogViewerPanel::default(),
             clone: CloneState::default(),
             startup_restore_prompt: None,
             open_projects_registry_path: registry_path,
@@ -4938,6 +4943,7 @@ impl IdeApp {
             CommandAction::ManageCustomActions => self.project.is_some(),
             CommandAction::ToggleCustomActionsToolWindow => self.project.is_some(),
             CommandAction::ToggleTodoToolWindow => self.project.is_some(),
+            CommandAction::ShowLogPanel => self.project.is_some(),
             // Not a no-op-and-silently-fail: `is_command_enabled` gates the
             // palette/menu entry itself on both a project being open *and*
             // it being a git repo (`git-fetch-pull-push.md` §2.2), unlike
@@ -5100,6 +5106,7 @@ impl IdeApp {
                 self.toggle_bottom_tool_window(BottomView::CustomActions)
             }
             CommandAction::ToggleTodoToolWindow => self.toggle_bottom_tool_window(BottomView::Todo),
+            CommandAction::ShowLogPanel => self.toggle_bottom_tool_window(BottomView::Log),
             CommandAction::ShowFileHistory => self.trigger_show_file_history(),
             CommandAction::Fetch => {
                 if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
@@ -5586,6 +5593,7 @@ mod tests {
             custom_actions: crate::custom_actions::CustomActionsPanel::default(),
             custom_actions_popup: CustomActionsPopupState::default(),
             todo: crate::todo_panel::TodoPanel::default(),
+            log_viewer: crate::log_viewer::LogViewerPanel::default(),
             clone: CloneState::default(),
             startup_restore_prompt: None,
             open_projects_registry_path: None,

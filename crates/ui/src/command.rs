@@ -227,6 +227,7 @@ pub enum CommandAction {
     ManageCustomActions,
     ToggleCustomActionsToolWindow,
     ToggleTodoToolWindow,
+    ShowLogPanel,
     ShowFileHistory,
     Fetch,
     Pull,
@@ -500,6 +501,13 @@ pub fn commands() -> &'static [Command] {
                 category: "Window",
                 binding: None,
                 action: CommandAction::ToggleTodoToolWindow,
+            },
+            Command {
+                id: "ShowLogPanel",
+                title: "Git Log",
+                category: "Window",
+                binding: None,
+                action: CommandAction::ShowLogPanel,
             },
             Command {
                 id: "NextTab",
