@@ -15,7 +15,7 @@ use std::sync::mpsc::Sender;
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::project::AiConfig;
+pub use crate::project::{resolve_role_route, AiConfig, RoleRoute, TaskRole};
 
 mod project;
 
@@ -758,6 +758,7 @@ pub trait Router {
         &self,
         messages: Vec<ChatMessage>,
         order: &[ProviderId],
+        model_override: Option<&str>,
         sanitized: bool,
         tx: Sender<Result<ChatDelta, AiError>>,
     ) -> impl std::future::Future<Output = Result<ProviderId, AiError>> + Send;
@@ -772,6 +773,7 @@ impl Router for DefaultRouter {
         &self,
         messages: Vec<ChatMessage>,
         order: &[ProviderId],
+        model_override: Option<&str>,
         sanitized: bool,
         tx: Sender<Result<ChatDelta, AiError>>,
     ) -> Result<ProviderId, AiError> {
@@ -786,9 +788,12 @@ impl Router for DefaultRouter {
         };
         try_in_order(&attempts, std::time::Duration::from_millis(500), |id| {
             let provider = Provider::from_id(id);
+            let model = model_override
+                .map(str::to_string)
+                .unwrap_or_else(|| default_model(id).to_string());
             let request = ChatRequest {
                 messages: messages.clone(),
-                model: default_model(id).to_string(),
+                model,
                 sanitized,
             };
             let tx = tx.clone();
@@ -841,6 +846,94 @@ pub fn fallback_eligible(e: &AiError) -> bool {
         e,
         AiError::ConnectionRefused | AiError::Timeout | AiError::RateLimited | AiError::StreamEnded
     ) || matches!(e, AiError::Http(c) if *c >= 500)
+}
+
+/// Bounded timeout for [`classify_task_role`]'s single completion call --
+/// deliberately much shorter than [`STREAM_CHUNK_TIMEOUT`] since a slow
+/// classifier must not meaningfully delay ordinary chat latency (T55 §2.1).
+pub const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hard cap on how much of the outgoing message [`classify_task_role`]
+/// ever sees -- classification needs a gist, not the full payload, and
+/// this keeps the extra call cheap and fast regardless of how long the
+/// user's actual message is. Applied via `truncate()`, so it never splits
+/// a multi-byte character.
+pub const MAX_CLASSIFY_INPUT_CHARS: usize = 500;
+
+const CLASSIFY_PROMPT_PREFIX: &str = "Classify the following developer request into exactly one label: general, planning, coding, review. Respond with only the label.\n\n";
+
+/// Parses a classifier's raw text response into a [`TaskRole`]: trimmed
+/// and lowercased, then matched exactly against the four labels. Any
+/// other text -- extra words, an apologetic preamble, empty output --
+/// classifies as [`TaskRole::General`] (T55 §3.1). Pure and
+/// network-free, so it's unit-tested directly rather than only through
+/// [`classify_task_role`]'s full network path.
+fn parse_task_role_label(text: &str) -> TaskRole {
+    match text.trim().to_lowercase().as_str() {
+        "planning" => TaskRole::Planning,
+        "coding" => TaskRole::Coding,
+        "review" => TaskRole::Review,
+        _ => TaskRole::General,
+    }
+}
+
+/// Classifies `latest_user_message` into a [`TaskRole`] via one short,
+/// non-streaming completion call to `classifier_provider` (T55 §2.1).
+/// Never returns an error -- a timeout, a transport error, or a response
+/// that doesn't parse to a known label all classify as
+/// `TaskRole::General`, so a broken or slow classifier can only ever cost
+/// one bounded extra round trip, never block or fail the real request.
+///
+/// `sanitized` is passed straight through to the classifier's own
+/// internal `ChatRequest.sanitized` field -- exactly `ChatRequest`'s
+/// existing contract: the caller asserts it already ran `mask_outgoing`
+/// on `latest_user_message` when `classifier_provider.is_cloud()`, and
+/// `Provider::stream_chat` enforces that assertion (refuses cloud
+/// dispatch when `sanitized` is `false`). This function does **not** mask
+/// on the caller's behalf and does **not** default `sanitized` to `true`.
+pub async fn classify_task_role(
+    classifier_provider: ProviderId,
+    latest_user_message: &str,
+    sanitized: bool,
+) -> TaskRole {
+    classify_task_role_with_timeout(
+        classifier_provider,
+        latest_user_message,
+        sanitized,
+        CLASSIFY_TIMEOUT,
+    )
+    .await
+}
+
+/// [`classify_task_role`]'s implementation, with an injectable timeout so
+/// tests can force the timeout branch without waiting the real 5s.
+async fn classify_task_role_with_timeout(
+    classifier_provider: ProviderId,
+    latest_user_message: &str,
+    sanitized: bool,
+    timeout: std::time::Duration,
+) -> TaskRole {
+    let input = truncate(latest_user_message, MAX_CLASSIFY_INPUT_CHARS);
+    let provider = Provider::from_id(classifier_provider);
+    let request = ChatRequest {
+        messages: vec![ChatMessage::user(format!(
+            "{CLASSIFY_PROMPT_PREFIX}{input}"
+        ))],
+        model: default_model(classifier_provider).to_string(),
+        sanitized,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dispatch = tokio::time::timeout(timeout, provider.stream_chat(&request, tx));
+    match dispatch.await {
+        Ok(Ok(())) => {
+            let mut text = String::new();
+            for delta in rx.try_iter().flatten() {
+                text.push_str(&delta.text);
+            }
+            parse_task_role_label(&text)
+        }
+        Ok(Err(_)) | Err(_) => TaskRole::General,
+    }
 }
 
 #[cfg(test)]

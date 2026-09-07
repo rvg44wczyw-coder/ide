@@ -10,6 +10,7 @@
 //! `Provider::dispatch` take their URI from the `WireRequest` we build, so
 //! the full SSE stream-parse path runs without network access.
 
+use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -19,9 +20,9 @@ use serde_json::json;
 
 use crate::{
     classify_status, default_model, extract_delta, extract_text, fallback_eligible,
-    parse_sse_event, truncate, try_in_order, AiConfig, AiError, ChatDelta, ChatMessage,
-    ChatRequest, ChatRole, DefaultRouter, HttpTransport, Provider, ProviderId, Router, SseParser,
-    WireRequest, OLLAMA_FIM_MODEL,
+    parse_sse_event, resolve_role_route, truncate, try_in_order, AiConfig, AiError, ChatDelta,
+    ChatMessage, ChatRequest, ChatRole, DefaultRouter, HttpTransport, Provider, ProviderId,
+    RoleRoute, Router, SseParser, TaskRole, WireRequest, OLLAMA_FIM_MODEL,
 };
 
 /// Minimal self-cleaning temp project root (creates `.ide/`).
@@ -140,6 +141,26 @@ fn load_parses_and_truncates_provider_order() {
 }
 
 #[test]
+fn load_truncates_an_oversized_role_route_provider_order_too() {
+    let root = TempRoot::new("role-route-oversized");
+    root.write_ai_json(
+        r#"{
+            "role_routes": {
+                "Planning": {
+                    "provider_order": [
+                        "OllamaLocal", "OllamaLocal", "OllamaLocal", "OllamaLocal",
+                        "OllamaLocal", "OllamaLocal", "OllamaLocal", "OllamaLocal"
+                    ]
+                }
+            }
+        }"#,
+    );
+    let config = AiConfig::load(&root.0);
+    let route = config.role_routes.get(&TaskRole::Planning).unwrap();
+    assert!(route.provider_order.len() <= 4);
+}
+
+#[test]
 fn load_partial_file_defaults_missing_fields() {
     let root = TempRoot::new("partial");
     root.write_ai_json(r#"{ "provider_order": ["OllamaLocal"] }"#);
@@ -151,15 +172,137 @@ fn load_partial_file_defaults_missing_fields() {
 
 #[test]
 fn serialize_roundtrip_preserves_config() {
+    let mut role_routes = HashMap::new();
+    role_routes.insert(
+        TaskRole::Planning,
+        RoleRoute {
+            provider_order: vec![ProviderId::Gemini],
+            model_override: Some("gemini-2.0-flash".to_string()),
+        },
+    );
     let config = AiConfig {
         provider_order: vec![ProviderId::Groq, ProviderId::OllamaLocal],
         sanitize_local: false,
         local_sanitize_threshold: 2.5,
         cloud_sanitize_threshold: 1.5,
+        role_routes,
+        auto_route: true,
+        classifier_provider: ProviderId::Groq,
     };
     let json = serde_json::to_string(&config).unwrap();
+    assert!(
+        json.contains("\"Planning\""),
+        "role_routes keys serialize as PascalCase variant names: {json}"
+    );
     let back: AiConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(back, config);
+}
+
+// ------------------------------------------------------------------------
+// `resolve_role_route` / `parse_task_role_label` / `classify_task_role`
+// (T55): role resolution and its always-safe fallback to `General`.
+// ------------------------------------------------------------------------
+
+#[test]
+fn resolve_role_route_falls_back_to_top_level_order_when_role_is_unconfigured() {
+    let config = AiConfig::default();
+    let route = resolve_role_route(&config, TaskRole::Planning);
+    assert_eq!(route.provider_order, config.provider_order);
+    assert_eq!(route.model_override, None);
+}
+
+#[test]
+fn resolve_role_route_falls_back_when_provider_order_is_empty() {
+    let mut role_routes = HashMap::new();
+    role_routes.insert(
+        TaskRole::Coding,
+        RoleRoute {
+            provider_order: Vec::new(),
+            model_override: Some("should-be-ignored".to_string()),
+        },
+    );
+    let config = AiConfig {
+        role_routes,
+        ..AiConfig::default()
+    };
+    let route = resolve_role_route(&config, TaskRole::Coding);
+    assert_eq!(route.provider_order, config.provider_order);
+    assert_eq!(route.model_override, None);
+}
+
+#[test]
+fn resolve_role_route_falls_back_when_every_listed_provider_is_disabled_at_runtime() {
+    // Assumes no GEMINI_API_KEY is set in the test environment (see this
+    // file's module doc) -- a role route naming only a disabled cloud
+    // provider must not surface a harder failure than not configuring the
+    // role at all.
+    let mut role_routes = HashMap::new();
+    role_routes.insert(
+        TaskRole::Review,
+        RoleRoute {
+            provider_order: vec![ProviderId::Gemini],
+            model_override: None,
+        },
+    );
+    let config = AiConfig {
+        role_routes,
+        ..AiConfig::default()
+    };
+    let route = resolve_role_route(&config, TaskRole::Review);
+    assert_eq!(route.provider_order, config.provider_order);
+}
+
+#[test]
+fn resolve_role_route_uses_the_configured_route_when_it_has_an_enabled_provider() {
+    let mut role_routes = HashMap::new();
+    role_routes.insert(
+        TaskRole::Coding,
+        RoleRoute {
+            provider_order: vec![ProviderId::OllamaLocal],
+            model_override: Some("codellama".to_string()),
+        },
+    );
+    let config = AiConfig {
+        role_routes,
+        ..AiConfig::default()
+    };
+    let route = resolve_role_route(&config, TaskRole::Coding);
+    assert_eq!(route.provider_order, vec![ProviderId::OllamaLocal]);
+    assert_eq!(route.model_override.as_deref(), Some("codellama"));
+}
+
+#[test]
+fn parse_task_role_label_matches_all_four_labels_case_insensitively() {
+    assert_eq!(crate::parse_task_role_label("general"), TaskRole::General);
+    assert_eq!(crate::parse_task_role_label("Planning"), TaskRole::Planning);
+    assert_eq!(crate::parse_task_role_label("CODING"), TaskRole::Coding);
+    assert_eq!(crate::parse_task_role_label("  review\n"), TaskRole::Review);
+}
+
+#[test]
+fn parse_task_role_label_defaults_unrecognized_text_to_general() {
+    assert_eq!(crate::parse_task_role_label(""), TaskRole::General);
+    assert_eq!(
+        crate::parse_task_role_label("I'm not sure, maybe planning?"),
+        TaskRole::General
+    );
+    assert_eq!(crate::parse_task_role_label("garbage"), TaskRole::General);
+}
+
+#[tokio::test]
+async fn classify_task_role_falls_back_to_general_when_the_call_times_out() {
+    // A zero-duration timeout guarantees the timeout branch fires before
+    // any real dispatch attempt completes (or even starts), independent of
+    // network state -- proves the "never blocks/fails the real request"
+    // contract without a live provider.
+    let role = crate::classify_task_role_with_timeout(
+        ProviderId::OllamaLocal,
+        "refactor this function",
+        false,
+        std::time::Duration::from_nanos(1),
+    )
+    .await;
+    assert_eq!(role, TaskRole::General);
 }
 
 // ------------------------------------------------------------------------
@@ -433,7 +576,7 @@ fn runtime() -> tokio::runtime::Runtime {
 async fn router_with_no_enabled_providers_reports_error() {
     let (_tx, rx) = mpsc::channel();
     let err = DefaultRouter
-        .chat(vec![ChatMessage::user("hi")], &[], true, _tx)
+        .chat(vec![ChatMessage::user("hi")], &[], None, true, _tx)
         .await
         .unwrap_err();
     assert!(matches!(err, AiError::Message(msg) if msg.contains("no enabled providers")));
