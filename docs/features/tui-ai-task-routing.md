@@ -291,9 +291,22 @@ behavior to before this feature.
   `Router`/`try_in_order` at all; it is one direct `Provider::stream_chat`
   call to exactly `classifier_provider`, drained to its first complete
   response or timeout).
+- **`classifier_provider.enabled()` is checked before dispatch, not just
+  left to `stream_chat`'s sanitizer gate**: if the configured
+  `classifier_provider` has no credential set (e.g. `classifier_provider:
+  "Gemini"` with no `GEMINI_API_KEY`), `classify_task_role` resolves to
+  `TaskRole::General` immediately with zero network calls, mirroring
+  `DefaultRouter::chat`'s own `enabled()` filter on `provider_order`. A
+  `hacker` pass (r1) found that without this check, the classifier would
+  still dispatch a real (masked, but real) network request to that
+  provider's actual endpoint on every message — no secret leak, since
+  `stream_chat`'s sanitizer gate still holds, but an unintended, silent
+  per-message contact with a cloud provider the rest of the app's own
+  credential model treats as disabled.
 - A classifier failure therefore costs at most `CLASSIFY_TIMEOUT` (5s) of
   added latency before the real request proceeds exactly as if
-  `auto_route` were `false` for that one message.
+  `auto_route` were `false` for that one message (zero added latency in
+  the disabled-provider case above, since no dispatch is attempted).
 
 ### 3.3 Sanitizer wiring
 
@@ -476,3 +489,17 @@ no classifier call ever made and no `classifier_provider` needed:
   now expected to be *addressed* (resolved, or explicitly named as a
   tradeoff, or escalated to the user) rather than only logged, in every
   future review.
+- **r2 (2026-09-07, implementation + `rev` + `hacker`):** `rev` found one
+  `[quality]` gap (fixed): the status-line format in `ai_panel.rs`'s
+  `settle()` used `"Provider · role"` instead of §2.2's specified
+  `"Provider (role)"`. `hacker` found one `[security: Medium]` gap (fixed,
+  §3.2): `classify_task_role` dispatched to `classifier_provider`
+  unconditionally, with no `enabled()`/credential check, unlike every other
+  cloud-dispatch path in this crate — a `classifier_provider` pointed at a
+  cloud provider with no credential set would still make a real (masked,
+  non-secret-leaking, but unintended) network call to that provider on
+  every message. Fixed with an `enabled()` early-return in
+  `classify_task_role_with_timeout`, live-verified via a standalone probe
+  program (1.37ms for the sanitizer-gate case, confirming no network
+  attempt; full findings in `docs/security-findings/
+  tui-ai-task-routing-2026-09-07.md`).

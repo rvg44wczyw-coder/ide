@@ -879,10 +879,15 @@ fn parse_task_role_label(text: &str) -> TaskRole {
 
 /// Classifies `latest_user_message` into a [`TaskRole`] via one short,
 /// non-streaming completion call to `classifier_provider` (T55 §2.1).
-/// Never returns an error -- a timeout, a transport error, or a response
-/// that doesn't parse to a known label all classify as
-/// `TaskRole::General`, so a broken or slow classifier can only ever cost
-/// one bounded extra round trip, never block or fail the real request.
+/// Never returns an error -- a timeout, a transport error, a provider with
+/// no credential configured (`ProviderId::enabled()` is `false`), or a
+/// response that doesn't parse to a known label all classify as
+/// `TaskRole::General`, so a broken, unconfigured, or slow classifier can
+/// only ever cost one bounded extra round trip (zero, in the disabled-
+/// provider case -- no dispatch is attempted at all, mirroring
+/// `DefaultRouter::chat`'s own `enabled()` filter so this call path can't
+/// contact a provider the rest of this crate treats as disabled), never
+/// block or fail the real request.
 ///
 /// `sanitized` is passed straight through to the classifier's own
 /// internal `ChatRequest.sanitized` field -- exactly `ChatRequest`'s
@@ -913,6 +918,15 @@ async fn classify_task_role_with_timeout(
     sanitized: bool,
     timeout: std::time::Duration,
 ) -> TaskRole {
+    // Mirrors `DefaultRouter::chat`'s own `enabled()` filter: a provider
+    // with no credential configured must never be contacted, classifier
+    // call included -- otherwise a `classifier_provider` pointed at an
+    // uncredentialed cloud provider silently makes a real network call to
+    // it on every message despite the rest of this crate treating that
+    // provider as disabled everywhere else (`hacker` fix round, T55).
+    if !classifier_provider.enabled() {
+        return TaskRole::General;
+    }
     let input = truncate(latest_user_message, MAX_CLASSIFY_INPUT_CHARS);
     let provider = Provider::from_id(classifier_provider);
     let request = ChatRequest {

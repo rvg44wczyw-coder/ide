@@ -306,6 +306,32 @@ async fn classify_task_role_falls_back_to_general_when_the_call_times_out() {
 }
 
 #[tokio::test]
+async fn classify_task_role_never_dispatches_to_an_uncredentialed_cloud_provider() {
+    // Assumes no GEMINI_API_KEY is set in the test environment (see this
+    // file's module doc and enabled_providers_falls_back_to_ollama_alone_
+    // with_no_cloud_credentials_set for the same established assumption).
+    // A generous 30s timeout would let a real (mistaken) network dispatch
+    // attempt run to completion -- a fast return here proves the enabled()
+    // guard short-circuited before any dispatch was attempted at all,
+    // rather than merely tolerating one that happened to fail quickly
+    // (hacker fix round, T55: classify_task_role must never contact a
+    // provider the rest of this crate treats as disabled).
+    let start = std::time::Instant::now();
+    let role = crate::classify_task_role_with_timeout(
+        ProviderId::Gemini,
+        "hi",
+        true,
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(role, TaskRole::General);
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(500),
+        "must short-circuit on the enabled() check, not attempt a real network dispatch"
+    );
+}
+
+#[tokio::test]
 async fn classify_task_role_public_entry_point_never_exceeds_the_bounded_timeout() {
     // Exercises the real public entry point (not the injectable-timeout
     // sibling above) -- whatever the outcome (a fast ConnectionRefused if
