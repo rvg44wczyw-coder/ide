@@ -42,9 +42,11 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// Non-text rows around the editor's visible buffer content: the
 /// permanent screen tab bar (1 row, `docs/features/
 /// tui-screen-navigation.md` §2.3/§4, T44) plus the status
-/// bar (`render`'s own vertical split, 1 row) plus `render_editor`'s
-/// `Block`'s top/bottom borders (2 rows) plus the tab strip (1 row) plus
-/// the breadcrumbs strip (1 row, `docs/features/
+/// bar (`render`'s own vertical split, 1 row) plus the persistent
+/// key-hint ribbon (1 row, `docs/features/tui-key-hint-ribbon.md` §2.4,
+/// T48 -- the fourth and last row of `render`'s own outer split) plus
+/// `render_editor`'s `Block`'s top/bottom borders (2 rows) plus the tab
+/// strip (1 row) plus the breadcrumbs strip (1 row, `docs/features/
 /// tui-file-structure-and-breadcrumbs.md` §3.4). This
 /// crate has no scroll-follows-cursor logic inside this file (this file
 /// mutates nothing, per its own doc comment above) -- `app.rs`'s
@@ -63,8 +65,11 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// enters/leaves a symbol, since this constant is read before any
 /// `Layout` pass runs (`tui-file-structure-and-breadcrumbs.md` §3.4
 /// spells out why; the screen tab bar is unconditional by construction
-/// so it never had this failure mode to begin with).
-pub const EDITOR_CHROME_ROWS: u16 = 6;
+/// so it never had this failure mode to begin with). The ribbon is the
+/// same kind of always-reserved row (`tui-key-hint-ribbon.md` §3.1) --
+/// unlike the `Bottom` dock tab, it is visible on every `AppScreen`, not
+/// just `Editor`.
+pub const EDITOR_CHROME_ROWS: u16 = 7;
 
 /// Right-margin guide column (`docs/features/right-margin-guide.md` §1) --
 /// always this literal value in `ide-tui`, unlike `ide-ui` where it's
@@ -104,6 +109,15 @@ pub struct HitMap {
     /// breadcrumbs row (`docs/features/tui-custom-actions-edge-slots.md`
     /// §3.1, T47) -- same mouse-click-only scope as `top_action_hits`.
     pub outline_action_hits: Vec<(Rect, crate::custom_actions::CustomAction)>,
+    /// `Ribbon`-slot custom action click regions, on the persistent
+    /// key-hint ribbon (`docs/features/tui-key-hint-ribbon.md` §2.4,
+    /// T48) -- same mouse-click-only scope as `top_action_hits`/
+    /// `outline_action_hits`.
+    pub ribbon_action_hits: Vec<(Rect, crate::custom_actions::CustomAction)>,
+    /// The ribbon's own `[+]` affordance click region (`docs/features/
+    /// tui-key-hint-ribbon.md` §2.4/§3.2, T48) -- a single optional
+    /// `Rect`, not a `Vec`, since there is always exactly one `[+]`.
+    pub ribbon_add_hit: Option<Rect>,
 }
 
 /// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
@@ -119,11 +133,13 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(size);
     let tab_bar_area = rows[0];
     let body = rows[1];
     let status_area = rows[2];
+    let ribbon_area = rows[3];
 
     render_screen_tabs(frame, app, tab_bar_area, hits);
 
@@ -173,6 +189,7 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         AppScreen::Keys => render_keys_screen(frame, app, body),
     }
     render_status(frame, app, status_area);
+    render_key_hint_ribbon(frame, app, ribbon_area, hits);
 
     if app.palette.is_some() {
         render_palette(frame, app, size);
@@ -930,6 +947,75 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         text.push_str(&format!("  [{problem_count} problems]"));
     }
     frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Persistent bottom key-hint ribbon (`docs/features/
+/// tui-key-hint-ribbon.md` §2.4/§3.2, T48) -- visible under every
+/// `AppScreen`, unlike the `Bottom` dock tab which only exists inside
+/// `Editor`. Left-aligned: `App::key_hint_rows`' fixed, curated hints.
+/// Right-aligned: every `Ribbon`-slot custom action as a clickable
+/// `[Name]` label (same shared right-alignment technique `T47`'s
+/// `append_right_aligned_actions` established for `Top`/`Outline`,
+/// generalized here to also place the non-`CustomAction` `[+]` marker at
+/// the end of the same group), followed by the ribbon's own `[+]`
+/// affordance.
+fn render_key_hint_ribbon(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    use crate::custom_actions::ActionSlot;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut column = area.x;
+    for (i, (title, binding)) in app.key_hint_rows().into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            column += 2;
+        }
+        let text = format!("{binding} {title}");
+        column += Span::raw(text.as_str()).width() as u16;
+        spans.push(Span::raw(text));
+    }
+
+    let ribbon_actions = app.custom_actions.actions_for_slot(ActionSlot::Ribbon);
+    let plus_label = "[+]";
+    let plus_width = Span::raw(plus_label).width() as u16;
+    let mut right_items: Vec<(Option<crate::custom_actions::CustomAction>, String, u16)> =
+        ribbon_actions
+            .into_iter()
+            .map(|a| {
+                let label = format!("[{}]", a.name);
+                let width = Span::raw(label.clone()).width() as u16;
+                (Some(a), label, width)
+            })
+            .collect();
+    right_items.push((None, plus_label.to_string(), plus_width));
+
+    let total_width: u16 = right_items.iter().map(|(_, _, w)| *w).sum::<u16>()
+        + 2 * right_items.len().saturating_sub(1) as u16;
+    let start_x = (area.x + area.width)
+        .saturating_sub(total_width)
+        .max(column);
+    if start_x > column {
+        spans.push(Span::raw(" ".repeat((start_x - column) as usize)));
+    }
+    let mut x = start_x;
+    for (i, (action, label, width)) in right_items.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            x += 2;
+        }
+        let rect = Rect {
+            x,
+            y: area.y,
+            width,
+            height: 1,
+        };
+        match action {
+            Some(a) => hits.ribbon_action_hits.push((rect, a)),
+            None => hits.ribbon_add_hit = Some(rect),
+        }
+        x += width;
+        spans.push(Span::raw(label));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Fixed row budget for the popup body (excludes the top/bottom border),

@@ -6478,6 +6478,20 @@ impl App {
                 return;
             }
         }
+        // `Ribbon`-slot custom actions and the ribbon's own `[+]`
+        // affordance (`docs/features/tui-key-hint-ribbon.md` §2.5, T48).
+        for (rect, action) in &hits.ribbon_action_hits {
+            if rect.contains(point.into()) {
+                self.run_custom_action(action.clone());
+                return;
+            }
+        }
+        if let Some(rect) = hits.ribbon_add_hit {
+            if rect.contains(point.into()) {
+                self.open_new_ribbon_action_form();
+                return;
+            }
+        }
         if let Some(area) = hits.tree_area {
             if area.contains(point.into()) {
                 let row = (event.row - area.y) as usize;
@@ -8375,6 +8389,32 @@ impl App {
         }
     }
 
+    /// `App::key_hint_rows`'s curated, fixed set of existing `Command::id`s
+    /// (`docs/features/tui-key-hint-ribbon.md` §2.2, T48) -- never an
+    /// invented binding, only ever what the live keymap already reports
+    /// for a command that already exists in `commands()` (enforced by
+    /// `key_hint_command_ids_exist_with_a_default_binding`).
+    const HINT_COMMAND_IDS: [&'static str; 6] =
+        ["SaveAll", "Undo", "Redo", "Find", "GoToFile", "FindAction"];
+
+    /// `(title, current effective binding label)` for every `HINT_COMMAND_
+    /// IDS` entry that both exists in `commands()` and currently has an
+    /// effective binding -- the user may have unbound it via Keymap
+    /// Settings (`T22`), in which case the hint is simply omitted, never
+    /// rendered as a dash placeholder (unlike `render_keys_screen`'s
+    /// reference list, this is a *hint* row, not a reference; an unbound
+    /// hint has nothing useful to hint at).
+    pub(crate) fn key_hint_rows(&self) -> Vec<(&'static str, String)> {
+        Self::HINT_COMMAND_IDS
+            .iter()
+            .filter_map(|id| {
+                let cmd = commands().iter().find(|c| c.id == *id)?;
+                let binding = self.keymap.effective_binding(cmd.id)?;
+                Some((cmd.title, crate::keymap::label(binding)))
+            })
+            .collect()
+    }
+
     /// Every `commands()` entry whose title, id, or effective-binding
     /// label contains the popup's query, case-insensitively -- empty
     /// query returns every command (`docs/features/tui-keymap.md` §2.5,
@@ -8506,6 +8546,21 @@ impl App {
         if opening {
             self.manage_actions_popup = Some(ManageActionsPopupState::default());
         }
+    }
+
+    /// The ribbon's own `[+]` affordance (`docs/features/
+    /// tui-key-hint-ribbon.md` §2.3/§3.2): opens Manage Custom Actions
+    /// directly in add-form mode, `form_slot` pre-seeded to `Ribbon` --
+    /// skips list mode since there's nothing to review yet, mirroring how
+    /// the list-mode `n` key already jumps straight to the form.
+    fn open_new_ribbon_action_form(&mut self) {
+        self.close_all_overlays();
+        self.manage_actions_popup = Some(ManageActionsPopupState {
+            adding: true,
+            add_field: ActionFormField::Name,
+            form_slot: crate::custom_actions::ActionSlot::Ribbon,
+            ..Default::default()
+        });
     }
 
     /// `ToggleCustomActionsPanel` command: switches the bottom dock to the
@@ -14595,6 +14650,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
@@ -14777,6 +14834,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
 
         app.handle_mouse(
@@ -14808,6 +14867,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
 
         app.handle_mouse(
@@ -14842,6 +14903,8 @@ mod tests {
             )],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
 
         app.handle_mouse(
@@ -14853,6 +14916,77 @@ mod tests {
             app.bottom_dock.as_ref().map(|d| d.tab),
             Some(BottomDockTab::Cargo)
         );
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_ribbon_action_runs_it() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let action = crate::custom_actions::CustomAction {
+            name: "Toggle notifications".to_string(),
+            slot: crate::custom_actions::ActionSlot::Ribbon,
+            kind: crate::custom_actions::CustomActionKind::Builtin {
+                command_id: "ToggleNotifications".to_string(),
+            },
+        };
+        app.custom_actions.actions.push(action.clone());
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![(
+                Rect {
+                    x: 0,
+                    y: 24,
+                    width: 20,
+                    height: 1,
+                },
+                action,
+            )],
+            ribbon_add_hit: None,
+        };
+        assert!(!app.notifications_open);
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 24),
+            &hits,
+        );
+        assert!(app.notifications_open);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_the_ribbon_add_affordance_opens_the_form_preseeded_to_ribbon() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: Some(Rect {
+                x: 70,
+                y: 24,
+                width: 3,
+                height: 1,
+            }),
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 71, 24),
+            &hits,
+        );
+        let state = app.manage_actions_popup.as_ref().unwrap();
+        assert!(state.adding);
+        assert_eq!(state.editing_index, None);
+        assert_eq!(state.form_slot, crate::custom_actions::ActionSlot::Ribbon);
     }
 
     #[test]
@@ -14877,6 +15011,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
 
         app.handle_mouse(
@@ -18282,7 +18418,7 @@ mod tests {
         app.handle_key(plain_key(KeyCode::Char(' ')));
         assert_eq!(
             app.manage_actions_popup.as_ref().unwrap().form_slot,
-            crate::custom_actions::ActionSlot::Top
+            crate::custom_actions::ActionSlot::Ribbon
         );
     }
 
@@ -18353,6 +18489,61 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_custom_action_in_slot(crate::custom_actions::ActionSlot::Tree);
         assert!(app.custom_actions.running.is_none());
+    }
+
+    #[test]
+    fn key_hint_command_ids_exist_with_a_default_binding() {
+        for id in App::HINT_COMMAND_IDS {
+            let cmd = commands()
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("HINT_COMMAND_IDS references unknown id {id}"));
+            assert!(
+                cmd.binding.is_some(),
+                "hint command {id} has no default binding"
+            );
+        }
+    }
+
+    #[test]
+    fn key_hint_rows_reports_title_and_current_binding_for_every_hint() {
+        let dir = sample_project();
+        let app = App::new(dir.path().to_path_buf()).unwrap();
+        let rows = app.key_hint_rows();
+        assert_eq!(rows.len(), App::HINT_COMMAND_IDS.len());
+        let (title, binding) = rows
+            .iter()
+            .find(|(title, _)| *title == "Save")
+            .expect("Save hint present");
+        assert_eq!(*title, "Save");
+        assert_eq!(binding, "Ctrl+s");
+    }
+
+    #[test]
+    fn key_hint_rows_omits_a_hint_the_user_has_explicitly_unbound() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap.set_override("SaveAll", None);
+        let rows = app.key_hint_rows();
+        assert!(!rows.iter().any(|(title, _)| *title == "Save"));
+        assert_eq!(rows.len(), App::HINT_COMMAND_IDS.len() - 1);
+    }
+
+    #[test]
+    fn open_new_ribbon_action_form_opens_the_form_preseeded_to_ribbon_and_closes_other_overlays() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_colon_command();
+        assert!(app.colon_command.is_some());
+
+        app.open_new_ribbon_action_form();
+
+        assert!(app.colon_command.is_none());
+        let state = app.manage_actions_popup.as_ref().unwrap();
+        assert!(state.adding);
+        assert_eq!(state.editing_index, None);
+        assert_eq!(state.form_slot, crate::custom_actions::ActionSlot::Ribbon);
+        assert_eq!(state.form_kind, FormKind::External);
     }
 
     #[test]
@@ -20082,6 +20273,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -20128,6 +20321,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
@@ -20154,6 +20349,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -20184,6 +20381,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         // Column 15 is well within the 20-wide hit-test area but past
         // "ab"'s own 2 characters -- must clamp to line end, not no-op.
@@ -20216,6 +20415,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5),
@@ -20241,6 +20442,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
@@ -20267,6 +20470,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert!(app.active_buffer().is_none());
@@ -20290,6 +20495,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -20494,6 +20701,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -20521,6 +20730,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 4),
@@ -20552,6 +20763,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
@@ -20696,6 +20909,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
@@ -20726,6 +20941,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
@@ -20757,6 +20974,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane, 1),
@@ -20944,6 +21163,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -20991,6 +21212,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
 
@@ -21019,6 +21242,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 1);
@@ -21045,6 +21270,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 1, 1), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 0);
@@ -21086,6 +21313,8 @@ mod tests {
             bottom_dock_tabs: vec![],
             top_action_hits: vec![],
             outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
         };
         for _ in 0..10 {
             app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);

@@ -33,7 +33,11 @@ const MAX_CUSTOM_ACTIONS: usize = 500;
 /// tui-custom-actions-edge-slots.md` §2.1, T47) -- the mockup's own
 /// vocabulary, replacing `T42`'s single flat list. `Default` is `Bottom`,
 /// the least surprising landing spot for a freshly-created action (where
-/// `T42`'s one-and-only list used to live).
+/// `T42`'s one-and-only list used to live). `Ribbon` (`docs/features/
+/// tui-key-hint-ribbon.md` §2.1, T48) is the persistent bottom key-hint
+/// ribbon's own bind point -- mouse-only like `Top`/`Outline`, added last
+/// in `ALL`/`next()`'s cycle since `Bottom` was already the established
+/// default before this variant existed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) enum ActionSlot {
     Top,
@@ -41,14 +45,16 @@ pub(crate) enum ActionSlot {
     Outline,
     #[default]
     Bottom,
+    Ribbon,
 }
 
 impl ActionSlot {
-    pub(crate) const ALL: [ActionSlot; 4] = [
+    pub(crate) const ALL: [ActionSlot; 5] = [
         ActionSlot::Top,
         ActionSlot::Tree,
         ActionSlot::Outline,
         ActionSlot::Bottom,
+        ActionSlot::Ribbon,
     ];
 
     pub(crate) fn next(self) -> Self {
@@ -61,6 +67,7 @@ impl ActionSlot {
             ActionSlot::Tree => 1,
             ActionSlot::Outline => 2,
             ActionSlot::Bottom => 3,
+            ActionSlot::Ribbon => 4,
         }
     }
 }
@@ -141,8 +148,12 @@ pub(crate) struct CustomActionsPanel {
     /// `ActionSlot::index()` -- was a single `selected: usize` before this
     /// doc; each slot's own filtered view (`actions_for_slot`) can have a
     /// different length, so one shared cursor would mean different things
-    /// in each.
-    pub(crate) selected: [usize; 4],
+    /// in each. Widened to `[usize; 5]` for `Ribbon` (`docs/features/
+    /// tui-key-hint-ribbon.md` §2.1, T48) -- `Ribbon` is mouse-only, so
+    /// nothing actually drives that slot's cursor, but the array must stay
+    /// indexable by every `ActionSlot::index()` value to keep `selected`
+    /// panic-free.
+    pub(crate) selected: [usize; 5],
     /// A **clone** of the action currently running, not an index into
     /// `actions` -- deleting or reordering the definition mid-run (via the
     /// Manage popup, independent of this dock tab) must never invalidate
@@ -330,7 +341,7 @@ mod tests {
     fn run_while_already_running_is_a_noop() {
         let mut panel = CustomActionsPanel {
             actions: vec![sample_action("a"), sample_action("b")],
-            selected: [0; 4],
+            selected: [0; 5],
             running: Some(sample_action("a")),
             output: vec!["existing".to_string()],
             rx: None,
@@ -392,11 +403,12 @@ mod tests {
     }
 
     #[test]
-    fn action_slot_next_cycles_through_all_four_and_wraps() {
+    fn action_slot_next_cycles_through_all_five_and_wraps() {
         assert_eq!(ActionSlot::Top.next(), ActionSlot::Tree);
         assert_eq!(ActionSlot::Tree.next(), ActionSlot::Outline);
         assert_eq!(ActionSlot::Outline.next(), ActionSlot::Bottom);
-        assert_eq!(ActionSlot::Bottom.next(), ActionSlot::Top);
+        assert_eq!(ActionSlot::Bottom.next(), ActionSlot::Ribbon);
+        assert_eq!(ActionSlot::Ribbon.next(), ActionSlot::Top);
     }
 
     #[test]
