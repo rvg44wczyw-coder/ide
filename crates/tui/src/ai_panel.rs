@@ -297,7 +297,7 @@ fn settle(
     match outcome {
         Ok(provider) => {
             let label = match role_label {
-                Some(role) => format!("{} · {role}", provider.label()),
+                Some(role) => format!("{} ({role})", provider.label()),
                 None => provider.label().to_string(),
             };
             vec![
@@ -740,7 +740,7 @@ mod tests {
         );
         assert!(matches!(
             &msgs[0],
-            AiDisplayMessage::ProviderServing(p) if p.ends_with(" · planning")
+            AiDisplayMessage::ProviderServing(p) if p.ends_with(" (planning)")
         ));
     }
 }

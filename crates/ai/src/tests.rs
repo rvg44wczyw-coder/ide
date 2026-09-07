@@ -305,6 +305,22 @@ async fn classify_task_role_falls_back_to_general_when_the_call_times_out() {
     assert_eq!(role, TaskRole::General);
 }
 
+#[tokio::test]
+async fn classify_task_role_public_entry_point_never_exceeds_the_bounded_timeout() {
+    // Exercises the real public entry point (not the injectable-timeout
+    // sibling above) -- whatever the outcome (a fast ConnectionRefused if
+    // nothing is listening locally, or a real reply if it is), it must
+    // never take meaningfully longer than CLASSIFY_TIMEOUT, proving the
+    // "never blocks the real request" contract without asserting a
+    // specific network outcome either way.
+    let start = std::time::Instant::now();
+    let _ = crate::classify_task_role(ProviderId::OllamaLocal, "hi", false).await;
+    assert!(
+        start.elapsed() < crate::CLASSIFY_TIMEOUT + std::time::Duration::from_secs(1),
+        "classify_task_role must never exceed its own bounded timeout"
+    );
+}
+
 // ------------------------------------------------------------------------
 // ProviderId / Provider / model mapping (no network, no env mutation).
 // ------------------------------------------------------------------------
