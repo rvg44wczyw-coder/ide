@@ -1800,9 +1800,9 @@ fn render_claude_tab_strip(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// No scroll-back in v1, same precedent as `render_cargo_panel` (`docs/
-/// features/tui-claude-panel.md` §1.1): only the tail of `history` that
-/// fits `area` renders.
+/// Scroll-back via `claude.history_scroll` (`docs/features/
+/// tui-panel-history-scroll.md` §2.3/§3.1, T52 -- revises this function's
+/// previous "no scroll-back in v1" cut, `tui-claude-panel.md` §1.1).
 fn render_claude_chat(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(LayoutDirection::Vertical)
@@ -1819,8 +1819,10 @@ fn render_claude_chat(frame: &mut Frame, app: &App, area: Rect) {
         .map(|m| claude_message_line(m, theme))
         .collect();
     let visible_rows = history_area.height as usize;
-    let start = lines.len().saturating_sub(visible_rows);
-    frame.render_widget(Paragraph::new(lines[start..].to_vec()), history_area);
+    frame.render_widget(
+        Paragraph::new(tail_window(&lines, visible_rows, app.claude.history_scroll).to_vec()),
+        history_area,
+    );
 
     let prefix = if app.claude.is_in_flight() {
         "(running) > "
@@ -1878,8 +1880,10 @@ fn render_ai_panel(frame: &mut Frame, app: &App, area: Rect) {
         .map(|m| ai_message_line(m, theme))
         .collect();
     let visible_rows = rows[1].height as usize;
-    let start = lines.len().saturating_sub(visible_rows);
-    frame.render_widget(Paragraph::new(lines[start..].to_vec()), rows[1]);
+    frame.render_widget(
+        Paragraph::new(tail_window(&lines, visible_rows, app.ai.history_scroll).to_vec()),
+        rows[1],
+    );
 
     let prefix = if app.ai.is_in_flight() {
         "(streaming) > "
@@ -2327,16 +2331,30 @@ fn render_problems_panel(frame: &mut Frame, app: &App, area: Rect, selected: usi
 /// -- build/test output can run to thousands of lines, so this tab shows
 /// only the tail that fits, rather than growing to `output.len()`
 /// (`docs/features/tui-cargo-panel.md` §4: no scroll-back in v1).
+/// Windows `items` to the last `visible_rows` entries, offset back by
+/// `scroll` from the tail (`docs/features/tui-panel-history-scroll.md`
+/// §2.1/§3.1, T52) -- shared by every "live-tailing log" panel (Cargo
+/// output, Claude chat, AI chat). `scroll == 0` is the tail exactly as
+/// every one of these three rendered unconditionally before this
+/// feature; increasing it slides the window backward through history.
+/// Never panics: `scroll` is clamped to `items.len()` before use.
+fn tail_window<T>(items: &[T], visible_rows: usize, scroll: u16) -> &[T] {
+    let max_scroll = items.len().saturating_sub(visible_rows);
+    let scroll = (scroll as usize).min(max_scroll);
+    let end = items.len() - scroll;
+    let start = end.saturating_sub(visible_rows);
+    &items[start..end]
+}
+
 fn render_cargo_panel(frame: &mut Frame, app: &App, area: Rect) {
     let visible_rows = area.height.saturating_sub(2) as usize;
     let output = &app.cargo.output;
-    let start = output.len().saturating_sub(visible_rows);
     let items: Vec<ListItem> = if output.is_empty() {
         vec![ListItem::new(Line::from(
             "No output yet -- press b/r/t/c/l/f to run a command.",
         ))]
     } else {
-        output[start..]
+        tail_window(output, visible_rows, app.cargo.output_scroll)
             .iter()
             .map(|line| ListItem::new(Line::from(line.as_str())))
             .collect()
@@ -4253,4 +4271,53 @@ fn render_k8s_picker_popup(
 
     let block = Block::default().borders(Borders::ALL).title(title);
     frame.render_widget(List::new(items).block(block), popup);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_window;
+
+    #[test]
+    fn tail_window_with_zero_scroll_shows_the_tail() {
+        let items: Vec<i32> = (0..10).collect();
+        assert_eq!(tail_window(&items, 3, 0), &[7, 8, 9]);
+    }
+
+    #[test]
+    fn tail_window_with_nonzero_scroll_slides_back_from_the_tail() {
+        let items: Vec<i32> = (0..10).collect();
+        assert_eq!(tail_window(&items, 3, 2), &[5, 6, 7]);
+    }
+
+    #[test]
+    fn tail_window_scroll_past_the_start_clamps_at_the_first_item() {
+        let items: Vec<i32> = (0..10).collect();
+        assert_eq!(tail_window(&items, 3, 100), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn tail_window_on_empty_items_never_panics() {
+        let items: Vec<i32> = Vec::new();
+        assert_eq!(tail_window(&items, 5, 3), &[] as &[i32]);
+        assert_eq!(tail_window(&items, 5, u16::MAX), &[] as &[i32]);
+    }
+
+    #[test]
+    fn tail_window_visible_rows_larger_than_items_shows_everything() {
+        let items: Vec<i32> = vec![1, 2, 3];
+        assert_eq!(tail_window(&items, 10, 0), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn tail_window_new_items_slide_the_window_forward_while_scrolled_back() {
+        // The auto-follow property `docs/features/
+        // tui-panel-history-scroll.md` §3.1 relies on: a fixed `scroll`
+        // depth stays that many items behind the *current* tail, not
+        // pinned to the same absolute indices, as more items arrive.
+        let mut items: Vec<i32> = (0..10).collect();
+        assert_eq!(tail_window(&items, 3, 2), &[5, 6, 7]);
+        items.push(10);
+        items.push(11);
+        assert_eq!(tail_window(&items, 3, 2), &[7, 8, 9]);
+    }
 }

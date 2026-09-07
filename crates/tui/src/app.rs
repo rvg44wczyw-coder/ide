@@ -2556,6 +2556,20 @@ impl App {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.claude.input.push(c);
             }
+            // Scroll-back through chat history (`docs/features/
+            // tui-panel-history-scroll.md` §2.5/§3.1, T52).
+            KeyCode::Up => {
+                self.claude.history_scroll = self.claude.history_scroll.saturating_add(1)
+            }
+            KeyCode::Down => {
+                self.claude.history_scroll = self.claude.history_scroll.saturating_sub(1)
+            }
+            KeyCode::PageUp => {
+                self.claude.history_scroll = self.claude.history_scroll.saturating_add(10)
+            }
+            KeyCode::PageDown => {
+                self.claude.history_scroll = self.claude.history_scroll.saturating_sub(10)
+            }
             _ => {}
         }
     }
@@ -2611,6 +2625,12 @@ impl App {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.ai.input.push(c);
             }
+            // Scroll-back through chat history (`docs/features/
+            // tui-panel-history-scroll.md` §2.5/§3.1, T52).
+            KeyCode::Up => self.ai.history_scroll = self.ai.history_scroll.saturating_add(1),
+            KeyCode::Down => self.ai.history_scroll = self.ai.history_scroll.saturating_sub(1),
+            KeyCode::PageUp => self.ai.history_scroll = self.ai.history_scroll.saturating_add(10),
+            KeyCode::PageDown => self.ai.history_scroll = self.ai.history_scroll.saturating_sub(10),
             _ => {}
         }
         LoopSignal::Continue
@@ -2954,6 +2974,16 @@ impl App {
             KeyCode::Char('c') => self.cargo.run(&self.project_root, CargoCommand::Check),
             KeyCode::Char('l') => self.cargo.run(&self.project_root, CargoCommand::Clippy),
             KeyCode::Char('f') => self.cargo.run(&self.project_root, CargoCommand::Fmt),
+            // Scroll-back through output (`docs/features/
+            // tui-panel-history-scroll.md` §2.5/§3.1, T52).
+            KeyCode::Up => self.cargo.output_scroll = self.cargo.output_scroll.saturating_add(1),
+            KeyCode::Down => self.cargo.output_scroll = self.cargo.output_scroll.saturating_sub(1),
+            KeyCode::PageUp => {
+                self.cargo.output_scroll = self.cargo.output_scroll.saturating_add(10)
+            }
+            KeyCode::PageDown => {
+                self.cargo.output_scroll = self.cargo.output_scroll.saturating_sub(10)
+            }
             _ => {}
         }
         LoopSignal::Continue
@@ -6833,6 +6863,17 @@ impl App {
         // `handle_key`, whose `AppScreen::Keys` guard moves
         // `keys_screen_scroll` for exactly these Up/Down codes.
         if self.active_screen == AppScreen::Keys {
+            self.handle_key(synthetic);
+            return;
+        }
+        // Run screen (`docs/features/tui-panel-history-scroll.md` §2.6,
+        // T52): same reasoning as the Keys-screen branch above -- it
+        // renders no tree/editor/dock body, so the position-based
+        // branches below would drop the event. Only meaningful now that
+        // `handle_cargo_panel_key` has an `Up`/`Down` arm to receive it
+        // (T51 left this unrouted since, at the time, there was nothing
+        // for it to do).
+        if self.active_screen == AppScreen::Run {
             self.handle_key(synthetic);
             return;
         }
@@ -12328,6 +12369,27 @@ mod tests {
     }
 
     #[test]
+    fn handle_cargo_panel_key_up_down_page_scroll_the_output_and_never_panic_at_zero() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(
+            app.cargo.output_scroll, 0,
+            "scrolling toward the tail with nothing scrolled back is a no-op, not underflow"
+        );
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.cargo.output_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.cargo.output_scroll, 11);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.cargo.output_scroll, 1);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.cargo.output_scroll, 0);
+    }
+
+    #[test]
     fn ctrl_w_still_closes_the_active_tab_while_the_cargo_panel_has_focus() {
         // Unlike the true modals above (find/goto/notifications/...),
         // dock tabs don't intercept every key -- keymap-bound global
@@ -15612,6 +15674,49 @@ mod tests {
         assert_eq!(app.docker.selected, 0);
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 22), &hits);
         assert_eq!(app.docker.selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_bottom_dock_body_moves_cargo_output_scroll() {
+        // T51's dock-body routing plus T52's new `Up`/`Down` arm on
+        // `handle_cargo_panel_key` combine with no changes to either --
+        // `docs/features/tui-panel-history-scroll.md` §3.3.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
+        let hits = ui::HitMap {
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+            ..ui::HitMap::default()
+        };
+
+        assert_eq!(app.cargo.output_scroll, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 22), &hits);
+        assert_eq!(app.cargo.output_scroll, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_bottom_dock_body_moves_ai_history_scroll() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAiPanel);
+        let hits = ui::HitMap {
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+            ..ui::HitMap::default()
+        };
+
+        assert_eq!(app.ai.history_scroll, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 22), &hits);
+        assert_eq!(app.ai.history_scroll, 1);
     }
 
     #[test]
@@ -19616,6 +19721,24 @@ mod tests {
     }
 
     #[test]
+    fn ai_panel_up_down_page_scroll_the_history_and_never_panic_at_zero() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAiPanel);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.ai.history_scroll, 0);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.ai.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.ai.history_scroll, 11);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.ai.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.ai.history_scroll, 0);
+    }
+
+    #[test]
     fn ai_panel_typing_edits_input_and_enter_submits() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
@@ -19801,6 +19924,24 @@ mod tests {
 
         app.handle_key(plain_key(KeyCode::Backspace));
         assert_eq!(app.claude.input, "h");
+    }
+
+    #[test]
+    fn claude_chat_up_down_page_scroll_the_history_and_never_panic_at_zero() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleClaudePanel);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.claude.history_scroll, 0);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.claude.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.claude.history_scroll, 11);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.claude.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.claude.history_scroll, 0);
     }
 
     #[test]
@@ -22183,6 +22324,39 @@ mod tests {
         assert_eq!(app.keys_screen_scroll, 0);
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
         assert_eq!(app.keys_screen_scroll, 0);
+    }
+
+    #[test]
+    fn wheel_scroll_while_the_claude_panel_is_open_moves_history_scroll() {
+        // Pre-existing `any_popup_open()` -> synthetic-key routing
+        // (`tui-mouse-support.md` §3.3) plus T52's new `Up`/`Down` arm on
+        // `handle_claude_chat_key` combine with no routing changes.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleClaudePanel);
+        let hits = ui::HitMap::default();
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.claude.history_scroll, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_run_screen_moves_cargo_output_scroll() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToRunScreen);
+        let hits = ui::HitMap::default();
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 1);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 2);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 1);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 0);
     }
 
     #[test]

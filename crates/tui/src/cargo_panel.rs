@@ -43,6 +43,11 @@ enum StreamEvent {
 pub(crate) struct CargoPanel {
     pub(crate) output: Vec<String>,
     pub(crate) running: Option<CargoCommand>,
+    /// Lines scrolled back from the live tail (`docs/features/
+    /// tui-panel-history-scroll.md` §2.2/§3.1, T52) -- same type and
+    /// "unclamped in the handler, clamped at render" shape as
+    /// `GitPanelState::diff_scroll`.
+    pub(crate) output_scroll: u16,
     rx: Option<Receiver<StreamEvent>>,
 }
 
@@ -55,6 +60,7 @@ impl CargoPanel {
             return;
         }
         self.output.clear();
+        self.output_scroll = 0;
         self.running = Some(command);
         self.rx = Some(spawn_streaming("cargo", command.subcommand(), project_root));
     }
@@ -175,11 +181,24 @@ mod tests {
         let mut panel = CargoPanel {
             output: vec!["existing".to_string()],
             running: Some(CargoCommand::Build),
+            output_scroll: 0,
             rx: None,
         };
         panel.run(Path::new("."), CargoCommand::Test);
         assert_eq!(panel.running, Some(CargoCommand::Build));
         assert_eq!(panel.output, vec!["existing".to_string()]);
+    }
+
+    #[test]
+    fn run_resets_output_scroll_for_the_new_command() {
+        let mut panel = CargoPanel {
+            output: vec!["stale".to_string()],
+            running: None,
+            output_scroll: 7,
+            rx: None,
+        };
+        panel.run(Path::new("."), CargoCommand::Build);
+        assert_eq!(panel.output_scroll, 0);
     }
 
     #[test]
@@ -210,6 +229,7 @@ mod tests {
         let mut panel = CargoPanel {
             output: Vec::new(),
             running: Some(CargoCommand::Build),
+            output_scroll: 0,
             rx: Some(rx),
         };
 
@@ -230,6 +250,7 @@ mod tests {
         let mut panel = CargoPanel {
             output: Vec::new(),
             running: Some(CargoCommand::Build),
+            output_scroll: 0,
             rx: Some(rx),
         };
 

@@ -67,6 +67,10 @@ pub struct AiPanel {
     /// (for the status line) -- `docs/features/tui-ai-hybrid-fallback.md`
     /// §3.3.
     pub sanitized: bool,
+    /// Lines scrolled back from the live tail (`docs/features/
+    /// tui-panel-history-scroll.md` §2.4/§3.1, T52) -- same shape as
+    /// `ClaudePanel::history_scroll`.
+    pub history_scroll: u16,
     /// The last provider that served a reply, for the status line.
     pub(crate) provider: Option<String>,
     /// True while an assistant reply is still accumulating over the
@@ -96,6 +100,7 @@ impl AiPanel {
             input: String::new(),
             history: Vec::new(),
             sanitized: false,
+            history_scroll: 0,
             provider: None,
             streaming: false,
             rx: None,
