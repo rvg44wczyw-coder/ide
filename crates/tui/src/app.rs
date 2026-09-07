@@ -525,6 +525,18 @@ pub(crate) struct BookmarksPopupState {
     pub(crate) selected: usize,
 }
 
+/// The line-number gutter's right-click menu (`docs/features/
+/// tui-gutter-line-numbers.md` §2.5, T50) -- `path`/`line` name the
+/// buffer line the right-click landed on (0-based, same convention
+/// `click_git_gutter_lane`/`click_blame_lane` already use), independent
+/// of wherever the caret happens to be, matching JetBrains' own gutter
+/// context menu (it acts on the clicked line, not the caret's line).
+pub(crate) struct GutterContextMenuState {
+    pub(crate) path: PathBuf,
+    pub(crate) line: usize,
+    pub(crate) selected: usize,
+}
+
 /// Rename's editable popup (`docs/features/tui-code-actions-and-rename.md`
 /// §2.3), ported from `ide-ui`'s own `RenamePopup` -- presence is
 /// visibility, no separate `show_*` bool (unlike `hover_open`'s pair with
@@ -1162,6 +1174,14 @@ pub struct App {
     /// The buffer line a sign-column click landed on, while its "Revert
     /// Hunk (r) / Show Diff (d)" popup is open. `None` when closed.
     pub(crate) git_gutter_popup_line: Option<usize>,
+    /// The line-number lane's right-click menu (`docs/features/
+    /// tui-gutter-line-numbers.md` §2.5/§3.4, T50). `None` when closed.
+    /// Deliberately not reset by `close_all_overlays` -- mirrors
+    /// `git_gutter_popup_line`'s own identical omission, safe for the
+    /// same reason: `handle_key`'s popup-priority check on this field
+    /// runs before any command dispatch that could open a competing
+    /// overlay, so it's already the exclusive input owner while open.
+    pub(crate) gutter_context_menu: Option<GutterContextMenuState>,
     /// Always alive since `docs/features/tui-tool-window-docking.md` §2.1
     /// (T33) -- a dock tab can be switched away from and back to as
     /// casually as `Tab`-cycling, so an in-flight `docker`/`kubectl` fetch
@@ -1372,6 +1392,7 @@ impl App {
             git_gutter: Vec::new(),
             git_gutter_path: None,
             git_gutter_popup_line: None,
+            gutter_context_menu: None,
             docker: DockerPanel::default(),
             k8s: K8sPanel::default(),
             left_dock: Some(LeftDockState::default()),
@@ -1778,8 +1799,11 @@ impl App {
 
     /// `ToggleLineBreakpoint` (`docs/features/tui-debugger.md` §2.7):
     /// toggles a breakpoint on the active editor's current caret line.
-    /// There is no gutter click to also wire this to (§2.4) -- the
-    /// keyboard command is `ide-tui`'s only way to toggle a breakpoint.
+    /// Resolves the caret's line and delegates to `toggle_breakpoint_at_
+    /// line` -- the gutter's left-click/context-menu entry points
+    /// (`docs/features/tui-gutter-line-numbers.md` §2.4/§2.7, T50) share
+    /// this same underlying toggle, parameterized by an arbitrary clicked
+    /// line instead of the caret's.
     fn toggle_breakpoint_at_caret(&mut self) {
         let Some(buf) = self.active_buffer() else {
             return;
@@ -1790,6 +1814,13 @@ impl App {
             buf.buffer.text_buffer().selections().primary().head,
         )
         .0;
+        self.toggle_breakpoint_at_line(path, line);
+    }
+
+    /// Shared by `toggle_breakpoint_at_caret` and the line-number gutter's
+    /// left-click/context-menu entry points (`docs/features/
+    /// tui-gutter-line-numbers.md` §2.6, T50).
+    fn toggle_breakpoint_at_line(&mut self, path: PathBuf, line: usize) {
         self.debug.toggle_breakpoint(path, line as u32 + 1);
     }
 
@@ -3658,7 +3689,11 @@ impl App {
     }
 
     /// `F3` entry point (`docs/features/tui-recent-files-and-bookmarks.md`
-    /// §3.2). No active tab: notifies and no-ops.
+    /// §3.2). No active tab: notifies and no-ops. Resolves the caret's
+    /// line and delegates to `toggle_bookmark_at_line` -- the gutter
+    /// context menu's "Toggle Bookmark" entry (`docs/features/
+    /// tui-gutter-line-numbers.md` §2.6/§3.3, T50) shares this same
+    /// underlying toggle, parameterized by the clicked line instead.
     fn toggle_bookmark_at_cursor(&mut self) {
         let Some(buf) = self.active_buffer() else {
             self.notify("No file open to bookmark.");
@@ -3670,6 +3705,13 @@ impl App {
             buf.buffer.text_buffer().selections().primary().head,
         )
         .0;
+        self.toggle_bookmark_at_line(path, line);
+    }
+
+    /// Shared by `toggle_bookmark_at_cursor` and the line-number gutter's
+    /// context-menu "Toggle Bookmark" entry (`docs/features/
+    /// tui-gutter-line-numbers.md` §2.6, T50).
+    fn toggle_bookmark_at_line(&mut self, path: PathBuf, line: usize) {
         let added = self.nav_state.toggle_bookmark(path, line);
         project_state::save(&self.project_root, &self.nav_state);
         self.notify(if added {
@@ -4078,15 +4120,35 @@ impl App {
         }
     }
 
-    /// `blame_lane_width() + git_gutter_lane_width()` -- the one value
-    /// both the mouse-click column math (`handle_mouse_click`) and
-    /// `render_editor`'s native-cursor-position fix use, so neither ever
-    /// computes the combined offset independently (`docs/features/
-    /// tui-git-gutter.md` §1.1/§2.3, the same "two things that could
-    /// drift" concern `tui-blame.md` §2.3 already resolved for its own
-    /// single lane).
+    /// `0` with no active tab; else the decimal digit width of the active
+    /// buffer's total line count, plus one column for a trailing space --
+    /// mirrors `ide-ui`'s `Metrics::gutter_width` stepping at line-count
+    /// digit boundaries (`docs/features/code-editor-widget.md` §3.3), the
+    /// same "grows only when an extra digit is actually needed" rule, not
+    /// a fixed budget (`docs/features/tui-gutter-line-numbers.md` §2.1/
+    /// §3.1, T50). Unlike `blame_lane_width`/`git_gutter_lane_width`,
+    /// this lane is never conditionally zero while a tab is open -- line
+    /// numbers are useful independent of git/blame state.
+    pub(crate) fn line_number_lane_width(&self) -> u16 {
+        match self.active_buffer() {
+            Some(buf) => {
+                let total_lines = buf.buffer.text_buffer().lines().line_count().max(1);
+                total_lines.to_string().len() as u16 + 1
+            }
+            None => 0,
+        }
+    }
+
+    /// `blame_lane_width() + git_gutter_lane_width() + line_number_lane_
+    /// width()` -- the one value both the mouse-click column math
+    /// (`handle_mouse_click`) and `render_editor`'s native-cursor-position
+    /// fix use, so neither ever computes the combined offset independently
+    /// (`docs/features/tui-git-gutter.md` §1.1/§2.3, the same "two things
+    /// that could drift" concern `tui-blame.md` §2.3 already resolved for
+    /// its own single lane; widened for the line-number lane in
+    /// `tui-gutter-line-numbers.md` §2.2, T50).
     pub(crate) fn editor_lane_width(&self) -> u16 {
-        self.blame_lane_width() + self.git_gutter_lane_width()
+        self.blame_lane_width() + self.git_gutter_lane_width() + self.line_number_lane_width()
     }
 
     /// The active tab's path, only while `git_gutter_popup_line` names a
@@ -4127,6 +4189,72 @@ impl App {
         if self.git_gutter.iter().any(|m| m.line == line) {
             self.git_gutter_popup_line = Some(line);
         }
+    }
+
+    /// Shared by `click_line_number_lane` and `handle_mouse_right_click`
+    /// (`docs/features/tui-gutter-line-numbers.md` §2.3, T50) -- same
+    /// bounds-check shape `click_blame_lane`/`click_git_gutter_lane`
+    /// already establish for mapping a click row to a buffer line, just
+    /// also returning the active tab's path since both callers need it.
+    fn resolve_gutter_line(&self, area_row: u16) -> Option<(PathBuf, usize)> {
+        let buf = self.active_buffer()?;
+        let text_buffer = buf.buffer.text_buffer();
+        let ranges = text_buffer.fold_ranges();
+        let line_count = text_buffer.lines().line_count();
+        let visual = VisualLines::build(line_count, &ranges, &buf.folded);
+        let clicked_row = buf.scroll as usize + area_row as usize;
+        if clicked_row >= visual.row_count() {
+            return None;
+        }
+        Some((buf.path.clone(), visual.buffer_line(clicked_row)))
+    }
+
+    /// Left-click on the line-number lane: toggles a breakpoint on the
+    /// clicked line, unconditionally -- independent of wherever the caret
+    /// currently sits. Mirrors `ide-ui`'s real gutter behavior
+    /// (`docs/features/debugger.md` §347: clicking a line's line-number
+    /// digits toggles a breakpoint), `docs/features/
+    /// tui-gutter-line-numbers.md` §2.4/§3.2, T50.
+    fn click_line_number_lane(&mut self, area_row: u16) {
+        if let Some((path, line)) = self.resolve_gutter_line(area_row) {
+            self.toggle_breakpoint_at_line(path, line);
+        }
+    }
+
+    /// Right-click anywhere in the editor text area (`handle_mouse`'s new
+    /// `MouseEventKind::Down(MouseButton::Right)` arm). A no-op unless the
+    /// click lands specifically inside the line-number lane's column
+    /// range -- right-clicking the blame/git-gutter lanes or the text
+    /// itself does nothing in this run, scoped exactly to the line-number
+    /// gutter (`docs/features/tui-gutter-line-numbers.md` §2.6/§4, T50).
+    fn handle_mouse_right_click(&mut self, event: MouseEvent, hits: &crate::ui::HitMap) {
+        if self.any_popup_open() {
+            return;
+        }
+        let Some(area) = hits.editor_text_area else {
+            return;
+        };
+        let point: (u16, u16) = (event.column, event.row);
+        if !area.contains(point.into()) {
+            return;
+        }
+        let col = event.column - area.x;
+        let row = event.row - area.y;
+        let blame_w = self.blame_lane_width();
+        let git_w = self.git_gutter_lane_width();
+        let line_num_start = blame_w + git_w;
+        let line_num_end = line_num_start + self.line_number_lane_width();
+        if (col as usize) < line_num_start as usize || (col as usize) >= line_num_end as usize {
+            return;
+        }
+        let Some((path, line)) = self.resolve_gutter_line(row) else {
+            return;
+        };
+        self.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line,
+            selected: 0,
+        });
     }
 
     /// Routes the git-gutter popup's two single-letter actions -- `r`
@@ -4209,6 +4337,55 @@ impl App {
         state.view = GitPanelView::Log;
         state.focus = GitPanelFocus::Diff;
         state.diff_scroll = 0;
+    }
+
+    /// Navigates/confirms the line-number gutter's right-click menu
+    /// (`docs/features/tui-gutter-line-numbers.md` §2.6/§3.3, T50) --
+    /// `Up`/`Down` clamp against the fixed 4-item list, `Enter` calls
+    /// `confirm_gutter_context_menu`, `Esc` closes, every other key is a
+    /// no-op -- same shape `handle_bookmarks_popup_key` already
+    /// establishes for a small navigable list (not
+    /// `handle_git_gutter_popup_key`'s different "any other key closes"
+    /// shape, which fits two mnemonic single keys, not four list items).
+    fn handle_gutter_context_menu_key(&mut self, key: KeyEvent) -> LoopSignal {
+        const ITEM_COUNT: usize = 4;
+        let Some(state) = self.gutter_context_menu.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => self.gutter_context_menu = None,
+            KeyCode::Up => {
+                if state.selected > 0 {
+                    state.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if state.selected + 1 < ITEM_COUNT {
+                    state.selected += 1;
+                }
+            }
+            KeyCode::Enter => self.confirm_gutter_context_menu(),
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Takes `gutter_context_menu` (closing it unconditionally -- every
+    /// one of the four actions is a plain toggle/open with nothing that
+    /// would ever need to keep the menu open) and dispatches on
+    /// `.selected` (`docs/features/tui-gutter-line-numbers.md` §2.6/§3.3,
+    /// T50).
+    fn confirm_gutter_context_menu(&mut self) {
+        let Some(state) = self.gutter_context_menu.take() else {
+            return;
+        };
+        match state.selected {
+            0 => self.toggle_breakpoint_at_line(state.path, state.line),
+            1 => self.toggle_bookmark_at_line(state.path, state.line),
+            2 => self.toggle_bookmarks_popup(),
+            3 => self.toggle_blame_annotations(),
+            _ => unreachable!("ITEM_COUNT bounds selected in handle_gutter_context_menu_key"),
+        }
     }
 
     /// Lower-level open/close primitive for `git_panel` -- no `Command`
@@ -6202,6 +6379,9 @@ impl App {
         if self.git_gutter_popup_line.is_some() {
             return self.handle_git_gutter_popup_key(key);
         }
+        if self.gutter_context_menu.is_some() {
+            return self.handle_gutter_context_menu_key(key);
+        }
         // `docs/features/tui-screen-navigation.md`, T44 review round --
         // gated on `active_screen`, not `git_panel.is_some()`: `git_panel`
         // deliberately stays `Some` after leaving the Git screen via Esc
@@ -6391,6 +6571,7 @@ impl App {
             || self.pending_refactor_preview.is_some()
             || self.blame_popup.is_some()
             || self.git_gutter_popup_line.is_some()
+            || self.gutter_context_menu.is_some()
             // Gated on `active_screen`, not `git_panel.is_some()` -- see
             // `handle_key`'s matching check above for why.
             || self.active_screen == AppScreen::Git
@@ -6426,6 +6607,7 @@ impl App {
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(event, hits),
+            MouseEventKind::Down(MouseButton::Right) => self.handle_mouse_right_click(event, hits),
             MouseEventKind::ScrollUp => self.handle_mouse_scroll(event, hits, KeyCode::Up),
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(event, hits, KeyCode::Down),
             _ => {}
@@ -6513,11 +6695,14 @@ impl App {
                 let col = event.column - area.x;
                 let row = event.row - area.y;
                 let blame_w = self.blame_lane_width();
+                let git_w = self.git_gutter_lane_width();
                 let lane = self.editor_lane_width();
                 if (col as usize) < blame_w as usize {
                     self.click_blame_lane(row);
-                } else if (col as usize) < lane as usize {
+                } else if (col as usize) < (blame_w + git_w) as usize {
                     self.click_git_gutter_lane(row);
+                } else if (col as usize) < lane as usize {
+                    self.click_line_number_lane(row);
                 } else {
                     self.click_editor_at(col - lane, row);
                 }
@@ -20352,8 +20537,12 @@ mod tests {
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
         };
+        // Column 2 into the text, past the line-number lane (T50) -- no
+        // blame/git-gutter lane here, so `editor_lane_width()` is exactly
+        // `line_number_lane_width()`.
+        let lane = app.editor_lane_width();
         app.handle_mouse(
-            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
+            mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
             &hits,
         );
         assert_eq!(app.focus, Focus::Editor);
@@ -20748,7 +20937,10 @@ mod tests {
             blame_annotation(0, 1, "aaaaaaa"),
             blame_annotation(1, 1, "bbbbbbb"),
         ]);
-        let lane = app.blame_lane_width();
+        // Full `editor_lane_width()`, not just `blame_lane_width()` --
+        // the line-number lane (T50, no repo here so `git_gutter_lane_
+        // width()` is 0) also sits between the blame lane and the text.
+        let lane = app.editor_lane_width();
         let hits = ui::HitMap {
             tree_area: None,
             editor_text_area: Some(Rect {
@@ -20874,17 +21066,247 @@ mod tests {
     }
 
     #[test]
-    fn editor_lane_width_sums_blame_and_gutter_lanes() {
+    fn editor_lane_width_sums_blame_gutter_and_line_number_lanes() {
         let dir = git_repo_without_commits();
         git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
         let mut app = open_committed_tab(dir.path(), "f.txt");
-        assert_eq!(app.editor_lane_width(), app.git_gutter_lane_width());
+        assert_eq!(
+            app.editor_lane_width(),
+            app.git_gutter_lane_width() + app.line_number_lane_width()
+        );
         app.toggle_blame_annotations();
         assert_eq!(
             app.editor_lane_width(),
-            app.blame_lane_width() + app.git_gutter_lane_width()
+            app.blame_lane_width() + app.git_gutter_lane_width() + app.line_number_lane_width()
         );
         assert!(app.editor_lane_width() > app.git_gutter_lane_width());
+    }
+
+    #[test]
+    fn line_number_lane_width_is_zero_with_no_active_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.line_number_lane_width(), 0);
+    }
+
+    #[test]
+    fn line_number_lane_width_grows_at_the_digit_count_boundary() {
+        let (_dir, app) = open_rust_tab("a\nb\n");
+        assert_eq!(app.line_number_lane_width(), 2);
+
+        let (_dir2, app2) = open_rust_tab(&"x\n".repeat(10));
+        assert_eq!(app2.line_number_lane_width(), 3);
+    }
+
+    #[test]
+    fn click_line_number_lane_toggles_a_breakpoint_on_the_clicked_line() {
+        let (_dir, mut app) = open_rust_tab("fn main() {\n    let x = 1;\n}\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.click_line_number_lane(1);
+        assert_eq!(app.debug.breakpoints.get(&path), Some(&vec![2]));
+    }
+
+    #[test]
+    fn click_line_number_lane_past_the_buffer_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("a\nb\n");
+        app.click_line_number_lane(50);
+        assert!(app.debug.breakpoints.is_empty());
+    }
+
+    #[test]
+    fn handle_mouse_click_on_the_line_number_lane_toggles_breakpoint_not_caret() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        let hits = ui::HitMap {
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            ..Default::default()
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
+            &hits,
+        );
+        assert_eq!(app.debug.breakpoints.get(&path), Some(&vec![2]));
+        let (line, column) = cursor_line_column(
+            app.active_buffer().unwrap().buffer.text_buffer(),
+            caret(&app),
+        );
+        assert_eq!(
+            (line, column),
+            (0, 0),
+            "the caret must not move into the gutter"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_right_click_on_the_line_number_lane_opens_the_context_menu() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        let hits = ui::HitMap {
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            ..Default::default()
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Right), 0, 1),
+            &hits,
+        );
+        let state = app
+            .gutter_context_menu
+            .as_ref()
+            .expect("right-click on the line-number lane should open the menu");
+        assert_eq!(state.path, path);
+        assert_eq!(state.line, 1);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn handle_mouse_right_click_past_the_line_number_lane_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let hits = ui::HitMap {
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            ..Default::default()
+        };
+        let lane = app.line_number_lane_width();
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Right), lane + 3, 1),
+            &hits,
+        );
+        assert!(app.gutter_context_menu.is_none());
+    }
+
+    #[test]
+    fn handle_gutter_context_menu_key_up_down_clamp_and_esc_closes() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 0,
+        });
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.gutter_context_menu.as_ref().unwrap().selected, 0);
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.gutter_context_menu.as_ref().unwrap().selected, 3);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(
+            app.gutter_context_menu.as_ref().unwrap().selected,
+            3,
+            "must clamp at the last item"
+        );
+        app.handle_key(plain_key(KeyCode::Esc));
+        assert!(app.gutter_context_menu.is_none());
+    }
+
+    #[test]
+    fn handle_key_routes_to_the_gutter_context_menu_before_anything_else() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        let text_before = active_text(&app);
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 0,
+        });
+        app.handle_key(plain_key(KeyCode::Char('z')));
+        assert!(
+            app.gutter_context_menu.is_some(),
+            "an unrecognized key must not close the menu"
+        );
+        assert_eq!(
+            active_text(&app),
+            text_before,
+            "the key must not fall through to editor input"
+        );
+    }
+
+    #[test]
+    fn confirm_gutter_context_menu_breakpoint_toggles_the_clicked_line() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path: path.clone(),
+            line: 1,
+            selected: 0,
+        });
+        app.confirm_gutter_context_menu();
+        assert!(app.gutter_context_menu.is_none());
+        assert_eq!(app.debug.breakpoints.get(&path), Some(&vec![2]));
+    }
+
+    #[test]
+    fn confirm_gutter_context_menu_bookmark_toggles_the_clicked_line() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path: path.clone(),
+            line: 1,
+            selected: 1,
+        });
+        app.confirm_gutter_context_menu();
+        assert!(app.gutter_context_menu.is_none());
+        assert!(app
+            .nav_state
+            .bookmarks
+            .iter()
+            .any(|b| b.path == path && b.line == 1));
+    }
+
+    #[test]
+    fn confirm_gutter_context_menu_show_bookmarks_opens_the_bookmarks_popup() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 2,
+        });
+        app.confirm_gutter_context_menu();
+        assert!(app.gutter_context_menu.is_none());
+        assert!(app.bookmarks_popup.is_some());
+    }
+
+    #[test]
+    fn confirm_gutter_context_menu_blame_toggles_annotations_for_the_active_tab() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        assert!(app.active_buffer().unwrap().blame.is_none());
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 3,
+        });
+        app.confirm_gutter_context_menu();
+        assert!(app.gutter_context_menu.is_none());
+        assert!(app.active_buffer().unwrap().blame.is_some());
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_gutter_context_menu() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        assert!(!app.any_popup_open());
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 0,
+        });
+        assert!(app.any_popup_open());
     }
 
     #[test]

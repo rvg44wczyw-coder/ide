@@ -238,6 +238,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.git_gutter_popup_line.is_some() {
         render_git_gutter_popup(frame, app, size);
     }
+    if app.gutter_context_menu.is_some() {
+        render_gutter_context_menu(frame, app, size);
+    }
     if app.clone_panel_open {
         render_clone_panel(frame, app, size);
     }
@@ -626,6 +629,21 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     " \u{22ef}",
                     Style::default().fg(theme.fold_marker_fg),
                 ));
+            }
+            // Line-number lane (`docs/features/tui-gutter-line-numbers.md`
+            // §2.9/§3.1, T50) -- prepended before the git-gutter lane so
+            // the final left-to-right order (blame, git-gutter,
+            // line-number, text) matches `editor_lane_width`'s summation
+            // order and `ide-ui`'s own documented lane ordering
+            // ("blame left of line numbers", `crates/ui/src/editor/
+            // geometry.rs:78`).
+            let line_number_lane_width = app.line_number_lane_width();
+            if line_number_lane_width > 0 {
+                let digits = line_number_lane_width as usize - 1;
+                let number = format!("{:>digits$} ", line + 1, digits = digits);
+                let mut spans = vec![Span::styled(number, Style::default().fg(theme.gutter_fg))];
+                spans.extend(styled.spans);
+                styled = Line::from(spans);
             }
             if app.git_gutter_lane_width() > 0 {
                 let mark = app.git_gutter.iter().find(|m| m.line == line);
@@ -3331,6 +3349,52 @@ fn render_git_gutter_popup(frame: &mut Frame, _app: &App, area: Rect) {
         .title("Git Gutter  (r: Revert Hunk, d: Show Diff, Esc: close)");
     let body = "r  Revert Hunk\nd  Show Diff";
     frame.render_widget(Paragraph::new(body).block(block), popup);
+}
+
+/// The line-number gutter's right-click menu (`docs/features/
+/// tui-gutter-line-numbers.md` §2.9, T50) -- same small fixed-size popup
+/// shape `render_git_gutter_popup` uses, but list-selectable via
+/// `render_scrollable_list` since it has four items, not two mnemonic
+/// single keys -- mirrors `render_bookmarks_popup`'s exact
+/// list-with-`REVERSED`-highlight shape.
+fn render_gutter_context_menu(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.gutter_context_menu.as_ref() else {
+        return;
+    };
+    let width = area.width.clamp(28, 40).min(area.width);
+    let height = 6u16.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    const LABELS: [&str; 4] = [
+        "Toggle Line Breakpoint",
+        "Toggle Bookmark",
+        "Show Bookmarks",
+        "Toggle Blame Annotations",
+    ];
+    let items: Vec<ListItem> = LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let style = if i == state.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(*label, style)))
+        })
+        .collect();
+
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Line {}  (\u{2191}/\u{2193} select, Enter: run, Esc: close)",
+        state.line + 1
+    ));
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 fn render_git_branches_popup(frame: &mut Frame, app: &App, area: Rect) {
