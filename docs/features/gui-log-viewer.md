@@ -87,7 +87,8 @@ binding. Registered in `command.rs` and `app/menu.rs`.
 
 - Off-thread: `run` spawns a thread, `poll` drains once per frame.
 - Generation counter: stale results dropped.
-- `LOG_LIMIT = 500` max commits (matches `COMMIT_GRAPH_LIMIT` in git_panel).
+- `LOG_LIMIT = 500` max commits (reuse `COMMIT_GRAPH_LIMIT` from
+  `git_panel.rs` or define a local constant).
 - Filter inputs are `String` fields, converted to `CommitLogFilter` at
   run time.
 
@@ -109,4 +110,5 @@ binding. Registered in `command.rs` and `app/menu.rs`.
 
 ## Revision notes
 
-- Round 1: Initial doc.
+- Round 1: Fixed `LOG_LIMIT` → reference to `COMMIT_GRAPH_LIMIT`, confirmed
+  `CommitDetail` includes `email` field.
