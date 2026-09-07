@@ -1,0 +1,43 @@
+@startuml tui-ai-task-routing-sequence
+title TUI AI Task Routing — optional classify -> role -> route
+
+actor User
+participant "AiPanel (frame loop)" as Panel
+participant "AiPanel thread\n(owns tokio Runtime)" as Thread
+participant Sanitizer as San
+participant "classify_task_role()" as Classifier
+participant "classifier_provider\n(fast/cheap)" as ClassifierProvider
+participant "DefaultRouter::chat" as Router
+participant "role's provider chain" as Chain
+
+User -> Panel : Enter (input + selection context)
+Panel -> Thread : submit(prompt, ctx) via std::sync::mpsc
+activate Thread
+
+alt auto_route == false (default)
+  Thread -> Thread : role = TaskRole::General
+else auto_route == true
+  Thread -> San : mask(latest_user_message) [cloud classifier only]
+  San --> Thread : masked text
+  Thread -> Classifier : classify_task_role(classifier_provider, masked text)
+  activate Classifier
+  Classifier -> ClassifierProvider : short single-shot completion\n(bounded 5s timeout)
+  ClassifierProvider --> Classifier : label or timeout/error
+  Classifier --> Thread : TaskRole (falls back to General\non any timeout/error/unparseable label)
+  deactivate Classifier
+end
+
+Thread -> Thread : route = role_routes[role]\n(falls back to top-level\nprovider_order/default_model\nwhen role has no entry)
+Thread -> San : mask(payload) [main request, unchanged from T49]
+San --> Thread : masked + placeholder map
+Thread -> Router : chat(messages, route.provider_order,\nroute.model_override, tx)
+activate Router
+Router -> Chain : try_in_order (unchanged T49/r7 logic)
+Chain --> Router : ChatDelta stream / final Ok or Err
+deactivate Router
+Thread -> San : restore_originals(reply, map)
+San --> Thread : restored text
+Thread --> Panel : Assistant(restored) / Error
+deactivate Thread
+Panel --> User : render history + ProviderServing\n+ role (when auto_route) + sanitized
+@enduml
