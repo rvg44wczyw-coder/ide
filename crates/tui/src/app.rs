@@ -177,6 +177,19 @@ pub(crate) struct PaletteState {
     pub(crate) selected: usize,
 }
 
+/// A quick, bottom-anchored `:`-triggered command line (`docs/features/
+/// tui-colon-command.md`, T45) -- deliberately identical in shape to
+/// [`PaletteState`] rather than reusing it: `close_all_overlays`/
+/// `any_popup_open` gate on distinct `Option` fields per overlay
+/// throughout this file, and colon-command is visually and positionally
+/// distinct from the palette (bottom-anchored line vs. centered popup)
+/// even though both share the same filter/execute model.
+pub(crate) struct ColonCommandState {
+    pub(crate) query: String,
+    pub(crate) filtered: Vec<&'static Command>,
+    pub(crate) selected: usize,
+}
+
 /// Zero-or-many result picker shared by Go to Declaration and Find Usages
 /// (`docs/features/tui-goto-and-usages.md` §2.2) -- exactly one result
 /// jumps immediately and never creates this; this only exists while the
@@ -910,6 +923,8 @@ pub struct App {
     pub(crate) tabs: Vec<OpenBuffer>,
     pub(crate) active_tab: Option<usize>,
     pub(crate) palette: Option<PaletteState>,
+    /// `docs/features/tui-colon-command.md` §2.1, T45.
+    pub(crate) colon_command: Option<ColonCommandState>,
     pub(crate) find: Option<FindState>,
     pub(crate) goto: Option<GotoState>,
     /// The `(path, position)` a `Ctrl+B` press actually fired from --
@@ -1140,6 +1155,18 @@ fn clamp_pct(current: u16, delta: i16, range: std::ops::RangeInclusive<u16>) -> 
     next.clamp(*range.start() as i32, *range.end() as i32) as u16
 }
 
+/// Single source of truth for "does this command match this query"
+/// (`docs/features/tui-colon-command.md` §2.1/§4, T45) -- both the palette
+/// and colon-command filter through this; do not let a future edit
+/// special-case one without the other.
+fn filter_commands_by_title(query: &str) -> Vec<&'static Command> {
+    let query = query.to_lowercase();
+    commands()
+        .iter()
+        .filter(|c| c.title.to_lowercase().contains(&query))
+        .collect()
+}
+
 impl App {
     pub fn new(root: PathBuf) -> Result<Self, ProjectError> {
         let project = Project::open(&root)?;
@@ -1191,6 +1218,7 @@ impl App {
             tabs: Vec::new(),
             active_tab: None,
             palette: None,
+            colon_command: None,
             find: None,
             goto: None,
             goto_declaration_origin: None,
@@ -2221,6 +2249,13 @@ impl App {
     /// Path panel this way never stops a running search -- only the `_open`
     /// flag changes, `self.search` itself is untouched.
     fn close_all_overlays(&mut self) {
+        // Deliberately included here even though `self.palette` (its
+        // closest sibling in shape) is not -- unlike the palette,
+        // colon-command has no toggle-function precedent guaranteeing it's
+        // already `None` by the time some other overlay opens, so leaving
+        // it out would let it linger open underneath a newly-opened popup
+        // (`docs/features/tui-colon-command.md` §2.3, T45).
+        self.colon_command = None;
         self.goto = None;
         self.notifications_open = false;
         self.hover_open = false;
@@ -5987,6 +6022,9 @@ impl App {
         if self.palette.is_some() {
             return self.handle_palette_key(key);
         }
+        if self.colon_command.is_some() {
+            return self.handle_colon_command_key(key);
+        }
         if self.find.is_some() {
             return self.handle_find_key(key);
         }
@@ -6144,6 +6182,23 @@ impl App {
             self.active_screen = AppScreen::Editor;
             return LoopSignal::Continue;
         }
+        // `docs/features/tui-colon-command.md` §2.2/§3.2, T45 -- must sit
+        // *before* the global keymap lookup below, at the same rank T44's
+        // own Esc rule immediately above occupies: every screen/focus this
+        // fires for (Run, Keys, Editor+LeftDock, Editor+BottomDock) has its
+        // own catch-all handling further down this chain that would
+        // otherwise consume `:` silently before this check ever ran. Not
+        // reachable on the Git screen (that screen's own key handling
+        // claims every key several checks earlier) or while the caret is
+        // live in a real text buffer (`is_text_editing_focused`) -- both
+        // deliberate, per that doc's §1/§3.1.
+        if key.code == KeyCode::Char(':')
+            && !self.is_text_editing_focused()
+            && !self.any_popup_open()
+        {
+            self.open_colon_command();
+            return LoopSignal::Continue;
+        }
         if let Some(action) = self.keymap.action_for(key.modifiers, key.code) {
             return self.run_action(action);
         }
@@ -6195,6 +6250,7 @@ impl App {
     /// `handle_key` itself currently treats as "a popup is open".
     fn any_popup_open(&self) -> bool {
         self.palette.is_some()
+            || self.colon_command.is_some()
             || self.find.is_some()
             || self.goto.is_some()
             || self.notifications_open
@@ -7944,12 +8000,75 @@ impl App {
         let Some(palette) = self.palette.as_mut() else {
             return;
         };
-        let query = palette.query.to_lowercase();
-        palette.filtered = commands()
-            .iter()
-            .filter(|c| c.title.to_lowercase().contains(&query))
-            .collect();
+        palette.filtered = filter_commands_by_title(&palette.query);
         palette.selected = 0;
+    }
+
+    /// `:`-triggered command line (`docs/features/tui-colon-command.md`
+    /// §2.1, T45) -- mirrors `open_palette` exactly, including not calling
+    /// `close_all_overlays` first (matches that function's own current
+    /// behavior; see `handle_key`'s trigger check for how mutual exclusion
+    /// with the palette is actually guaranteed instead, §3.3).
+    fn open_colon_command(&mut self) {
+        self.colon_command = Some(ColonCommandState {
+            query: String::new(),
+            filtered: filter_commands_by_title(""),
+            selected: 0,
+        });
+    }
+
+    fn handle_colon_command_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.colon_command.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.colon_command = None;
+            }
+            KeyCode::Up => {
+                if state.selected > 0 {
+                    state.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if state.selected + 1 < state.filtered.len() {
+                    state.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let action = state.filtered.get(state.selected).map(|c| c.action);
+                self.colon_command = None;
+                if let Some(action) = action {
+                    return self.run_action(action);
+                }
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                self.refilter_colon_command();
+            }
+            KeyCode::Char(c) => {
+                state.query.push(c);
+                self.refilter_colon_command();
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    fn refilter_colon_command(&mut self) {
+        let Some(state) = self.colon_command.as_mut() else {
+            return;
+        };
+        state.filtered = filter_commands_by_title(&state.query);
+        state.selected = 0;
+    }
+
+    /// Whether a bare `:` keystroke right now means "insert a literal
+    /// colon into a real file's content" (`docs/features/
+    /// tui-colon-command.md` §1/§3.1) -- the one and only context where
+    /// `handle_key`'s colon-command trigger must not fire.
+    fn is_text_editing_focused(&self) -> bool {
+        self.active_screen == AppScreen::Editor && self.focus == Focus::Editor
     }
 
     /// `ToggleKeymapSettings` command (`docs/features/tui-keymap.md`
@@ -9694,6 +9813,200 @@ mod tests {
             .filtered
             .iter()
             .any(|c| c.id == "ToggleFormatOnSave"));
+    }
+
+    #[test]
+    fn colon_opens_colon_command_when_left_dock_focused_and_esc_closes_it() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.focus, Focus::LeftDock);
+        assert!(app.colon_command.is_none());
+
+        app.handle_key(plain_key(KeyCode::Char(':')));
+        assert!(app.colon_command.is_some());
+
+        app.handle_key(plain_key(KeyCode::Esc));
+        assert!(app.colon_command.is_none());
+    }
+
+    #[test]
+    fn colon_does_not_trigger_while_the_editor_caret_is_live() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        assert_eq!(app.active_screen, AppScreen::Editor);
+        assert_eq!(app.focus, Focus::Editor);
+
+        app.handle_key(plain_key(KeyCode::Char(':')));
+
+        assert!(
+            app.colon_command.is_none(),
+            "a literal ':' keystroke in the editor must never open colon-command"
+        );
+        assert_eq!(
+            app.tabs[app.active_tab.unwrap()].buffer.text(),
+            ":fn main() {}\n",
+            "the colon must be inserted into the buffer at the caret (start of file)"
+        );
+    }
+
+    #[test]
+    fn colon_opens_on_top_of_the_run_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToRunScreen);
+
+        app.handle_key(plain_key(KeyCode::Char(':')));
+
+        assert!(app.colon_command.is_some());
+        assert!(app.any_popup_open());
+        assert_eq!(app.active_screen, AppScreen::Run);
+    }
+
+    #[test]
+    fn colon_opens_on_top_of_the_keys_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+
+        app.handle_key(plain_key(KeyCode::Char(':')));
+
+        assert!(app.colon_command.is_some());
+        assert!(app.any_popup_open());
+        assert_eq!(app.active_screen, AppScreen::Keys);
+    }
+
+    #[test]
+    fn colon_does_not_trigger_on_the_git_screen_and_types_literally_instead() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_git_panel();
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().changes_focus,
+            ChangesFocus::Message
+        );
+
+        app.handle_key(plain_key(KeyCode::Char(':')));
+
+        assert!(
+            app.colon_command.is_none(),
+            "a ':' on the Git screen must reach handle_git_panel_key, not open colon-command"
+        );
+        assert_eq!(app.git.commit_message, ":");
+    }
+
+    #[test]
+    fn colon_command_up_down_move_the_selection() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Char(':')));
+        assert_eq!(app.colon_command.as_ref().unwrap().selected, 0);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.colon_command.as_ref().unwrap().selected, 1);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.colon_command.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn colon_command_backspace_shrinks_the_query_and_refilters() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Char(':')));
+        for c in "save".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.colon_command.as_ref().unwrap().filtered.len(), 2);
+        app.handle_key(plain_key(KeyCode::Backspace));
+        app.handle_key(plain_key(KeyCode::Backspace));
+        app.handle_key(plain_key(KeyCode::Backspace));
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.colon_command.as_ref().unwrap().query, "");
+        assert_eq!(
+            app.colon_command.as_ref().unwrap().filtered.len(),
+            commands().len()
+        );
+    }
+
+    #[test]
+    fn colon_command_enter_runs_the_selected_command() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Char(':')));
+        for c in "exit".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        let signal = app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(signal, LoopSignal::Exit);
+        assert!(app.colon_command.is_none());
+    }
+
+    #[test]
+    fn colon_command_filters_by_substring_case_insensitively() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Char(':')));
+        for c in "SAVE".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        let state = app.colon_command.as_ref().unwrap();
+        assert_eq!(state.filtered.len(), 2);
+        assert!(state.filtered.iter().any(|c| c.id == "SaveAll"));
+        assert!(state.filtered.iter().any(|c| c.id == "ToggleFormatOnSave"));
+    }
+
+    #[test]
+    fn colon_command_typing_a_second_colon_is_a_harmless_literal_query_char() {
+        // The first ':' triggers `open_colon_command` and is never itself
+        // added to the query; a second ':' has no special case and is
+        // pushed like any other character, ending up as a one-character
+        // query that happens to substring-match "Custom Actions: Manage"
+        // (the one command title containing a literal colon) -- there is
+        // no crash or special-cased behavior either way.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Char(':')));
+        app.handle_key(plain_key(KeyCode::Char(':')));
+        let state = app.colon_command.as_ref().unwrap();
+        assert_eq!(state.query, ":");
+        assert_eq!(state.filtered.len(), 1);
+        assert!(state.filtered.iter().any(|c| c.title.contains(':')));
+    }
+
+    #[test]
+    fn colon_command_and_palette_are_mutually_exclusive() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(plain_key(KeyCode::Char(':')));
+        assert!(app.colon_command.is_some());
+        assert!(app.palette.is_none());
+
+        app.handle_key(plain_key(KeyCode::Esc));
+        app.handle_key(key(
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            KeyCode::Char('a'),
+        ));
+        assert!(app.palette.is_some());
+        assert!(app.colon_command.is_none());
+    }
+
+    #[test]
+    fn close_all_overlays_closes_colon_command() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_colon_command();
+        assert!(app.colon_command.is_some());
+        app.close_all_overlays();
+        assert!(app.colon_command.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_includes_colon_command() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+        app.open_colon_command();
+        assert!(app.any_popup_open());
     }
 
     #[test]

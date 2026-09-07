@@ -168,6 +168,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.palette.is_some() {
         render_palette(frame, app, size);
     }
+    if app.colon_command.is_some() {
+        render_colon_command(frame, app, size);
+    }
     if app.goto.is_some() {
         render_goto_popup(frame, app, size);
     }
@@ -875,6 +878,55 @@ fn render_palette(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(palette.selected));
     frame.render_stateful_widget(list, popup, &mut state);
+}
+
+/// Smaller than [`PALETTE_VISIBLE_ROWS`] -- this is a quick single-command
+/// line, not a way to browse the whole registry (`docs/features/
+/// tui-colon-command.md` §2.4, T45).
+const COLON_COMMAND_VISIBLE_ROWS: u16 = 6;
+
+fn render_colon_command(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.colon_command.as_ref() else {
+        return;
+    };
+    let width = area.width.saturating_sub(2);
+    let height = (COLON_COMMAND_VISIBLE_ROWS + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    // Bottom-anchored, directly above the status bar row `render` reserves
+    // as the last row of `area` -- unlike every other popup in this file,
+    // which centers in `area`.
+    let popup = Rect {
+        x: area.x + 1,
+        y: area.y + area.height.saturating_sub(1).saturating_sub(height),
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = state
+        .filtered
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            let style = if i == state.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{}  ({})", cmd.title, cmd.id),
+                style,
+            )))
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(": {}", state.query));
+    let list = List::new(items).block(block);
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+    frame.render_stateful_widget(list, popup, &mut list_state);
 }
 
 fn render_goto_popup(frame: &mut Frame, app: &App, area: Rect) {
