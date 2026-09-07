@@ -226,6 +226,7 @@ pub enum CommandAction {
     GitWorktrees,
     ManageCustomActions,
     ToggleCustomActionsToolWindow,
+    ToggleTodoToolWindow,
     ShowFileHistory,
     Fetch,
     Pull,
@@ -492,6 +493,13 @@ pub fn commands() -> &'static [Command] {
                 category: "Window",
                 binding: None,
                 action: CommandAction::ToggleCustomActionsToolWindow,
+            },
+            Command {
+                id: "ToggleTodoToolWindow",
+                title: "TODO",
+                category: "Window",
+                binding: None,
+                action: CommandAction::ToggleTodoToolWindow,
             },
             Command {
                 id: "NextTab",

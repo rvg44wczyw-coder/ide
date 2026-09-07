@@ -23,6 +23,7 @@ mod nav_history;
 mod search_in_path_panel;
 mod search_panel;
 mod theme;
+mod todo_panel;
 mod tree_scan;
 
 /// `initial_project`, when given, opens that path directly (skipping the
