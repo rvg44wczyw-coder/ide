@@ -29,14 +29,64 @@ use crate::subprocess::{self, StreamEvent};
 /// something other than this feature's own write path.
 const MAX_CUSTOM_ACTIONS: usize = 500;
 
-/// One user-declared, named external command. `args` is already a real
-/// argv (split once, at save time, in `App::confirm_action_form`) -- never
-/// re-split from a raw string at run time.
+/// Which edge of the screen a `CustomAction` is bound to (`docs/features/
+/// tui-custom-actions-edge-slots.md` §2.1, T47) -- the mockup's own
+/// vocabulary, replacing `T42`'s single flat list. `Default` is `Bottom`,
+/// the least surprising landing spot for a freshly-created action (where
+/// `T42`'s one-and-only list used to live).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) enum ActionSlot {
+    Top,
+    Tree,
+    Outline,
+    #[default]
+    Bottom,
+}
+
+impl ActionSlot {
+    pub(crate) const ALL: [ActionSlot; 4] = [
+        ActionSlot::Top,
+        ActionSlot::Tree,
+        ActionSlot::Outline,
+        ActionSlot::Bottom,
+    ];
+
+    pub(crate) fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    fn index(self) -> usize {
+        match self {
+            ActionSlot::Top => 0,
+            ActionSlot::Tree => 1,
+            ActionSlot::Outline => 2,
+            ActionSlot::Bottom => 3,
+        }
+    }
+}
+
+/// What running a `CustomAction` actually does (`docs/features/
+/// tui-custom-actions-edge-slots.md` §2.1/§3.2, T47). `External` is `T42`'s
+/// original (and only) shape, unchanged. `Builtin` references an existing
+/// `Command::id` -- **not** a second, parallel list of runnable things --
+/// so running one never spawns a subprocess; `App::run_custom_action`
+/// resolves the id against `commands()` and calls the exact same
+/// `run_action` every keybinding/palette/colon-command row already calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub(crate) enum CustomActionKind {
+    External { command: String, args: Vec<String> },
+    Builtin { command_id: String },
+}
+
+/// One user-declared custom action. `args` (when `kind` is `External`) is
+/// already a real argv (split once, at save time, in `App::
+/// confirm_action_form`) -- never re-split from a raw string at run time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CustomAction {
     pub(crate) name: String,
-    pub(crate) command: String,
-    pub(crate) args: Vec<String>,
+    pub(crate) slot: ActionSlot,
+    pub(crate) kind: CustomActionKind,
 }
 
 /// The `.ide/custom_actions.json` payload shape -- a struct, not a bare
@@ -86,7 +136,13 @@ pub(crate) fn save(project_root: &Path, actions: &[CustomAction]) {
 #[derive(Default)]
 pub(crate) struct CustomActionsPanel {
     pub(crate) actions: Vec<CustomAction>,
-    pub(crate) selected: usize,
+    /// One selection cursor per `ActionSlot` (`docs/features/
+    /// tui-custom-actions-edge-slots.md` §2.2, T47), indexed by
+    /// `ActionSlot::index()` -- was a single `selected: usize` before this
+    /// doc; each slot's own filtered view (`actions_for_slot`) can have a
+    /// different length, so one shared cursor would mean different things
+    /// in each.
+    pub(crate) selected: [usize; 4],
     /// A **clone** of the action currently running, not an index into
     /// `actions` -- deleting or reordering the definition mid-run (via the
     /// Manage popup, independent of this dock tab) must never invalidate
@@ -102,20 +158,54 @@ pub(crate) struct CustomActionsPanel {
 }
 
 impl CustomActionsPanel {
-    /// No-op if `running.is_some()` (v1 scope: at most one in flight,
-    /// mirrors `CargoPanel::run`) or if `actions` is empty or `selected`
-    /// is out of range.
-    pub(crate) fn run_selected(&mut self, project_root: &Path) {
+    /// Every action bound to `slot`, in `actions`' own order -- owned
+    /// clones, not references: these lists are tiny (bounded by
+    /// `MAX_CUSTOM_ACTIONS` across *all* slots combined) and every caller
+    /// needs an owned value anyway (to hand to `run` or to `App::
+    /// run_custom_action`), so cloning here avoids fighting borrow
+    /// lifetimes at every call site for no real cost.
+    pub(crate) fn actions_for_slot(&self, slot: ActionSlot) -> Vec<CustomAction> {
+        self.actions
+            .iter()
+            .filter(|a| a.slot == slot)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn selected(&self, slot: ActionSlot) -> usize {
+        self.selected[slot.index()]
+    }
+
+    /// Moves `slot`'s own cursor by `delta` (`+1`/`-1`), clamped to
+    /// `[0, actions_for_slot(slot).len().saturating_sub(1)]` -- same
+    /// clamp-not-wrap convention every other list cursor in this crate
+    /// uses (`GoToFileState::selected`, `PaletteState::selected`, ...).
+    pub(crate) fn move_selection(&mut self, slot: ActionSlot, delta: i32) {
+        let len = self.actions_for_slot(slot).len();
+        let current = self.selected(slot) as i32;
+        let next = (current + delta).clamp(0, len.saturating_sub(1) as i32);
+        self.selected[slot.index()] = next as usize;
+    }
+
+    /// Spawns `action`'s subprocess. No-op if already `running.is_some()`
+    /// (v1 scope: at most one in flight, mirrors `CargoPanel::run`) --
+    /// **or** if `action.kind` is `Builtin`: that is a caller bug, not a
+    /// reachable user-facing state (`App::run_custom_action` is
+    /// responsible for routing `Builtin` through `run_action` before ever
+    /// reaching here, `docs/features/tui-custom-actions-edge-slots.md`
+    /// §3.2), so this mirrors this crate's existing "defensive no-op on a
+    /// should-never-happen state" convention rather than `panic!`.
+    pub(crate) fn run(&mut self, project_root: &Path, action: CustomAction) {
         if self.running.is_some() {
             return;
         }
-        let Some(action) = self.actions.get(self.selected).cloned() else {
+        let CustomActionKind::External { command, args } = &action.kind else {
             return;
         };
         self.output.clear();
         self.rx = Some(subprocess::spawn_streaming(
-            &action.command,
-            &action.args,
+            command,
+            args,
             Some(project_root),
         ));
         self.running = Some(action);
@@ -168,10 +258,27 @@ mod tests {
     }
 
     fn sample_action(name: &str) -> CustomAction {
+        external_action(name, ActionSlot::Bottom)
+    }
+
+    fn external_action(name: &str, slot: ActionSlot) -> CustomAction {
         CustomAction {
             name: name.to_string(),
-            command: "cargo".to_string(),
-            args: vec!["test".to_string()],
+            slot,
+            kind: CustomActionKind::External {
+                command: "cargo".to_string(),
+                args: vec!["test".to_string()],
+            },
+        }
+    }
+
+    fn builtin_action(name: &str, slot: ActionSlot, command_id: &str) -> CustomAction {
+        CustomAction {
+            name: name.to_string(),
+            slot,
+            kind: CustomActionKind::Builtin {
+                command_id: command_id.to_string(),
+            },
         }
     }
 
@@ -220,24 +327,87 @@ mod tests {
     }
 
     #[test]
-    fn run_selected_on_an_empty_list_is_a_noop() {
-        let mut panel = CustomActionsPanel::default();
-        panel.run_selected(Path::new("."));
-        assert!(panel.running.is_none());
-    }
-
-    #[test]
-    fn run_selected_while_already_running_is_a_noop() {
+    fn run_while_already_running_is_a_noop() {
         let mut panel = CustomActionsPanel {
             actions: vec![sample_action("a"), sample_action("b")],
-            selected: 1,
+            selected: [0; 4],
             running: Some(sample_action("a")),
             output: vec!["existing".to_string()],
             rx: None,
         };
-        panel.run_selected(Path::new("."));
+        panel.run(Path::new("."), sample_action("b"));
         assert_eq!(panel.running, Some(sample_action("a")));
         assert_eq!(panel.output, vec!["existing".to_string()]);
+    }
+
+    #[test]
+    fn run_on_a_builtin_action_is_a_noop_caller_bug_guard() {
+        // `App::run_custom_action` is responsible for never calling `run`
+        // with a `Builtin` action -- this just confirms the defensive
+        // no-op holds if that invariant is ever violated.
+        let mut panel = CustomActionsPanel::default();
+        panel.run(
+            Path::new("."),
+            builtin_action("b", ActionSlot::Bottom, "Exit"),
+        );
+        assert!(panel.running.is_none());
+        assert!(panel.rx.is_none());
+    }
+
+    #[test]
+    fn actions_for_slot_filters_by_slot() {
+        let panel = CustomActionsPanel {
+            actions: vec![
+                external_action("top1", ActionSlot::Top),
+                external_action("bottom1", ActionSlot::Bottom),
+                external_action("top2", ActionSlot::Top),
+            ],
+            ..Default::default()
+        };
+        let top = panel.actions_for_slot(ActionSlot::Top);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].name, "top1");
+        assert_eq!(top[1].name, "top2");
+        assert_eq!(panel.actions_for_slot(ActionSlot::Tree).len(), 0);
+    }
+
+    #[test]
+    fn move_selection_clamps_per_slot_independently() {
+        let mut panel = CustomActionsPanel {
+            actions: vec![
+                external_action("top1", ActionSlot::Top),
+                external_action("bottom1", ActionSlot::Bottom),
+                external_action("bottom2", ActionSlot::Bottom),
+            ],
+            ..Default::default()
+        };
+        panel.move_selection(ActionSlot::Top, 1);
+        assert_eq!(panel.selected(ActionSlot::Top), 0); // only 1 row, clamps
+        panel.move_selection(ActionSlot::Bottom, 1);
+        assert_eq!(panel.selected(ActionSlot::Bottom), 1);
+        panel.move_selection(ActionSlot::Bottom, 1);
+        assert_eq!(panel.selected(ActionSlot::Bottom), 1); // clamps at len-1
+        panel.move_selection(ActionSlot::Bottom, -5);
+        assert_eq!(panel.selected(ActionSlot::Bottom), 0);
+    }
+
+    #[test]
+    fn action_slot_next_cycles_through_all_four_and_wraps() {
+        assert_eq!(ActionSlot::Top.next(), ActionSlot::Tree);
+        assert_eq!(ActionSlot::Tree.next(), ActionSlot::Outline);
+        assert_eq!(ActionSlot::Outline.next(), ActionSlot::Bottom);
+        assert_eq!(ActionSlot::Bottom.next(), ActionSlot::Top);
+    }
+
+    #[test]
+    fn action_slot_all_lists_every_variant_once_in_next_order() {
+        for slot in ActionSlot::ALL {
+            assert_eq!(ActionSlot::ALL.iter().filter(|s| **s == slot).count(), 1);
+        }
+        for i in 0..ActionSlot::ALL.len() {
+            let next_index = (i + 1) % ActionSlot::ALL.len();
+            assert_eq!(ActionSlot::ALL[i].next(), ActionSlot::ALL[next_index]);
+        }
     }
 
     #[test]
@@ -248,21 +418,26 @@ mod tests {
         assert!(panel.running.is_none());
     }
 
+    fn streaming_action(name: &str) -> CustomAction {
+        CustomAction {
+            name: name.to_string(),
+            slot: ActionSlot::Bottom,
+            kind: CustomActionKind::External {
+                command: fixture("streaming_output.sh"),
+                args: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn run_and_poll_streams_stdout_and_stderr_lines() {
         let dir = tempfile::tempdir().unwrap();
+        let action = streaming_action("Stream");
         let mut panel = CustomActionsPanel {
-            actions: vec![CustomAction {
-                name: "Stream".to_string(),
-                command: fixture("streaming_output.sh"),
-                args: Vec::new(),
-            }],
-            selected: 0,
-            running: None,
-            output: Vec::new(),
-            rx: None,
+            actions: vec![action.clone()],
+            ..Default::default()
         };
-        panel.run_selected(dir.path());
+        panel.run(dir.path(), action);
         assert!(panel.running.is_some());
 
         wait_until(|| {
@@ -278,24 +453,18 @@ mod tests {
     #[test]
     fn deleting_the_running_actions_definition_does_not_affect_the_in_flight_run() {
         let dir = tempfile::tempdir().unwrap();
+        let action = streaming_action("Stream");
         let mut panel = CustomActionsPanel {
-            actions: vec![CustomAction {
-                name: "Stream".to_string(),
-                command: fixture("streaming_output.sh"),
-                args: Vec::new(),
-            }],
-            selected: 0,
-            running: None,
-            output: Vec::new(),
-            rx: None,
+            actions: vec![action.clone()],
+            ..Default::default()
         };
-        panel.run_selected(dir.path());
+        panel.run(dir.path(), action);
         let running_before = panel.running.clone();
         assert!(running_before.is_some());
 
         // Simulates the Manage popup deleting the only defined action
         // while it's running -- `running` is a clone, so this must not
-        // disturb it (`docs/features/tui-custom-actions.md` §2.3/§3.1).
+        // disturb it (`docs/features/tui-custom-actions-edge-slots.md` §3.1).
         panel.actions.clear();
 
         wait_until(|| {

@@ -24,8 +24,8 @@ use ratatui::Frame;
 use crate::ai_panel::AiDisplayMessage;
 use crate::app::{
     ActionFormField, App, AppScreen, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView,
-    DebugPanelFocus, FilterField, FinderRow, Focus, GitPanelFocus, GitPanelState, GitPanelView,
-    LeftDockState, LeftDockTab, SearchInPathField,
+    DebugPanelFocus, FilterField, FinderRow, Focus, FormKind, GitPanelFocus, GitPanelState,
+    GitPanelView, LeftDockState, LeftDockTab, SearchInPathField,
 };
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
@@ -95,6 +95,15 @@ pub struct HitMap {
     /// §3.2.4) -- Docker/Kubernetes/Cargo/
     /// Custom Actions/Problems/Git Log, same shape as `screen_tabs`.
     pub bottom_dock_tabs: Vec<(Rect, BottomDockTab)>,
+    /// `Top`-slot custom action click regions, right-aligned on the screen
+    /// tab bar (`docs/features/tui-custom-actions-edge-slots.md` §3.1,
+    /// T47) -- mouse-click-only, no keyboard focus target (see that doc's
+    /// §3.1 for why).
+    pub top_action_hits: Vec<(Rect, crate::custom_actions::CustomAction)>,
+    /// `Outline`-slot custom action click regions, right-aligned on the
+    /// breadcrumbs row (`docs/features/tui-custom-actions-edge-slots.md`
+    /// §3.1, T47) -- same mouse-click-only scope as `top_action_hits`.
+    pub outline_action_hits: Vec<(Rect, crate::custom_actions::CustomAction)>,
 }
 
 /// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
@@ -370,13 +379,18 @@ fn render_left_dock(
         rows[0],
         focus_style(app, Focus::LeftDock),
         &mut hits.left_dock_tabs,
-        &[(LeftDockTab::Files, "Files"), (LeftDockTab::Todos, "Todos")],
+        &[
+            (LeftDockTab::Files, "Files"),
+            (LeftDockTab::Todos, "Todos"),
+            (LeftDockTab::Actions, "Actions"),
+        ],
         dock.tab,
     );
 
     match dock.tab {
         LeftDockTab::Files => render_tree(frame, app, rows[1], hits),
         LeftDockTab::Todos => render_todo_panel(frame, app, rows[1], dock.todos_selected),
+        LeftDockTab::Actions => render_tree_actions_tab(frame, app, rows[1]),
     }
 }
 
@@ -505,7 +519,7 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let text_area = sections[2];
 
     render_tab_strip(frame, app, strip_area, hits);
-    render_breadcrumbs(frame, app, breadcrumbs_area);
+    render_breadcrumbs(frame, app, breadcrumbs_area, hits);
     hits.editor_text_area = Some(text_area);
 
     let Some(buf) = app.active_buffer() else {
@@ -702,6 +716,58 @@ fn blame_lane_prefix(
     format!("{label:<BLAME_LANE_CHARS$} ")
 }
 
+/// Appends `actions`' `[Name]` labels right-aligned within `area`, after
+/// whatever's already in `spans` (which occupies `[area.x, column)`) --
+/// shared by `render_screen_tabs`' `Top` slot and `render_breadcrumbs`'
+/// `Outline` slot (`docs/features/tui-custom-actions-edge-slots.md` §3.1,
+/// T47). A no-op (no padding spacer, no hit regions) when `actions` is
+/// empty, so it never turns an otherwise-blank row non-blank.
+fn append_right_aligned_actions(
+    spans: &mut Vec<Span<'static>>,
+    hit_regions: &mut Vec<(Rect, crate::custom_actions::CustomAction)>,
+    actions: Vec<crate::custom_actions::CustomAction>,
+    area: Rect,
+    column: u16,
+) {
+    if actions.is_empty() {
+        return;
+    }
+    let items: Vec<(crate::custom_actions::CustomAction, String, u16)> = actions
+        .into_iter()
+        .map(|a| {
+            let label = format!("[{}]", a.name);
+            let width = Span::raw(label.clone()).width() as u16;
+            (a, label, width)
+        })
+        .collect();
+    let total_width: u16 =
+        items.iter().map(|(_, _, w)| *w).sum::<u16>() + 2 * items.len().saturating_sub(1) as u16;
+    let start_x = (area.x + area.width)
+        .saturating_sub(total_width)
+        .max(column);
+    if start_x > column {
+        spans.push(Span::raw(" ".repeat((start_x - column) as usize)));
+    }
+    let mut x = start_x;
+    for (i, (action, label, width)) in items.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            x += 2;
+        }
+        hit_regions.push((
+            Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            action,
+        ));
+        x += width;
+        spans.push(Span::raw(label));
+    }
+}
+
 /// Permanent screen tab bar (`docs/features/tui-screen-navigation.md`
 /// §2.3, T44) -- always rendered, the first row of every frame regardless
 /// of `active_screen`, same "unconditional chrome row" precedent
@@ -739,6 +805,18 @@ fn render_screen_tabs(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMa
         column += width;
         spans.push(Span::styled(*label, style));
     }
+
+    let top_actions = app
+        .custom_actions
+        .actions_for_slot(crate::custom_actions::ActionSlot::Top);
+    append_right_aligned_actions(
+        &mut spans,
+        &mut hits.top_action_hits,
+        top_actions,
+        area,
+        column,
+    );
+
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -790,17 +868,34 @@ fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap)
 /// Renders a blank row (not a placeholder) when `active_breadcrumbs()` is
 /// empty, matching `render_git_gutter`'s existing "nothing to show today"
 /// convention.
-fn render_breadcrumbs(frame: &mut Frame, app: &App, area: Rect) {
+fn render_breadcrumbs(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let crumbs = app.active_breadcrumbs();
-    if crumbs.is_empty() {
-        return;
-    }
-    let mut spans = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut column = area.x;
     for (i, symbol) in crumbs.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw(" \u{203a} "));
+            let sep = " \u{203a} ";
+            column += Span::raw(sep).width() as u16;
+            spans.push(Span::raw(sep));
         }
-        spans.push(Span::raw(symbol.name.clone()));
+        let name = symbol.name.clone();
+        column += Span::raw(name.as_str()).width() as u16;
+        spans.push(Span::raw(name));
+    }
+
+    let outline_actions = app
+        .custom_actions
+        .actions_for_slot(crate::custom_actions::ActionSlot::Outline);
+    append_right_aligned_actions(
+        &mut spans,
+        &mut hits.outline_action_hits,
+        outline_actions,
+        area,
+        column,
+    );
+
+    if spans.is_empty() {
+        return;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -2141,28 +2236,44 @@ fn render_cargo_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
-/// Custom Actions dock tab (`docs/features/tui-custom-actions.md` §3.1) --
-/// mirrors `render_docker_panel`'s list-plus-output-area shape rather than
-/// `render_cargo_panel`'s single list, since here the declared-action list
-/// and the running output are two logically distinct things (Cargo only
-/// ever has its six fixed built-in subcommands, never a user-declared
-/// list to select from).
-fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme.theme();
-    let rows = Layout::default()
-        .direction(LayoutDirection::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(0)])
-        .split(area);
+/// A `CustomAction`'s one-line list label -- `External` keeps `T42`'s own
+/// `name  --  command args` shape; `Builtin` shows the bound `Command::id`
+/// in brackets instead of a program name, so the two kinds are visually
+/// distinguishable at a glance (`docs/features/tui-custom-actions-edge-
+/// slots.md` §2.1/§3.1, T47).
+fn custom_action_label(action: &crate::custom_actions::CustomAction) -> String {
+    match &action.kind {
+        crate::custom_actions::CustomActionKind::External { command, args } => {
+            let args = args.join(" ");
+            if args.is_empty() {
+                format!("{}  --  {}", action.name, command)
+            } else {
+                format!("{}  --  {} {}", action.name, command, args)
+            }
+        }
+        crate::custom_actions::CustomActionKind::Builtin { command_id } => {
+            format!("{}  --  [{}]", action.name, command_id)
+        }
+    }
+}
 
-    let selected = app.custom_actions.selected;
-    let items: Vec<ListItem> = if app.custom_actions.actions.is_empty() {
+/// `LeftDockTab::Actions` -- the `Tree` slot (`docs/features/
+/// tui-custom-actions-edge-slots.md` §3.1) -- a plain scrollable list, no
+/// output pane (that's `External`-run-shaped state the `Bottom` slot's own
+/// tab already owns; a `Tree`-bound action's visible effect, `External` or
+/// `Builtin` alike, shows up wherever it always would -- the Bottom dock's
+/// Output pane for a subprocess, or the rest of the UI for a `Builtin`).
+fn render_tree_actions_tab(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::custom_actions::ActionSlot;
+    let slot_actions = app.custom_actions.actions_for_slot(ActionSlot::Tree);
+    let selected = app.custom_actions.selected(ActionSlot::Tree);
+    let items: Vec<ListItem> = if slot_actions.is_empty() {
         vec![ListItem::new(Line::from(
             "No custom actions declared -- open the command palette and run \
              \"Custom Actions: Manage\" to add one.",
         ))]
     } else {
-        app.custom_actions
-            .actions
+        slot_actions
             .iter()
             .enumerate()
             .map(|(i, action)| {
@@ -2171,13 +2282,48 @@ fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default()
                 };
-                let args = action.args.join(" ");
-                let label = if args.is_empty() {
-                    format!("{}  --  {}", action.name, action.command)
+                ListItem::new(Line::from(Span::styled(custom_action_label(action), style)))
+            })
+            .collect()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Actions  (Enter: run)");
+    render_scrollable_list(frame, items, block, area, selected);
+}
+
+/// Custom Actions dock tab -- the `Bottom` slot (`docs/features/
+/// tui-custom-actions-edge-slots.md` §3.1) -- mirrors `render_docker_
+/// panel`'s list-plus-output-area shape rather than `render_cargo_panel`'s
+/// single list, since here the declared-action list and the running
+/// output are two logically distinct things (Cargo only ever has its six
+/// fixed built-in subcommands, never a user-declared list to select from).
+fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::custom_actions::ActionSlot;
+    let theme = app.theme.theme();
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(0)])
+        .split(area);
+
+    let slot_actions = app.custom_actions.actions_for_slot(ActionSlot::Bottom);
+    let selected = app.custom_actions.selected(ActionSlot::Bottom);
+    let items: Vec<ListItem> = if slot_actions.is_empty() {
+        vec![ListItem::new(Line::from(
+            "No custom actions declared -- open the command palette and run \
+             \"Custom Actions: Manage\" to add one.",
+        ))]
+    } else {
+        slot_actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let style = if i == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
                 } else {
-                    format!("{}  --  {} {}", action.name, action.command, args)
+                    Style::default()
                 };
-                ListItem::new(Line::from(Span::styled(label, style)))
+                ListItem::new(Line::from(Span::styled(custom_action_label(action), style)))
             })
             .collect()
     };
@@ -2245,23 +2391,39 @@ fn render_manage_actions_popup(frame: &mut Frame, app: &App, area: Rect) {
                 " "
             }
         };
-        let items = vec![
+        let mut items = vec![
             ListItem::new(Line::from(format!(
                 "{} Name: {}",
                 field_marker(ActionFormField::Name),
                 state.new_name
             ))),
             ListItem::new(Line::from(format!(
-                "{} Command: {}",
-                field_marker(ActionFormField::Command),
-                state.new_command
+                "{} Kind: {:?}  (Space to toggle)",
+                field_marker(ActionFormField::Kind),
+                state.form_kind
             ))),
             ListItem::new(Line::from(format!(
+                "{} {}: {}",
+                field_marker(ActionFormField::Command),
+                match state.form_kind {
+                    FormKind::External => "Command",
+                    FormKind::Builtin => "Command id",
+                },
+                state.new_command
+            ))),
+        ];
+        if state.form_kind == FormKind::External {
+            items.push(ListItem::new(Line::from(format!(
                 "{} Args: {}",
                 field_marker(ActionFormField::Args),
                 state.new_args
-            ))),
-        ];
+            ))));
+        }
+        items.push(ListItem::new(Line::from(format!(
+            "{} Slot: {:?}  (Space to cycle)",
+            field_marker(ActionFormField::Slot),
+            state.form_slot
+        ))));
         let title = if state.editing_index.is_some() {
             "Edit Custom Action  (Tab: next field, Enter: save, Esc: cancel)"
         } else {
@@ -2284,8 +2446,7 @@ fn render_manage_actions_popup(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default()
             };
-            let args = action.args.join(" ");
-            let label = format!("{}  --  {} {}", action.name, action.command, args);
+            let label = format!("[{:?}] {}", action.slot, custom_action_label(action));
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();

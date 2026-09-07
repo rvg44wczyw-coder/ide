@@ -791,19 +791,26 @@ pub(crate) enum LeftDockTab {
     #[default]
     Files,
     Todos,
+    /// `docs/features/tui-custom-actions-edge-slots.md` §3.1, T47 -- the
+    /// `Tree`-slot custom actions, filtered via `actions_for_slot(Tree)`.
+    Actions,
 }
 
 impl LeftDockTab {
     pub(crate) fn next(self) -> Self {
         match self {
             LeftDockTab::Files => LeftDockTab::Todos,
-            LeftDockTab::Todos => LeftDockTab::Files,
+            LeftDockTab::Todos => LeftDockTab::Actions,
+            LeftDockTab::Actions => LeftDockTab::Files,
         }
     }
 
     pub(crate) fn previous(self) -> Self {
-        // Only two variants -- `next`'s own cycle is its own inverse.
-        self.next()
+        match self {
+            LeftDockTab::Files => LeftDockTab::Actions,
+            LeftDockTab::Todos => LeftDockTab::Files,
+            LeftDockTab::Actions => LeftDockTab::Todos,
+        }
     }
 }
 
@@ -884,37 +891,64 @@ pub(crate) struct GitLogDockState {
     pub(crate) diff_scroll: u16,
 }
 
+/// Which of the two ways a `CustomAction` can run (`docs/features/
+/// tui-custom-actions-edge-slots.md` §2.3, T47) -- `Space` on the form's
+/// `Kind` field toggles this; `Default` is `External`, `T42`'s original
+/// (and, until this doc, only) shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FormKind {
+    #[default]
+    External,
+    Builtin,
+}
+
+impl FormKind {
+    pub(crate) fn toggle(self) -> Self {
+        match self {
+            FormKind::External => FormKind::Builtin,
+            FormKind::Builtin => FormKind::External,
+        }
+    }
+}
+
 /// Which field of the Manage Custom Actions add/edit form has focus;
-/// `Tab`/`BackTab` cycle it. Mirrors `WorktreeAddField`
-/// (`git_panel.rs`) exactly (`docs/features/tui-custom-actions.md` §2.3).
+/// `Tab`/`BackTab` cycle it in this order (`docs/features/
+/// tui-custom-actions-edge-slots.md` §2.3, T47 -- `Kind`/`Slot` are new).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ActionFormField {
     #[default]
     Name,
+    Kind,
     Command,
     Args,
+    Slot,
 }
 
 impl ActionFormField {
     pub(crate) fn next(self) -> Self {
         match self {
-            ActionFormField::Name => ActionFormField::Command,
+            ActionFormField::Name => ActionFormField::Kind,
+            ActionFormField::Kind => ActionFormField::Command,
             ActionFormField::Command => ActionFormField::Args,
-            ActionFormField::Args => ActionFormField::Name,
+            ActionFormField::Args => ActionFormField::Slot,
+            ActionFormField::Slot => ActionFormField::Name,
         }
     }
 
     pub(crate) fn prev(self) -> Self {
         match self {
-            ActionFormField::Name => ActionFormField::Args,
-            ActionFormField::Command => ActionFormField::Name,
+            ActionFormField::Name => ActionFormField::Slot,
+            ActionFormField::Kind => ActionFormField::Name,
+            ActionFormField::Command => ActionFormField::Kind,
             ActionFormField::Args => ActionFormField::Command,
+            ActionFormField::Slot => ActionFormField::Args,
         }
     }
 }
 
 /// The Manage Custom Actions popup's state (`docs/features/
-/// tui-custom-actions.md` §2.3/§3.2). `adding` doubles as "add" and "edit"
+/// tui-custom-actions.md` §2.3/§3.2, extended by `tui-custom-actions-edge-
+/// slots.md` §2.3, T47). `adding` doubles as "add" and "edit"
 /// mode (mirrors `WorktreesPopupState::adding`) -- `editing_index:
 /// Some(i)` means the form was opened via `Enter` on `actions[i]` and
 /// `Enter` in the form overwrites that index instead of pushing a new
@@ -929,12 +963,19 @@ pub(crate) struct ManageActionsPopupState {
     pub(crate) editing_index: Option<usize>,
     pub(crate) add_field: ActionFormField,
     pub(crate) new_name: String,
+    /// `External`: the program name. `Builtin`: the typed `Command::id`
+    /// (case-sensitive exact match, validated at confirm time) -- one
+    /// field reused for both, since exactly one is ever meaningful at a
+    /// time depending on `form_kind`.
     pub(crate) new_command: String,
     /// Raw typed text, space-separated -- split into `Vec<String>` only in
     /// `confirm_action_form`, the same one-parse-site discipline
     /// `confirm_debug_adapter_config`'s `args: String` field already
-    /// establishes.
+    /// establishes. Ignored (not cleared, not validated) when `form_kind
+    /// == Builtin`.
     pub(crate) new_args: String,
+    pub(crate) form_kind: FormKind,
+    pub(crate) form_slot: crate::custom_actions::ActionSlot,
 }
 
 pub struct App {
@@ -6422,6 +6463,21 @@ impl App {
                 return;
             }
         }
+        // `Top`/`Outline`-slot custom actions (`docs/features/
+        // tui-custom-actions-edge-slots.md` §3.1, T47) -- mouse-click-only,
+        // same shared dispatch every other slot's "run the thing" path uses.
+        for (rect, action) in &hits.top_action_hits {
+            if rect.contains(point.into()) {
+                self.run_custom_action(action.clone());
+                return;
+            }
+        }
+        for (rect, action) in &hits.outline_action_hits {
+            if rect.contains(point.into()) {
+                self.run_custom_action(action.clone());
+                return;
+            }
+        }
         if let Some(area) = hits.tree_area {
             if area.contains(point.into()) {
                 let row = (event.row - area.y) as usize;
@@ -6796,6 +6852,7 @@ impl App {
                     LeftDockTab::Todos => {
                         self.handle_todo_panel_key(key);
                     }
+                    LeftDockTab::Actions => self.handle_tree_actions_tab_key(key),
                 }
             }
         }
@@ -8452,30 +8509,74 @@ impl App {
     }
 
     /// `ToggleCustomActionsPanel` command: switches the bottom dock to the
-    /// Custom Actions tab (`docs/features/tui-custom-actions.md` §3.1),
-    /// same shape `toggle_docker_panel`/`toggle_cargo_panel` already use.
+    /// Custom Actions tab, i.e. the `Bottom` slot (`docs/features/
+    /// tui-custom-actions-edge-slots.md` §2.4/§3.1), same shape
+    /// `toggle_docker_panel`/`toggle_cargo_panel` already use.
     fn toggle_custom_actions_panel(&mut self) {
         self.show_bottom_dock_tab(BottomDockTab::CustomActions);
     }
 
-    /// Custom Actions dock tab key handling (`docs/features/
-    /// tui-custom-actions.md` §3.1): `Up`/`Down` move the selection cursor
-    /// (clamped, mirrors `handle_docker_panel_key`'s list navigation);
-    /// `Enter` runs the selected action.
-    fn handle_custom_actions_panel_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => {
-                self.custom_actions.selected = self.custom_actions.selected.saturating_sub(1);
+    /// Resolves `Builtin`/`External` dispatch for one `CustomAction`
+    /// (`docs/features/tui-custom-actions-edge-slots.md` §2.4/§3.2) -- the
+    /// single call every slot's "run the thing" path (keyboard `Enter` and
+    /// mouse click alike) goes through. `Builtin` never reaches `Custom
+    /// ActionsPanel::run`, so it never spawns a subprocess.
+    pub(crate) fn run_custom_action(&mut self, action: crate::custom_actions::CustomAction) {
+        match action.kind {
+            crate::custom_actions::CustomActionKind::Builtin { command_id } => {
+                match commands().iter().find(|c| c.id == command_id) {
+                    Some(cmd) => {
+                        let action = cmd.action;
+                        self.run_action(action);
+                    }
+                    None => {
+                        self.notify(format!("No command with id \"{command_id}\"."));
+                    }
+                }
             }
-            KeyCode::Down => {
-                let len = self.custom_actions.actions.len();
-                self.custom_actions.selected =
-                    (self.custom_actions.selected + 1).min(len.saturating_sub(1));
-            }
-            KeyCode::Enter => {
+            crate::custom_actions::CustomActionKind::External { .. } => {
                 let root = self.project_root.clone();
-                self.custom_actions.run_selected(&root);
+                self.custom_actions.run(&root, action);
             }
+        }
+    }
+
+    /// Keyboard entry point for running `slot`'s currently-selected row
+    /// (`docs/features/tui-custom-actions-edge-slots.md` §2.4). No-op if
+    /// the slot is empty or the cursor is out of range -- both defensive,
+    /// not reachable through normal navigation, which already clamps.
+    fn run_custom_action_in_slot(&mut self, slot: crate::custom_actions::ActionSlot) {
+        let actions = self.custom_actions.actions_for_slot(slot);
+        let Some(action) = actions.into_iter().nth(self.custom_actions.selected(slot)) else {
+            return;
+        };
+        self.run_custom_action(action);
+    }
+
+    /// Custom Actions dock tab key handling -- the `Bottom` slot
+    /// (`docs/features/tui-custom-actions-edge-slots.md` §3.1): `Up`/`Down`
+    /// move that slot's own selection cursor (clamped, mirrors
+    /// `handle_docker_panel_key`'s list navigation); `Enter` runs the
+    /// selected action via the shared `run_custom_action` dispatch.
+    fn handle_custom_actions_panel_key(&mut self, key: KeyEvent) {
+        use crate::custom_actions::ActionSlot;
+        match key.code {
+            KeyCode::Up => self.custom_actions.move_selection(ActionSlot::Bottom, -1),
+            KeyCode::Down => self.custom_actions.move_selection(ActionSlot::Bottom, 1),
+            KeyCode::Enter => self.run_custom_action_in_slot(ActionSlot::Bottom),
+            _ => {}
+        }
+    }
+
+    /// `LeftDockTab::Actions` key handling -- the `Tree` slot
+    /// (`docs/features/tui-custom-actions-edge-slots.md` §3.1), identical
+    /// shape to `handle_custom_actions_panel_key`'s `Bottom` slot.
+    fn handle_tree_actions_tab_key(&mut self, key: KeyEvent) {
+        use crate::custom_actions::ActionSlot;
+        match key.code {
+            KeyCode::Up => self.custom_actions.move_selection(ActionSlot::Tree, -1),
+            KeyCode::Down => self.custom_actions.move_selection(ActionSlot::Tree, 1),
+            KeyCode::Enter => self.run_custom_action_in_slot(ActionSlot::Tree),
             _ => {}
         }
     }
@@ -8511,6 +8612,8 @@ impl App {
                 state.new_name.clear();
                 state.new_command.clear();
                 state.new_args.clear();
+                state.form_kind = FormKind::default();
+                state.form_slot = crate::custom_actions::ActionSlot::default();
             }
             KeyCode::Enter => {
                 let selected = state.selected;
@@ -8520,8 +8623,19 @@ impl App {
                     state.editing_index = Some(selected);
                     state.add_field = ActionFormField::Name;
                     state.new_name = action.name;
-                    state.new_command = action.command;
-                    state.new_args = action.args.join(" ");
+                    state.form_slot = action.slot;
+                    match action.kind {
+                        crate::custom_actions::CustomActionKind::External { command, args } => {
+                            state.form_kind = FormKind::External;
+                            state.new_command = command;
+                            state.new_args = args.join(" ");
+                        }
+                        crate::custom_actions::CustomActionKind::Builtin { command_id } => {
+                            state.form_kind = FormKind::Builtin;
+                            state.new_command = command_id;
+                            state.new_args.clear();
+                        }
+                    }
                 }
             }
             KeyCode::Char('d') => {
@@ -8540,10 +8654,13 @@ impl App {
     }
 
     /// Manage Custom Actions popup, add/edit form mode (`docs/features/
-    /// tui-custom-actions.md` §3.2). `Tab`/`BackTab` cycle the three
-    /// fields, `Backspace`/`Char` edit the focused one, `Esc` discards back
-    /// to list mode, `Enter` confirms. Mirrors
-    /// `handle_git_worktree_add_key`'s exact shape.
+    /// tui-custom-actions.md` §3.2, extended by `tui-custom-actions-edge-
+    /// slots.md` §2.3, T47). `Tab`/`BackTab` cycle the five fields;
+    /// `Backspace`/`Char` edit the focused text field and no-op on `Kind`/
+    /// `Slot`; `Space` on `Kind` toggles `form_kind`, on `Slot` cycles
+    /// `form_slot` (`ActionSlot::next()`); `Esc` discards back to list
+    /// mode; `Enter` confirms. Mirrors `handle_git_worktree_add_key`'s
+    /// exact shape.
     fn handle_action_form_key(&mut self, key: KeyEvent) -> LoopSignal {
         let Some(state) = self.manage_actions_popup.as_mut() else {
             return LoopSignal::Continue;
@@ -8559,21 +8676,33 @@ impl App {
             KeyCode::Tab => state.add_field = state.add_field.next(),
             KeyCode::BackTab => state.add_field = state.add_field.prev(),
             KeyCode::Enter => self.confirm_action_form(),
+            KeyCode::Char(' ') if state.add_field == ActionFormField::Kind => {
+                state.form_kind = state.form_kind.toggle();
+            }
+            KeyCode::Char(' ') if state.add_field == ActionFormField::Slot => {
+                state.form_slot = state.form_slot.next();
+            }
             KeyCode::Backspace => {
-                let field = match state.add_field {
-                    ActionFormField::Name => &mut state.new_name,
-                    ActionFormField::Command => &mut state.new_command,
-                    ActionFormField::Args => &mut state.new_args,
+                match state.add_field {
+                    ActionFormField::Name => {
+                        state.new_name.pop();
+                    }
+                    ActionFormField::Command => {
+                        state.new_command.pop();
+                    }
+                    ActionFormField::Args => {
+                        state.new_args.pop();
+                    }
+                    ActionFormField::Kind | ActionFormField::Slot => {}
                 };
-                field.pop();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let field = match state.add_field {
-                    ActionFormField::Name => &mut state.new_name,
-                    ActionFormField::Command => &mut state.new_command,
-                    ActionFormField::Args => &mut state.new_args,
+                match state.add_field {
+                    ActionFormField::Name => state.new_name.push(c),
+                    ActionFormField::Command => state.new_command.push(c),
+                    ActionFormField::Args => state.new_args.push(c),
+                    ActionFormField::Kind | ActionFormField::Slot => {}
                 };
-                field.push(c);
             }
             _ => {}
         }
@@ -8581,37 +8710,55 @@ impl App {
     }
 
     /// Validates and saves the Manage Custom Actions add/edit form
-    /// (`docs/features/tui-custom-actions.md` §3.2): trims `name`/
-    /// `command`, rejecting (via `notify`, form stays open) if either is
-    /// empty; splits `args` on whitespace. `editing_index: Some(i)`
-    /// overwrites `actions[i]` in place (guaranteed in-bounds -- see
-    /// `ManageActionsPopupState`'s own doc comment); `None` pushes a new
-    /// entry. Persists to `.ide/custom_actions.json` on success.
+    /// (`docs/features/tui-custom-actions.md` §3.2, extended by
+    /// `tui-custom-actions-edge-slots.md` §3.3): trims `name`, rejecting
+    /// (via `notify`, form stays open) if empty. `External`: trims
+    /// `command`, rejecting if empty, splits `args` on whitespace.
+    /// `Builtin`: trims `new_command` as the typed `Command::id`,
+    /// rejecting if empty or if no command in `commands()` has that
+    /// exact id. `editing_index: Some(i)` overwrites `actions[i]` in place
+    /// (guaranteed in-bounds -- see `ManageActionsPopupState`'s own doc
+    /// comment); `None` pushes a new entry. Persists to
+    /// `.ide/custom_actions.json` on success.
     fn confirm_action_form(&mut self) {
         let Some(state) = self.manage_actions_popup.as_ref() else {
             return;
         };
         let name = state.new_name.trim().to_string();
-        let command = state.new_command.trim().to_string();
         if name.is_empty() {
             self.notify("Custom action name cannot be empty.");
             return;
         }
-        if command.is_empty() {
-            self.notify("Custom action command cannot be empty.");
-            return;
-        }
-        let args: Vec<String> = state
-            .new_args
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
-        let editing_index = state.editing_index;
-        let action = crate::custom_actions::CustomAction {
-            name,
-            command,
-            args,
+        let slot = state.form_slot;
+        let kind = match state.form_kind {
+            FormKind::External => {
+                let command = state.new_command.trim().to_string();
+                if command.is_empty() {
+                    self.notify("Custom action command cannot be empty.");
+                    return;
+                }
+                let args: Vec<String> = state
+                    .new_args
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect();
+                crate::custom_actions::CustomActionKind::External { command, args }
+            }
+            FormKind::Builtin => {
+                let command_id = state.new_command.trim().to_string();
+                if command_id.is_empty() {
+                    self.notify("Custom action command cannot be empty.");
+                    return;
+                }
+                if !commands().iter().any(|c| c.id == command_id) {
+                    self.notify(format!("No command with id \"{command_id}\"."));
+                    return;
+                }
+                crate::custom_actions::CustomActionKind::Builtin { command_id }
+            }
         };
+        let editing_index = state.editing_index;
+        let action = crate::custom_actions::CustomAction { name, slot, kind };
         match editing_index {
             Some(idx) => self.custom_actions.actions[idx] = action,
             None => self.custom_actions.actions.push(action),
@@ -14446,6 +14593,8 @@ mod tests {
             )],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
@@ -14626,6 +14775,8 @@ mod tests {
             )],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
 
         app.handle_mouse(
@@ -14655,6 +14806,8 @@ mod tests {
                 LeftDockTab::Todos,
             )],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
 
         app.handle_mouse(
@@ -14687,6 +14840,8 @@ mod tests {
                 },
                 BottomDockTab::Cargo,
             )],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
 
         app.handle_mouse(
@@ -14720,6 +14875,8 @@ mod tests {
             )],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
 
         app.handle_mouse(
@@ -17931,13 +18088,23 @@ mod tests {
     }
 
     #[test]
-    fn action_form_field_next_and_prev_cycle_through_all_three_fields() {
-        assert_eq!(ActionFormField::Name.next(), ActionFormField::Command);
+    fn action_form_field_next_and_prev_cycle_through_all_five_fields() {
+        assert_eq!(ActionFormField::Name.next(), ActionFormField::Kind);
+        assert_eq!(ActionFormField::Kind.next(), ActionFormField::Command);
         assert_eq!(ActionFormField::Command.next(), ActionFormField::Args);
-        assert_eq!(ActionFormField::Args.next(), ActionFormField::Name);
-        assert_eq!(ActionFormField::Name.prev(), ActionFormField::Args);
-        assert_eq!(ActionFormField::Command.prev(), ActionFormField::Name);
+        assert_eq!(ActionFormField::Args.next(), ActionFormField::Slot);
+        assert_eq!(ActionFormField::Slot.next(), ActionFormField::Name);
+        assert_eq!(ActionFormField::Name.prev(), ActionFormField::Slot);
+        assert_eq!(ActionFormField::Kind.prev(), ActionFormField::Name);
+        assert_eq!(ActionFormField::Command.prev(), ActionFormField::Kind);
         assert_eq!(ActionFormField::Args.prev(), ActionFormField::Command);
+        assert_eq!(ActionFormField::Slot.prev(), ActionFormField::Args);
+    }
+
+    #[test]
+    fn form_kind_toggle_flips_between_external_and_builtin() {
+        assert_eq!(FormKind::External.toggle(), FormKind::Builtin);
+        assert_eq!(FormKind::Builtin.toggle(), FormKind::External);
     }
 
     #[test]
@@ -17980,19 +18147,26 @@ mod tests {
         app.handle_key(plain_key(KeyCode::Char('n')));
         assert!(app.manage_actions_popup.as_ref().unwrap().adding);
         type_str(&mut app, "Run tests");
-        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind (left External, default)
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Command
         type_str(&mut app, "cargo");
-        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Args
         type_str(&mut app, "test --workspace");
         app.handle_key(plain_key(KeyCode::Enter));
 
         assert!(!app.manage_actions_popup.as_ref().unwrap().adding);
         assert_eq!(app.custom_actions.actions.len(), 1);
         assert_eq!(app.custom_actions.actions[0].name, "Run tests");
-        assert_eq!(app.custom_actions.actions[0].command, "cargo");
         assert_eq!(
-            app.custom_actions.actions[0].args,
-            vec!["test".to_string(), "--workspace".to_string()]
+            app.custom_actions.actions[0].slot,
+            crate::custom_actions::ActionSlot::Bottom
+        );
+        assert_eq!(
+            app.custom_actions.actions[0].kind,
+            crate::custom_actions::CustomActionKind::External {
+                command: "cargo".to_string(),
+                args: vec!["test".to_string(), "--workspace".to_string()],
+            }
         );
 
         let reloaded = crate::custom_actions::load(dir.path());
@@ -18004,8 +18178,10 @@ mod tests {
         assert!(state.adding);
         assert_eq!(state.editing_index, Some(0));
         assert_eq!(state.new_name, "Run tests");
+        assert_eq!(state.form_kind, FormKind::External);
         assert_eq!(state.new_command, "cargo");
         assert_eq!(state.new_args, "test --workspace");
+        assert_eq!(state.form_slot, crate::custom_actions::ActionSlot::Bottom);
 
         // Overwrite the name, keep the rest, save.
         for _ in 0.."Run tests".len() {
@@ -18041,7 +18217,8 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ManageCustomActions);
         app.handle_key(plain_key(KeyCode::Char('n')));
-        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Command
         type_str(&mut app, "cargo");
         app.handle_key(plain_key(KeyCode::Enter));
 
@@ -18060,6 +18237,122 @@ mod tests {
 
         assert!(app.manage_actions_popup.as_ref().unwrap().adding);
         assert!(app.custom_actions.actions.is_empty());
+    }
+
+    #[test]
+    fn confirm_action_form_space_on_kind_field_is_a_noop_not_text() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().add_field,
+            ActionFormField::Kind
+        );
+        app.handle_key(plain_key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().form_kind,
+            FormKind::Builtin
+        );
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().form_kind,
+            FormKind::Builtin
+        );
+    }
+
+    #[test]
+    fn confirm_action_form_space_on_slot_field_cycles_form_slot() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        for _ in 0..4 {
+            app.handle_key(plain_key(KeyCode::Tab)); // Name->Kind->Command->Args->Slot
+        }
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().add_field,
+            ActionFormField::Slot
+        );
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().form_slot,
+            crate::custom_actions::ActionSlot::Bottom
+        );
+        app.handle_key(plain_key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().form_slot,
+            crate::custom_actions::ActionSlot::Top
+        );
+    }
+
+    #[test]
+    fn confirm_action_form_builtin_with_unknown_command_id_notifies_and_keeps_form_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        type_str(&mut app, "Bad binding");
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind
+        app.handle_key(plain_key(KeyCode::Char(' '))); // -> Builtin
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Command
+        type_str(&mut app, "NotARealCommandId");
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.manage_actions_popup.as_ref().unwrap().adding);
+        assert!(app.custom_actions.actions.is_empty());
+    }
+
+    #[test]
+    fn confirm_action_form_builtin_with_a_real_command_id_saves_and_runs_via_run_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        type_str(&mut app, "Toggle notifications");
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind
+        app.handle_key(plain_key(KeyCode::Char(' '))); // -> Builtin
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Command
+        type_str(&mut app, "ToggleNotifications");
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.custom_actions.actions.len(), 1);
+        assert_eq!(
+            app.custom_actions.actions[0].kind,
+            crate::custom_actions::CustomActionKind::Builtin {
+                command_id: "ToggleNotifications".to_string(),
+            }
+        );
+
+        let action = app.custom_actions.actions[0].clone();
+        let before = app.notifications_open;
+        app.run_custom_action(action);
+        assert_eq!(app.notifications_open, !before);
+        // Never touches the External-only subprocess state.
+        assert!(app.custom_actions.running.is_none());
+    }
+
+    #[test]
+    fn run_custom_action_on_a_removed_builtin_id_notifies_without_panicking() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let action = crate::custom_actions::CustomAction {
+            name: "Stale".to_string(),
+            slot: crate::custom_actions::ActionSlot::Bottom,
+            kind: crate::custom_actions::CustomActionKind::Builtin {
+                command_id: "NoLongerRegistered".to_string(),
+            },
+        };
+        app.run_custom_action(action);
+        assert!(app.custom_actions.running.is_none());
+    }
+
+    #[test]
+    fn run_custom_action_in_slot_is_a_noop_when_the_slot_is_empty() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_custom_action_in_slot(crate::custom_actions::ActionSlot::Tree);
+        assert!(app.custom_actions.running.is_none());
     }
 
     #[test]
@@ -19398,7 +19691,7 @@ mod tests {
     // -- T33: TUI Tool Window Docking (`tui-tool-window-docking.md`) --
 
     #[test]
-    fn handle_left_dock_key_tab_and_backtab_cycle_files_and_todos() {
+    fn handle_left_dock_key_tab_and_backtab_cycle_files_todos_and_actions() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         // `left_dock` starts open on `Files`, focused, by default.
@@ -19408,10 +19701,13 @@ mod tests {
         assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Todos);
 
         app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Actions);
+
+        app.handle_key(plain_key(KeyCode::Tab));
         assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Files);
 
         app.handle_key(plain_key(KeyCode::BackTab));
-        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Todos);
+        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Actions);
     }
 
     #[test]
@@ -19784,6 +20080,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -19828,6 +20126,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
@@ -19852,6 +20152,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -19880,6 +20182,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         // Column 15 is well within the 20-wide hit-test area but past
         // "ab"'s own 2 characters -- must clamp to line end, not no-op.
@@ -19910,6 +20214,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5),
@@ -19933,6 +20239,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
@@ -19957,6 +20265,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert!(app.active_buffer().is_none());
@@ -19978,6 +20288,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -20180,6 +20492,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -20205,6 +20519,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 4),
@@ -20234,6 +20550,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
@@ -20376,6 +20694,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
@@ -20404,6 +20724,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
@@ -20433,6 +20755,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane, 1),
@@ -20618,6 +20942,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -20663,6 +20989,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
 
@@ -20689,6 +21017,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 1);
@@ -20713,6 +21043,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 1, 1), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 0);
@@ -20752,6 +21084,8 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
         };
         for _ in 0..10 {
             app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);
