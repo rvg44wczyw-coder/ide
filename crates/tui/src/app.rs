@@ -6853,6 +6853,65 @@ impl App {
         direction: KeyCode,
     ) {
         let synthetic = KeyEvent::new(direction, KeyModifiers::NONE);
+        let point: (u16, u16) = (event.column, event.row);
+        // The full Git screen (`docs/features/tui-panel-pane-scroll.md`
+        // §3.1, T53): its Log/Changes views render up to three
+        // simultaneously-visible sub-panes, but `any_popup_open()` below
+        // folds `active_screen == AppScreen::Git` in unconditionally and
+        // would otherwise route every wheel event through a synthetic key
+        // keyed off `state.focus`/`state.changes_focus` -- moving whichever
+        // pane last had keyboard focus, not the one under the cursor. Try
+        // position-based dispatch first; a popup (branches/worktrees) is
+        // still routed through the generic path below, since those draw
+        // over this content and `handle_git_panel_key`'s priority chain
+        // already handles them correctly.
+        if self.active_screen == AppScreen::Git
+            && !self.git.branches_popup.open
+            && !self.git.worktrees_popup.open
+        {
+            if let Some(state) = self.git_panel.as_ref() {
+                match state.view {
+                    GitPanelView::Log => {
+                        if hits.git_diff_area.is_some_and(|r| r.contains(point.into())) {
+                            self.scroll_git_log_pane(GitPanelFocus::Diff, direction);
+                            return;
+                        }
+                        if hits
+                            .git_conflicts_area
+                            .is_some_and(|r| r.contains(point.into()))
+                        {
+                            self.scroll_git_log_pane(GitPanelFocus::Conflicts, direction);
+                            return;
+                        }
+                        if hits
+                            .git_graph_area
+                            .is_some_and(|r| r.contains(point.into()))
+                        {
+                            self.scroll_git_log_pane(GitPanelFocus::Graph, direction);
+                            return;
+                        }
+                    }
+                    GitPanelView::Changes => {
+                        if self.git.pending_discard.is_none() {
+                            if hits
+                                .git_staged_area
+                                .is_some_and(|r| r.contains(point.into()))
+                            {
+                                self.scroll_git_changes_pane(ChangesFocus::Staged, direction);
+                                return;
+                            }
+                            if hits
+                                .git_unstaged_area
+                                .is_some_and(|r| r.contains(point.into()))
+                            {
+                                self.scroll_git_changes_pane(ChangesFocus::Unstaged, direction);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if self.any_popup_open() {
             self.handle_key(synthetic);
             return;
@@ -6877,7 +6936,6 @@ impl App {
             self.handle_key(synthetic);
             return;
         }
-        let point: (u16, u16) = (event.column, event.row);
         if hits.tree_area.is_some_and(|r| r.contains(point.into())) {
             self.handle_tree_key(synthetic);
             return;
@@ -6894,6 +6952,53 @@ impl App {
             self.handle_left_dock_key(synthetic);
             return;
         }
+        // The bottom dock's Git Log tab reuses `render_git_log_view`
+        // verbatim, so it populates the same `git_diff_area`/`git_graph_
+        // area` fields checked above for the full Git screen -- but this
+        // point is only reachable when `active_screen != AppScreen::Git`
+        // (that case already returned above), so these can only be
+        // populated here by the dock tab, dispatched against `git_log_
+        // dock`'s own fields instead of `git_panel`'s (`tui-panel-pane-
+        // scroll.md` §3.2, T53). Checked before the generic `bottom_dock_
+        // body` below since they're a more specific sub-region of it.
+        // `Conflicts` is deliberately not handled here -- `GitLogDockState`
+        // has no `conflicts_selected` field for it to scroll.
+        if hits.git_diff_area.is_some_and(|r| r.contains(point.into())) {
+            self.git_log_dock.diff_scroll = match direction {
+                KeyCode::Up => self.git_log_dock.diff_scroll.saturating_sub(1),
+                _ => self.git_log_dock.diff_scroll.saturating_add(1),
+            };
+            return;
+        }
+        if hits
+            .git_graph_area
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            match direction {
+                KeyCode::Up => {
+                    self.git_log_dock.graph_selected =
+                        self.git_log_dock.graph_selected.saturating_sub(1);
+                }
+                _ => {
+                    if self.git_log_dock.graph_selected + 1 < self.git.graph.len() {
+                        self.git_log_dock.graph_selected += 1;
+                    }
+                }
+            }
+            return;
+        }
+        // The bottom dock's other two-pane tabs (Docker/Kubernetes/Custom
+        // Actions) -- one generic field for whichever tab's "secondary"
+        // (logs/output) pane is on screen (`tui-panel-pane-scroll.md`
+        // §3.2, T53), checked before `bottom_dock_body` for the same
+        // more-specific-first reason as `git_diff_area` above.
+        if hits
+            .dock_secondary_area
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            self.scroll_dock_secondary_pane(direction);
+            return;
+        }
         if hits
             .bottom_dock_body
             .is_some_and(|r| r.contains(point.into()))
@@ -6906,6 +7011,115 @@ impl App {
             .is_some_and(|r| r.contains(point.into()))
         {
             self.scroll_editor_view(direction);
+        }
+    }
+
+    /// Wheel-scroll for the full Git screen's Log view, dispatched by
+    /// mouse position rather than `state.focus` (`docs/features/
+    /// tui-panel-pane-scroll.md` §3.1, T53) -- mutates only the targeted
+    /// pane's own field, never `state.focus` itself, matching the "wheel
+    /// scroll never changes focus" rule `tui-mouse-support.md` §3.3
+    /// established. Clamping mirrors `handle_git_log_key`'s existing
+    /// `Up`/`Down` arms exactly, just parameterized by `pane` instead of
+    /// reading `state.focus`.
+    fn scroll_git_log_pane(&mut self, pane: GitPanelFocus, direction: KeyCode) {
+        let graph_len = self.git.graph.len();
+        let conflicts_len = self.git.conflicts.len();
+        let Some(state) = self.git_panel.as_mut() else {
+            return;
+        };
+        match pane {
+            GitPanelFocus::Graph => match direction {
+                KeyCode::Up => state.graph_selected = state.graph_selected.saturating_sub(1),
+                _ => {
+                    if state.graph_selected + 1 < graph_len {
+                        state.graph_selected += 1;
+                    }
+                }
+            },
+            GitPanelFocus::Conflicts => match direction {
+                KeyCode::Up => {
+                    state.conflicts_selected = state.conflicts_selected.saturating_sub(1)
+                }
+                _ => {
+                    if state.conflicts_selected + 1 < conflicts_len {
+                        state.conflicts_selected += 1;
+                    }
+                }
+            },
+            GitPanelFocus::Diff => match direction {
+                KeyCode::Up => state.diff_scroll = state.diff_scroll.saturating_sub(1),
+                _ => state.diff_scroll = state.diff_scroll.saturating_add(1),
+            },
+            GitPanelFocus::Filter => {}
+        }
+    }
+
+    /// Mirrors `scroll_git_log_pane` for the Changes view's Staged/
+    /// Unstaged lists (`tui-panel-pane-scroll.md` §3.1, T53), clamping
+    /// exactly like `handle_git_changes_key`'s existing `Up`/`Down` arms.
+    fn scroll_git_changes_pane(&mut self, pane: ChangesFocus, direction: KeyCode) {
+        let staged_len = self.git.status.staged.len();
+        let unstaged_len = self.git.status.unstaged.len();
+        let Some(state) = self.git_panel.as_mut() else {
+            return;
+        };
+        match pane {
+            ChangesFocus::Staged => match direction {
+                KeyCode::Up => state.staged_selected = state.staged_selected.saturating_sub(1),
+                _ => {
+                    if state.staged_selected + 1 < staged_len {
+                        state.staged_selected += 1;
+                    }
+                }
+            },
+            ChangesFocus::Unstaged => match direction {
+                KeyCode::Up => state.unstaged_selected = state.unstaged_selected.saturating_sub(1),
+                _ => {
+                    if state.unstaged_selected + 1 < unstaged_len {
+                        state.unstaged_selected += 1;
+                    }
+                }
+            },
+            ChangesFocus::Message => {}
+        }
+    }
+
+    /// Wheel-scroll for the bottom dock's "secondary" pane -- Docker/
+    /// Kubernetes' logs column, Custom Actions' output row -- dispatched
+    /// by which tab is currently active (`tui-panel-pane-scroll.md` §3.2,
+    /// T53). A no-op for tabs with no secondary-pane scroll state
+    /// (`Ai`/`Cargo`/`Problems`/`GitLog` -- the latter two are handled
+    /// elsewhere: `Problems` has no scrollable secondary pane at all, and
+    /// `GitLog` is dispatched via `git_diff_area` in `handle_mouse_scroll`
+    /// directly, not through this generic field).
+    fn scroll_dock_secondary_pane(&mut self, direction: KeyCode) {
+        let Some(dock) = self.bottom_dock.as_ref() else {
+            return;
+        };
+        match dock.tab {
+            BottomDockTab::Docker => {
+                self.docker.logs_scroll = match direction {
+                    KeyCode::Up => self.docker.logs_scroll.saturating_sub(1),
+                    _ => self.docker.logs_scroll.saturating_add(1),
+                };
+            }
+            BottomDockTab::Kubernetes => {
+                self.k8s.output_scroll = match direction {
+                    KeyCode::Up => self.k8s.output_scroll.saturating_sub(1),
+                    _ => self.k8s.output_scroll.saturating_add(1),
+                };
+            }
+            BottomDockTab::CustomActions => {
+                self.custom_actions.output_scroll = match direction {
+                    KeyCode::Up => self.custom_actions.output_scroll.saturating_sub(1),
+                    _ => self.custom_actions.output_scroll.saturating_add(1),
+                };
+            }
+            BottomDockTab::Ai
+            | BottomDockTab::Cargo
+            | BottomDockTab::Problems
+            | BottomDockTab::GitLog => {}
         }
     }
 
@@ -14954,6 +15168,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
@@ -15140,6 +15355,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15175,6 +15391,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15213,6 +15430,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15259,6 +15477,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         assert!(!app.notifications_open);
         app.handle_mouse(
@@ -15290,6 +15509,7 @@ mod tests {
             }),
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 71, 24),
@@ -15327,6 +15547,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15380,6 +15601,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15422,6 +15644,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15467,6 +15690,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15506,6 +15730,7 @@ mod tests {
                 height: 10,
             }),
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15540,6 +15765,7 @@ mod tests {
                 width: 40,
                 height: 10,
             }),
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15575,6 +15801,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: Some(area),
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -15638,6 +15865,7 @@ mod tests {
                 height: 10,
             }),
             bottom_dock_body: None,
+            ..Default::default()
         };
 
         assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 0);
@@ -15669,6 +15897,7 @@ mod tests {
                 width: 40,
                 height: 10,
             }),
+            ..Default::default()
         };
 
         assert_eq!(app.docker.selected, 0);
@@ -15740,6 +15969,7 @@ mod tests {
                 width: 40,
                 height: 10,
             }),
+            ..Default::default()
         };
 
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 22), &hits);
@@ -21034,6 +21264,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -21084,6 +21315,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
@@ -21114,6 +21346,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         // Column 2 into the text, past the line-number lane (T50) -- no
         // blame/git-gutter lane here, so `editor_lane_width()` is exactly
@@ -21152,6 +21385,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         // Column 15 is well within the 20-wide hit-test area but past
         // "ab"'s own 2 characters -- must clamp to line end, not no-op.
@@ -21188,6 +21422,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5),
@@ -21217,6 +21452,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
@@ -21247,6 +21483,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert!(app.active_buffer().is_none());
@@ -21274,6 +21511,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -21482,6 +21720,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -21513,6 +21752,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 4),
@@ -21551,6 +21791,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
@@ -21929,6 +22170,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
@@ -21963,6 +22205,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
@@ -21998,6 +22241,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane, 1),
@@ -22189,6 +22433,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -22240,6 +22485,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
 
@@ -22272,6 +22518,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 1);
@@ -22302,9 +22549,235 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 1, 1), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_diff_pane_moves_diff_scroll_regardless_of_focus() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "b.txt", "more", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().focus,
+            GitPanelFocus::Graph,
+            "default focus is Graph"
+        );
+        let rect = Rect {
+            x: 10,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_diff_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 15, 5), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().diff_scroll, 1);
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().focus,
+            GitPanelFocus::Graph,
+            "wheel scroll must never change focus"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_graph_pane_moves_graph_selected_regardless_of_focus() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "b.txt", "more", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        assert_eq!(app.git.graph.len(), 2);
+        app.git_panel.as_mut().unwrap().focus = GitPanelFocus::Diff;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_graph_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().graph_selected, 1);
+        assert_eq!(app.git_panel.as_ref().unwrap().focus, GitPanelFocus::Diff);
+
+        // Clamped at the last row.
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().graph_selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_conflicts_pane_moves_conflicts_selected() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        app.git.conflicts = vec![
+            std::path::PathBuf::from("a.txt"),
+            std::path::PathBuf::from("b.txt"),
+        ];
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 5,
+        };
+        let hits = ui::HitMap {
+            git_conflicts_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 2), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().conflicts_selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_changes_staged_and_unstaged_panes_are_independent() {
+        let dir = sample_git_project();
+        fs::write(dir.path().join("a.txt"), "hello\nworld2").unwrap();
+        fs::write(dir.path().join("b.txt"), "new").unwrap();
+        fs::write(dir.path().join("c.txt"), "new2").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.git.sync_status();
+        app.git.stage(std::path::Path::new("c.txt")).unwrap();
+        app.git.sync_status();
+        assert_eq!(app.git.status.unstaged.len(), 2);
+        assert_eq!(app.git.status.staged.len(), 1);
+
+        app.go_to_git_screen();
+        app.git_panel.as_mut().unwrap().view = GitPanelView::Changes;
+
+        let staged_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 5,
+        };
+        let unstaged_rect = Rect {
+            x: 0,
+            y: 10,
+            width: 20,
+            height: 5,
+        };
+        let hits = ui::HitMap {
+            git_staged_area: Some(staged_rect),
+            git_unstaged_area: Some(unstaged_rect),
+            ..Default::default()
+        };
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 11), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().unstaged_selected, 1);
+        assert_eq!(app.git_panel.as_ref().unwrap().staged_selected, 0);
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 1), &hits);
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().staged_selected,
+            0,
+            "staged has only one entry, so this is clamped, not moved"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_screen_falls_back_to_focus_based_scroll_while_a_popup_is_open() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        app.git.branches_popup.open = true;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_diff_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().diff_scroll,
+            0,
+            "a real popup must still take priority over position-based dispatch"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_log_dock_diff_pane_moves_git_log_dock_diff_scroll() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::GitLog);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_diff_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.git_log_dock.diff_scroll, 1);
+        assert!(
+            app.git_panel.is_none(),
+            "the full Git screen's own state must be untouched"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_log_dock_graph_pane_moves_git_log_dock_graph_selected() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "b.txt", "more", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::GitLog);
+        assert_eq!(app.git.graph.len(), 2);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_graph_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.git_log_dock.graph_selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_dock_secondary_pane_dispatches_by_active_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            dock_secondary_area: Some(rect),
+            ..Default::default()
+        };
+
+        app.show_bottom_dock_tab(BottomDockTab::Docker);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.docker.logs_scroll, 1);
+
+        app.show_bottom_dock_tab(BottomDockTab::Kubernetes);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.k8s.output_scroll, 1);
+
+        app.show_bottom_dock_tab(BottomDockTab::CustomActions);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.custom_actions.output_scroll, 1);
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.custom_actions.output_scroll, 0);
     }
 
     #[test]
@@ -22380,6 +22853,7 @@ mod tests {
             ribbon_add_hit: None,
             left_dock_body: None,
             bottom_dock_body: None,
+            ..Default::default()
         };
         for _ in 0..10 {
             app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);

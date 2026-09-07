@@ -107,6 +107,11 @@ pub(crate) struct DockerPanel {
     once_rx: Option<Receiver<(Vec<String>, bool)>>,
     pub(crate) logs: Vec<String>,
     pub(crate) logs_for: Option<String>,
+    /// Lines scrolled back from the live tail of `logs` (`docs/features/
+    /// tui-panel-pane-scroll.md` §2.2, T53) -- same tail-anchored shape as
+    /// `CargoPanel::output_scroll`, reset to `0` by `fetch_logs` the same
+    /// way `CargoPanel::run` resets its own.
+    pub(crate) logs_scroll: u16,
     pub(crate) error: Option<String>,
     pub(crate) confirm: Option<DockerConfirm>,
 }
@@ -147,6 +152,7 @@ impl DockerPanel {
         }
         self.in_flight = Some(InFlight::Logs);
         self.logs.clear();
+        self.logs_scroll = 0;
         self.logs_for = Some(container_id.to_string());
         let args = vec![
             "logs".to_string(),
@@ -446,6 +452,16 @@ mod tests {
         });
         assert_eq!(panel.logs, vec!["hello-logs".to_string()]);
         assert_eq!(panel.logs_for, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn fetch_logs_resets_logs_scroll_to_zero() {
+        let mut panel = DockerPanel {
+            logs_scroll: 7,
+            ..Default::default()
+        };
+        panel.fetch_logs("abc123");
+        assert_eq!(panel.logs_scroll, 0);
     }
 
     #[test]

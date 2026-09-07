@@ -126,6 +126,35 @@ pub struct HitMap {
     /// Mirrors `left_dock_body` for the bottom dock (`rows[1]` in
     /// `render_bottom_dock`).
     pub bottom_dock_body: Option<Rect>,
+    /// The Git panel's commit graph list, populated by `render_git_left_
+    /// column` whenever the Log view renders -- also reused verbatim by
+    /// the bottom-dock Git Log tab's own graph pane, since both share that
+    /// one render function and only one of the two is ever on screen in a
+    /// given frame (`docs/features/tui-panel-pane-scroll.md` §2.1, T53).
+    pub git_graph_area: Option<Rect>,
+    /// The Git panel's Conflicts list, populated only while `!app.git.
+    /// conflicts.is_empty()` (`tui-panel-pane-scroll.md` §2.1, T53). Not
+    /// reused by the dock's Git Log tab -- `GitLogDockState` has no
+    /// `conflicts_selected` field to scroll, so wheel-scroll over this
+    /// area in that context is deliberately left unhandled.
+    pub git_conflicts_area: Option<Rect>,
+    /// The Git panel's Diff pane, populated only when a diff (not conflict
+    /// resolution) is showing -- reused by the dock's Git Log tab like
+    /// `git_graph_area` (`tui-panel-pane-scroll.md` §2.1, T53).
+    pub git_diff_area: Option<Rect>,
+    /// The Git panel's Changes-view Staged list (`tui-panel-pane-scroll.md`
+    /// §2.1, T53).
+    pub git_staged_area: Option<Rect>,
+    /// The Git panel's Changes-view Unstaged list (`tui-panel-pane-scroll.
+    /// md` §2.1, T53).
+    pub git_unstaged_area: Option<Rect>,
+    /// The bottom dock's "secondary" pane -- Docker/Kubernetes' logs
+    /// column, Custom Actions' output row -- for whichever tab is active
+    /// (`tui-panel-pane-scroll.md` §2.2, T53). One generic field, not one
+    /// per tab, since only one bottom-dock tab is ever rendered at a time;
+    /// dispatch reads `bottom_dock.as_ref().map(|d| d.tab)` to know which
+    /// panel's scroll field to mutate.
+    pub dock_secondary_area: Option<Rect>,
 }
 
 /// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
@@ -192,7 +221,7 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 render_bottom_dock(frame, app, dock, rows2[1], hits);
             }
         }
-        AppScreen::Git => render_git_panel(frame, app, body),
+        AppScreen::Git => render_git_panel(frame, app, body, hits),
         AppScreen::Run => render_cargo_panel(frame, app, body),
         AppScreen::Keys => render_keys_screen(frame, app, body),
     }
@@ -495,11 +524,11 @@ fn render_bottom_dock(
     );
     hits.bottom_dock_body = Some(rows[1]);
     match dock.tab {
-        BottomDockTab::Docker => render_docker_panel(frame, app, rows[1]),
+        BottomDockTab::Docker => render_docker_panel(frame, app, rows[1], hits),
         BottomDockTab::Ai => render_ai_panel(frame, app, rows[1]),
-        BottomDockTab::Kubernetes => render_k8s_panel(frame, app, rows[1]),
+        BottomDockTab::Kubernetes => render_k8s_panel(frame, app, rows[1], hits),
         BottomDockTab::Cargo => render_cargo_panel(frame, app, rows[1]),
-        BottomDockTab::CustomActions => render_custom_actions_panel(frame, app, rows[1]),
+        BottomDockTab::CustomActions => render_custom_actions_panel(frame, app, rows[1], hits),
         BottomDockTab::Problems => {
             render_problems_panel(frame, app, rows[1], dock.problems_selected)
         }
@@ -511,7 +540,7 @@ fn render_bottom_dock(
                 diff_scroll: app.git_log_dock.diff_scroll,
                 ..GitPanelState::default()
             };
-            render_git_log_view(frame, app, &state, rows[1]);
+            render_git_log_view(frame, app, &state, rows[1], hits);
         }
     }
 }
@@ -2430,7 +2459,7 @@ fn render_tree_actions_tab(frame: &mut Frame, app: &App, area: Rect) {
 /// single list, since here the declared-action list and the running
 /// output are two logically distinct things (Cargo only ever has its six
 /// fixed built-in subcommands, never a user-declared list to select from).
-fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     use crate::custom_actions::ActionSlot;
     let theme = app.theme.theme();
     let rows = Layout::default()
@@ -2463,14 +2492,15 @@ fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title("Custom Actions  (Enter: run)");
     render_scrollable_list(frame, items, list_block, rows[0], selected);
+    hits.dock_secondary_area = Some(rows[1]);
 
     let visible_rows = rows[1].height.saturating_sub(2) as usize;
     let output = &app.custom_actions.output;
-    let start = output.len().saturating_sub(visible_rows);
+    let windowed = tail_window(output, visible_rows, app.custom_actions.output_scroll);
     let output_items: Vec<ListItem> = if output.is_empty() {
         vec![ListItem::new(Line::from("No output yet."))]
     } else {
-        output[start..]
+        windowed
             .iter()
             .map(|line| {
                 // `subprocess::run_and_stream`'s two spawn-failure message
@@ -3079,7 +3109,7 @@ fn render_refactor_preview(frame: &mut Frame, app: &App, area: Rect) {
 /// lines -- §1's "no graph line-drawing" scope cut). Right column: either
 /// the three-way conflict-resolution view (while `git.active_conflict`/
 /// `binary_conflict` is `Some`) or the diff pane.
-fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_git_panel(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some(state) = app.git_panel.as_ref() else {
         return;
     };
@@ -3116,8 +3146,8 @@ fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     match state.view {
-        GitPanelView::Log => render_git_log_view(frame, app, state, content_area),
-        GitPanelView::Changes => render_git_changes(frame, app, state, content_area),
+        GitPanelView::Log => render_git_log_view(frame, app, state, content_area, hits),
+        GitPanelView::Changes => render_git_changes(frame, app, state, content_area, hits),
     }
 
     if app.git.branches_popup.open {
@@ -3156,17 +3186,19 @@ fn render_git_log_view(
     app: &App,
     state: &crate::app::GitPanelState,
     area: Rect,
+    hits: &mut HitMap,
 ) {
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    render_git_left_column(frame, app, state, columns[0]);
+    render_git_left_column(frame, app, state, columns[0], hits);
     if app.git.active_conflict.is_some() || app.git.binary_conflict.is_some() {
         render_git_conflict_resolution(frame, app, columns[1]);
     } else {
         render_git_diff(frame, app, state, columns[1]);
+        hits.git_diff_area = Some(columns[1]);
     }
 }
 
@@ -3174,7 +3206,13 @@ fn render_git_log_view(
 /// (`docs/features/tui-git-staging-branches-and-log-filters.md` §2.4,
 /// `git-commit-and-staging.md` §2.3's egui rendering content translated to
 /// plain list rows).
-fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanelState, area: Rect) {
+fn render_git_changes(
+    frame: &mut Frame,
+    app: &App,
+    state: &crate::app::GitPanelState,
+    area: Rect,
+    hits: &mut HitMap,
+) {
     let rows = Layout::default()
         .direction(LayoutDirection::Vertical)
         .constraints([
@@ -3219,6 +3257,7 @@ fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanel
         .borders(Borders::ALL)
         .title(format!("{staged_title}  (Enter: unstage)"));
     render_scrollable_list(frame, staged_items, block, rows[0], state.staged_selected);
+    hits.git_staged_area = Some(rows[0]);
 
     let (unstaged_title, unstaged_items) = status_row(
         "Unstaged",
@@ -3236,6 +3275,7 @@ fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanel
         rows[1],
         state.unstaged_selected,
     );
+    hits.git_unstaged_area = Some(rows[1]);
 
     if let Some(path) = app.git.pending_discard.as_ref() {
         let block = Block::default()
@@ -3709,6 +3749,7 @@ fn render_git_left_column(
     app: &App,
     state: &crate::app::GitPanelState,
     area: Rect,
+    hits: &mut HitMap,
 ) {
     let has_conflicts = !app.git.conflicts.is_empty();
     let rows = if has_conflicts {
@@ -3747,6 +3788,7 @@ fn render_git_left_column(
             .collect();
         let block = Block::default().borders(Borders::ALL).title("Conflicts");
         frame.render_widget(List::new(items).block(block), rows[1]);
+        hits.git_conflicts_area = Some(rows[1]);
         rows[2]
     } else {
         rows[1]
@@ -3779,6 +3821,7 @@ fn render_git_left_column(
         .borders(Borders::ALL)
         .title("Commits  (Tab: switch focus, Enter: view diff)");
     frame.render_widget(List::new(items).block(block), graph_area);
+    hits.git_graph_area = Some(graph_area);
 }
 
 /// Flattens every `FileDiff`'s hunks into styled lines, applying
@@ -3959,12 +4002,13 @@ fn selection_style(is_selected: bool) -> Style {
 /// or images). Right column: the selected container's logs, once fetched,
 /// or the panel's current error. The yes/no lifecycle confirm still renders
 /// as its own small centered modal on top of `area`.
-fn render_docker_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_docker_panel(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let panel = &app.docker;
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
+    hits.dock_secondary_area = Some(columns[1]);
 
     let tab_label = match panel.tab {
         DockerTab::Containers => "Containers",
@@ -4031,8 +4075,9 @@ fn render_docker_panel(frame: &mut Frame, app: &App, area: Rect) {
             columns[1],
         );
     } else {
-        let log_items: Vec<ListItem> = panel
-            .logs
+        let visible_rows = columns[1].height.saturating_sub(2) as usize;
+        let windowed = tail_window(&panel.logs, visible_rows, panel.logs_scroll);
+        let log_items: Vec<ListItem> = windowed
             .iter()
             .map(|line| ListItem::new(Line::from(line.as_str())))
             .collect();
@@ -4077,12 +4122,13 @@ fn render_docker_confirm_popup(
 /// count prompt, and the context/namespace picker each still render as
 /// their own small centered modal on top of `area`, checked in the same
 /// priority order `handle_k8s_panel_key` uses.
-fn render_k8s_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_k8s_panel(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let panel = &app.k8s;
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
+    hits.dock_secondary_area = Some(columns[1]);
 
     let tab_label = match panel.tab {
         K8sTab::Pods => "Pods",
@@ -4174,7 +4220,9 @@ fn render_k8s_panel(frame: &mut Frame, app: &App, area: Rect) {
             columns[1],
         );
     } else {
-        let log_items: Vec<ListItem> = right_lines
+        let visible_rows = columns[1].height.saturating_sub(2) as usize;
+        let windowed = tail_window(right_lines, visible_rows, panel.output_scroll);
+        let log_items: Vec<ListItem> = windowed
             .iter()
             .map(|line| ListItem::new(Line::from(line.as_str())))
             .collect();

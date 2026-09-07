@@ -231,6 +231,13 @@ pub(crate) struct K8sPanel {
     pub(crate) logs_for: Option<String>,
     pub(crate) describe_output: Vec<String>,
     pub(crate) describe_for: Option<String>,
+    /// Lines scrolled back from the live tail of whichever of `logs`/
+    /// `describe_output` is currently shown (`docs/features/
+    /// tui-panel-pane-scroll.md` §2.2, T53) -- one shared field, not two,
+    /// since `render_k8s_panel` only ever shows one of the two at a time
+    /// (mutually exclusive by `logs_for`/`describe_for`); reset to `0` by
+    /// both `fetch_logs` and `fetch_describe`.
+    pub(crate) output_scroll: u16,
     pub(crate) error: Option<String>,
     pub(crate) confirm: Option<K8sConfirm>,
     pub(crate) scale_input: Option<String>,
@@ -320,6 +327,7 @@ impl K8sPanel {
         }
         self.in_flight = Some(InFlight::Logs);
         self.logs.clear();
+        self.output_scroll = 0;
         self.logs_for = Some(pod_name.to_string());
         let mut args = vec![
             "logs".to_string(),
@@ -337,6 +345,7 @@ impl K8sPanel {
         }
         self.in_flight = Some(InFlight::Describe);
         self.describe_output.clear();
+        self.output_scroll = 0;
         self.describe_for = Some(format!("{kind}/{name}"));
         let mut args = vec!["describe".to_string(), format!("{kind}/{name}")];
         args.extend(self.context_namespace_args());
@@ -965,6 +974,26 @@ mod tests {
         });
         assert_eq!(panel.logs, vec!["hello-logs".to_string()]);
         assert_eq!(panel.logs_for, Some("worker-7f9c".to_string()));
+    }
+
+    #[test]
+    fn fetch_logs_resets_output_scroll_to_zero() {
+        let mut panel = K8sPanel {
+            output_scroll: 7,
+            ..Default::default()
+        };
+        panel.fetch_logs("worker-7f9c");
+        assert_eq!(panel.output_scroll, 0);
+    }
+
+    #[test]
+    fn fetch_describe_resets_output_scroll_to_zero() {
+        let mut panel = K8sPanel {
+            output_scroll: 7,
+            ..Default::default()
+        };
+        panel.fetch_describe("pod", "worker-7f9c");
+        assert_eq!(panel.output_scroll, 0);
     }
 
     #[test]

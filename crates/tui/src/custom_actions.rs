@@ -162,6 +162,10 @@ pub(crate) struct CustomActionsPanel {
     /// `CustomAction` holds `String`s).
     pub(crate) running: Option<CustomAction>,
     pub(crate) output: Vec<String>,
+    /// Lines scrolled back from the live tail of `output` (`docs/features/
+    /// tui-panel-pane-scroll.md` §2.2, T53) -- same tail-anchored shape as
+    /// `CargoPanel::output_scroll`, reset to `0` by `run` the same way.
+    pub(crate) output_scroll: u16,
     /// `pub(crate)`, not private, only so `App::new`'s `CustomActionsPanel
     /// { actions: ..., ..Default::default() }` struct-update syntax can see
     /// every field from `app.rs` -- never set directly outside this module.
@@ -214,6 +218,7 @@ impl CustomActionsPanel {
             return;
         };
         self.output.clear();
+        self.output_scroll = 0;
         self.rx = Some(subprocess::spawn_streaming(
             command,
             args,
@@ -344,11 +349,22 @@ mod tests {
             selected: [0; 5],
             running: Some(sample_action("a")),
             output: vec!["existing".to_string()],
+            output_scroll: 0,
             rx: None,
         };
         panel.run(Path::new("."), sample_action("b"));
         assert_eq!(panel.running, Some(sample_action("a")));
         assert_eq!(panel.output, vec!["existing".to_string()]);
+    }
+
+    #[test]
+    fn run_resets_output_scroll_to_zero() {
+        let mut panel = CustomActionsPanel {
+            output_scroll: 7,
+            ..Default::default()
+        };
+        panel.run(Path::new("."), sample_action("a"));
+        assert_eq!(panel.output_scroll, 0);
     }
 
     #[test]
