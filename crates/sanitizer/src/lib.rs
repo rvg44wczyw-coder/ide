@@ -124,6 +124,15 @@ pub fn as_map(s: &Sanitizer) -> HashMap<String, String> {
 /// format the sanitizer itself mints) -- never arbitrary substrings, so
 /// this never writes anything into files besides the restored text.
 pub fn restore_originals(masked: &str, map: &HashMap<String, String>) -> String {
+    // Iteration order over `map` is unspecified (`HashMap`). That's only
+    // safe because no placeholder's `original` text ever contains another
+    // placeholder's literal `__IDE_SAN_n__` string -- true as long as
+    // `mask_secrets_with_threshold`'s `known` patterns stay ordered
+    // coarsest-shape-first (see that function's own comment), so a
+    // narrower shape never gets masked *after* it's already nested inside
+    // a coarser match. If that invariant is ever broken by a future
+    // pattern addition, restoring here would silently depend on which
+    // order the `HashMap` happens to iterate in.
     let mut out = masked.to_string();
     for (placeholder, original) in map {
         out = out.replace(placeholder, original);

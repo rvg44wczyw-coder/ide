@@ -907,7 +907,7 @@ pub fn commands() -> &'static [Command] {
             // Palette-only, same reasoning as `ClaudePanel` immediately
             // above -- no JetBrains-keymap entry covers the hybrid
             // assistant dock tab (`docs/features/tui-ai-hybrid-fallback.md`
-            // §3.5).
+            // §2.4).
             binding: None,
             action: Action::ToggleAiPanel,
         },
