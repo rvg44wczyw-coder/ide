@@ -6543,12 +6543,15 @@ impl App {
         LoopSignal::Continue
     }
 
-    /// Mirrors `handle_key`'s own popup-priority chain above (every branch
-    /// before the `keymap.action_for`/`self.focus` dispatch) -- kept as a
-    /// single source of truth so mouse routing (`docs/features/
-    /// tui-mouse-support.md` §3.2/§3.3) never drifts from which state
-    /// `handle_key` itself currently treats as "a popup is open".
-    fn any_popup_open(&self) -> bool {
+    /// Every condition `any_popup_open` checks *except*
+    /// `active_screen == AppScreen::Git` -- split out so
+    /// `handle_mouse_click` can gate on "is a genuine modal popup open"
+    /// without also treating the Git screen itself as one (`docs/
+    /// features/tui-panel-focus-and-scroll.md` §2.2/§3.1, T51): unlike
+    /// every other member of this OR-chain, the Git screen has its own
+    /// clickable chrome (the screen-tab bar) that must stay reachable by
+    /// mouse even while it's "open".
+    fn any_true_popup_open(&self) -> bool {
         self.palette.is_some()
             || self.colon_command.is_some()
             || self.unified_finder.is_some()
@@ -6572,9 +6575,6 @@ impl App {
             || self.blame_popup.is_some()
             || self.git_gutter_popup_line.is_some()
             || self.gutter_context_menu.is_some()
-            // Gated on `active_screen`, not `git_panel.is_some()` -- see
-            // `handle_key`'s matching check above for why.
-            || self.active_screen == AppScreen::Git
             || self.clone_panel_open
             || self.keymap_popup.is_some()
             || self.theme_popup.is_some()
@@ -6590,6 +6590,18 @@ impl App {
                 && (self.k8s.confirm.is_some()
                     || self.k8s.scale_input.is_some()
                     || self.k8s.picker.is_some()))
+    }
+
+    /// Mirrors `handle_key`'s own popup-priority chain above (every branch
+    /// before the `keymap.action_for`/`self.focus` dispatch) -- kept as a
+    /// single source of truth so mouse routing (`docs/features/
+    /// tui-mouse-support.md` §3.2/§3.3) never drifts from which state
+    /// `handle_key` itself currently treats as "a popup is open". Every
+    /// caller except `handle_mouse_click` wants this exact value,
+    /// Git screen included -- see `any_true_popup_open`'s own doc comment
+    /// for the one caller that doesn't.
+    fn any_popup_open(&self) -> bool {
+        self.any_true_popup_open() || self.active_screen == AppScreen::Git
     }
 
     /// Entry point for every `Event::Mouse` (`docs/features/
@@ -6618,7 +6630,7 @@ impl App {
     /// all input while open, so a click doesn't reach the base view at
     /// all in that case, matching wheel scroll's own popup-priority rule.
     fn handle_mouse_click(&mut self, event: MouseEvent, hits: &crate::ui::HitMap) {
-        if self.any_popup_open() {
+        if self.any_true_popup_open() {
             return;
         }
         let point: (u16, u16) = (event.column, event.row);
@@ -6632,6 +6644,12 @@ impl App {
                 }
                 return;
             }
+        }
+        // No click support inside the Git screen's own body yet (`docs/
+        // features/tui-panel-focus-and-scroll.md` §1/§2.3, T51) -- only
+        // its screen-tab bar, handled above, is clickable while here.
+        if self.active_screen == AppScreen::Git {
+            return;
         }
         for &(rect, tab) in &hits.left_dock_tabs {
             if rect.contains(point.into()) {
@@ -6680,6 +6698,22 @@ impl App {
                 self.tree_state.select(&self.tree, row);
                 self.handle_tree_enter();
                 self.focus = Focus::LeftDock;
+                return;
+            }
+        }
+        // Click-to-focus for dock tabs with no click behaviour of their
+        // own (Todos/Actions; Files is handled above via `tree_area`,
+        // checked first so it still wins for that tab) -- `docs/features/
+        // tui-panel-focus-and-scroll.md` §2.3/§3.2, T51.
+        if let Some(area) = hits.left_dock_body {
+            if area.contains(point.into()) {
+                self.focus = Focus::LeftDock;
+                return;
+            }
+        }
+        if let Some(area) = hits.bottom_dock_body {
+            if area.contains(point.into()) {
+                self.focus = Focus::BottomDock;
                 return;
             }
         }
@@ -6805,6 +6839,25 @@ impl App {
         let point: (u16, u16) = (event.column, event.row);
         if hits.tree_area.is_some_and(|r| r.contains(point.into())) {
             self.handle_tree_key(synthetic);
+            return;
+        }
+        // Dock body content (`docs/features/tui-panel-focus-and-scroll.md`
+        // §2.4/§3.3, T51) -- routes straight into the dock's own key
+        // handler, which already fully delegates `Up`/`Down` to whichever
+        // tab is active, exactly like `tree_area` above does for
+        // `handle_tree_key`.
+        if hits
+            .left_dock_body
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            self.handle_left_dock_key(synthetic);
+            return;
+        }
+        if hits
+            .bottom_dock_body
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            self.handle_bottom_dock_key(synthetic);
             return;
         }
         if hits
@@ -14837,6 +14890,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
@@ -15021,6 +15076,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
 
         app.handle_mouse(
@@ -15054,6 +15111,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
 
         app.handle_mouse(
@@ -15090,6 +15149,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
 
         app.handle_mouse(
@@ -15134,6 +15195,8 @@ mod tests {
                 action,
             )],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         assert!(!app.notifications_open);
         app.handle_mouse(
@@ -15163,6 +15226,8 @@ mod tests {
                 width: 3,
                 height: 1,
             }),
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 71, 24),
@@ -15198,6 +15263,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
 
         app.handle_mouse(
@@ -15207,6 +15274,370 @@ mod tests {
 
         assert_eq!(app.active_screen, AppScreen::Editor);
         assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn any_true_popup_open_excludes_the_git_screen_but_any_popup_open_includes_it() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+
+        assert!(
+            !app.any_true_popup_open(),
+            "the Git screen alone is not a genuine modal popup"
+        );
+        assert!(
+            app.any_popup_open(),
+            "any_popup_open must keep including the Git screen for every other caller"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_screen_tab_switches_away_from_the_git_screen() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                AppScreen::Editor,
+            )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Editor,
+            "clicking a screen tab must work even while already on the Git screen"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_screen_tab_while_on_the_git_screen_is_still_blocked_by_a_real_popup()
+    {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        app.open_palette();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                AppScreen::Editor,
+            )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Git,
+            "a genuine modal popup must still block screen-tab clicks, Git screen or not"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_inside_the_git_screen_body_past_the_tab_bar_is_a_noop() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        let hits = ui::HitMap {
+            tree_area: Some(Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 10,
+            }),
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                AppScreen::Editor,
+            )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            &hits,
+        );
+
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Git,
+            "no click support inside the Git screen's own body yet -- stale tree_area from a\
+             previous frame must not be acted on"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_inside_the_left_dock_body_focuses_the_left_dock() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.left_dock.as_mut().unwrap().tab = LeftDockTab::Todos;
+        app.focus = Focus::Editor;
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: Some(Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 10,
+            }),
+            bottom_dock_body: None,
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            &hits,
+        );
+
+        assert_eq!(app.focus, Focus::LeftDock);
+    }
+
+    #[test]
+    fn handle_mouse_click_inside_the_bottom_dock_body_focuses_the_bottom_dock() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleProblems);
+        app.focus = Focus::Editor;
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 22),
+            &hits,
+        );
+
+        assert_eq!(app.focus, Focus::BottomDock);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_tree_row_wins_over_the_left_dock_body_for_the_files_tab() {
+        let (_dir, mut app) = two_file_project();
+        let rows = app.tree_state.visible_rows(&app.tree);
+        assert!(rows.len() >= 2);
+        let target_name = rows[1].path.file_name().unwrap().to_owned();
+        let area = Rect {
+            x: 0,
+            y: 1,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            tree_area: Some(area),
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: Some(area),
+            bottom_dock_body: None,
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
+            &hits,
+        );
+
+        assert_eq!(app.focus, Focus::LeftDock);
+        let selected = app
+            .tree_state
+            .selected_row(&rows)
+            .expect("a row must be selected");
+        assert_eq!(selected.path.file_name().unwrap(), target_name);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_left_dock_body_moves_the_todos_selection() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.left_dock.as_mut().unwrap().tab = LeftDockTab::Todos;
+        app.todo.results = Some(crate::todo_panel::TodoResults {
+            matches: vec![
+                crate::todo_panel::TodoMatch {
+                    pattern: "TODO",
+                    inner: ide_core::SearchMatch {
+                        path: PathBuf::from("a.txt"),
+                        line: 1,
+                        column: 0,
+                        byte_offset: 0,
+                        line_text: "// TODO one".to_string(),
+                    },
+                },
+                crate::todo_panel::TodoMatch {
+                    pattern: "TODO",
+                    inner: ide_core::SearchMatch {
+                        path: PathBuf::from("b.txt"),
+                        line: 2,
+                        column: 0,
+                        byte_offset: 0,
+                        line_text: "// TODO two".to_string(),
+                    },
+                },
+            ],
+            truncated: false,
+        });
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: Some(Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 10,
+            }),
+            bottom_dock_body: None,
+        };
+
+        assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_bottom_dock_body_moves_the_docker_selection() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleDockerPanel);
+        app.docker.containers = vec![sample_container("a", "web"), sample_container("b", "db")];
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+        };
+
+        assert_eq!(app.docker.selected, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 22), &hits);
+        assert_eq!(app.docker.selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_bottom_dock_body_is_a_noop_when_no_dock_is_open() {
+        let (_dir, mut app) = two_file_project();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+        };
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 22), &hits);
     }
 
     #[test]
@@ -20460,6 +20891,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -20508,6 +20941,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
@@ -20536,6 +20971,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         // Column 2 into the text, past the line-number lane (T50) -- no
         // blame/git-gutter lane here, so `editor_lane_width()` is exactly
@@ -20572,6 +21009,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         // Column 15 is well within the 20-wide hit-test area but past
         // "ab"'s own 2 characters -- must clamp to line end, not no-op.
@@ -20606,6 +21045,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5),
@@ -20633,6 +21074,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
@@ -20661,6 +21104,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert!(app.active_buffer().is_none());
@@ -20686,6 +21131,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -20892,6 +21339,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -20921,6 +21370,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 4),
@@ -20957,6 +21408,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
@@ -21333,6 +21786,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
@@ -21365,6 +21820,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
@@ -21398,6 +21855,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane, 1),
@@ -21587,6 +22046,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -21636,6 +22097,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
 
@@ -21666,6 +22129,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 1);
@@ -21694,6 +22159,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 1, 1), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 0);
@@ -21737,6 +22204,8 @@ mod tests {
             outline_action_hits: vec![],
             ribbon_action_hits: vec![],
             ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
         };
         for _ in 0..10 {
             app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);

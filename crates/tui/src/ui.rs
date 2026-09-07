@@ -118,6 +118,14 @@ pub struct HitMap {
     /// tui-key-hint-ribbon.md` §2.4/§3.2, T48) -- a single optional
     /// `Rect`, not a `Vec`, since there is always exactly one `[+]`.
     pub ribbon_add_hit: Option<Rect>,
+    /// The left dock's active-tab body area (`rows[1]` in
+    /// `render_left_dock`, below its one-row tab strip) -- populated
+    /// whenever the left dock renders at all, regardless of which tab is
+    /// active (`docs/features/tui-panel-focus-and-scroll.md` §2.1, T51).
+    pub left_dock_body: Option<Rect>,
+    /// Mirrors `left_dock_body` for the bottom dock (`rows[1]` in
+    /// `render_bottom_dock`).
+    pub bottom_dock_body: Option<Rect>,
 }
 
 /// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
@@ -406,6 +414,7 @@ fn render_left_dock(
         ],
         dock.tab,
     );
+    hits.left_dock_body = Some(rows[1]);
 
     match dock.tab {
         LeftDockTab::Files => render_tree(frame, app, rows[1], hits),
@@ -484,6 +493,7 @@ fn render_bottom_dock(
         ],
         dock.tab,
     );
+    hits.bottom_dock_body = Some(rows[1]);
     match dock.tab {
         BottomDockTab::Docker => render_docker_panel(frame, app, rows[1]),
         BottomDockTab::Ai => render_ai_panel(frame, app, rows[1]),
