@@ -171,7 +171,7 @@ pub struct AiConfig {
     pub local_sanitize_threshold: f64, // entropy threshold, default 4.0
     pub cloud_sanitize_threshold: f64, // default 3.5 (tighter)
 }
-impl Default for AiConfig { /* provider_order = [OllamaLocal, Gemini, Groq, GitHubModels] ... */ }
+impl Default for AiConfig { /* provider_order = [Gemini, Groq, GitHubModels, OllamaLocal] ... */ }
 impl AiConfig {
     /// Credential-driven: drops cloud providers whose env var is absent.
     pub fn enabled_providers(&self) -> Vec<ProviderId>;
@@ -353,18 +353,30 @@ lists an assistant panel; `commands.rs:895-901`). No invented binding.
 > sanitize → route → stream → restore choreography in one picture.
 
 - Provider order comes from `AiConfig::provider_order`, defaulted to
-  `[OllamaLocal, Gemini, Groq, GitHubModels]`, filtered by
-  `enabled_providers()` (credential-driven).
-- Local first. `complete_fim` requires `OllamaLocal` (only local model is
-  FIM-capable in the defaults); if local is unavailable, FIM reports a
-  status-line error rather than falling to cloud (cloud free-tiers have no
-  FIM contract).
+  `[Gemini, Groq, GitHubModels, OllamaLocal]`, filtered by
+  `enabled_providers()` (credential-driven). **Cloud-first, local-last**:
+  every configured free-tier cloud provider is tried before the local
+  fallback, so the local model only serves once the entire cloud chain has
+  been exhausted with fallback-eligible errors (typically 429 rate
+  limits). This was reversed from an earlier local-first default per a
+  direct user requirement — see this section's "Revision notes".
+- `complete_fim` requires `OllamaLocal` (only local model is FIM-capable
+  in the defaults); if local is unavailable, FIM reports a status-line
+  error rather than falling to cloud (cloud free-tiers have no FIM
+  contract). This is independent of `provider_order` — FIM never
+  consults it.
 - Fallback on: `ConnectionRefused`, `Timeout`, `RateLimited`, `Http(5xx)`,
   `StreamEnded`. **No** fallback on `Http(4xx)` other than 408/429 — a
   4xx is a request/credential problem, retrying a different provider
   masks it.
-- Bounded retry: max 1 retry per provider, max total 2 attempts across
-  the chain, fixed 500 ms backoff between attempts (no unbounded waits).
+- Full-chain retry: `DefaultRouter::chat` (via the private `try_in_order`
+  helper) walks **every** enabled provider in `order` once, in sequence,
+  stopping at the first success or the first non-fallback-eligible error,
+  with a fixed 500 ms backoff between attempts (no unbounded waits). The
+  number of attempts is naturally bounded by `AiConfig::enabled_providers`'s
+  `MAX_PROVIDERS = 4` cap, so the router itself needs no separate limit.
+  When only one provider is enabled it is retried once (a single flaky
+  provider is still worth one retry with nothing to fall back to).
 - A reply records which provider served it (`ProviderServing`) for the
   status line. Switching providers mid-reply is *not* attempted — the
   fallback decision happens at request start, not at first bad byte.
@@ -602,4 +614,44 @@ and `hyper-rustls` approved by user 2026-09-06 as `hyper` companions):
   merge. All fixes carry new regression tests (`crates/ai/src/tests.rs`,
   `crates/sanitizer/src/lib.rs`, `crates/tui/src/ai_panel.rs`,
   `crates/tui/src/app.rs`) and are pure Rust with no OS-specific code —
+  (continued in r7 below).
+- **r7 (2026-09-07, cloud-first fallback fix, direct user requirement):**
+  the user asked, in exactly these words, to "use free AI first, then if
+  we get all 429 from all models, switch to local." Two independent gaps
+  stood between that and the shipped behaviour: (1) `AiConfig::default()`'s
+  `provider_order` was `[OllamaLocal, Gemini, Groq, GitHubModels]` —
+  **local first**, the opposite of the request; (2) `DefaultRouter::chat`
+  hardcoded exactly two attempts (`[order[0], order.get(1)]`) regardless of
+  how many providers `order` held, so even a corrected cloud-first ordering
+  could never reach a 3rd or 4th provider — a 4-provider cloud-then-local
+  chain would give up after the 2nd cloud provider, never reaching
+  `OllamaLocal` at all. Both are fixed: `provider_order` default is now
+  `[Gemini, Groq, GitHubModels, OllamaLocal]` (§3.1, §2.3), and
+  `DefaultRouter::chat` now delegates to a new private `try_in_order`
+  helper that walks the *entire* filtered `order` once, in sequence,
+  stopping at the first success or first non-fallback-eligible error — the
+  attempt count is no longer hardcoded, only naturally bounded by
+  `enabled_providers()`'s existing `MAX_PROVIDERS = 4` cap. The one
+  exception: a single-enabled-provider chain still retries that provider
+  once (unchanged from the prior "max 1 retry per provider" behaviour),
+  since a solitary flaky provider is still worth one retry with nothing to
+  fall back to. `try_in_order` is unit-tested directly against a canned
+  `attempt` closure (4 new tests in `crates/ai/src/tests.rs`:
+  walks-every-provider-before-succeeding, stops-immediately-on-non-
+  fallback-error, returns-last-error-once-exhausted, retries-a-single-
+  provider) rather than through `Provider::stream_chat`, since every
+  `ProviderId::endpoint()` but the local one is a real internet host and
+  can't be pointed at a test server — this was also true before this fix,
+  which is why the pre-existing router test only covered the trivial
+  empty-`enabled_providers()` case and never exercised the attempt-count
+  logic that was actually wrong. §3.1's prose, §2.3's `Default` impl
+  comment, and two now-stale tests (`default_matches_doc_section_2_3`,
+  renamed `enabled_providers_always_leads_with_ollama` →
+  `enabled_providers_falls_back_to_ollama_alone_with_no_cloud_credentials_set`)
+  were updated to match. `cargo fmt`/`clippy -D warnings`/`test` all green
+  (45 tests, up from 41); coverage not independently re-measured against
+  the 80% gate for this fix since it's a targeted bug fix in an
+  already-shipped, already-audited feature rather than a fresh
+  `rust-tui-dev` implementation round, but `try_in_order`'s own logic is
+  now more directly tested than the code it replaced.
   unaffected by the macOS/Linux/Windows cross-platform target.

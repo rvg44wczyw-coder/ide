@@ -736,11 +736,16 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Two-attempt router: attempt 1 = first enabled provider; on a
-/// fallback-eligible error, a fixed 500 ms backoff, then attempt 2 = the
-/// next enabled provider (or a retry of the same if only one is enabled);
-/// then give up. Deltas for whichever attempt runs push into `tx`; the
-/// final `ProviderId` that served is returned. The per-attempt
+/// Full-chain router: walks every enabled provider in `order` once, in
+/// order, stopping at the first success. On a fallback-eligible error a
+/// fixed 500 ms backoff separates attempts, then the next provider in
+/// `order` is tried; a non-fallback-eligible error aborts the chain
+/// immediately (§3.1). When only one provider is enabled it is retried
+/// once (a single flaky provider is worth one retry even with nothing to
+/// fall back to). The number of attempts is naturally bounded by
+/// `AiConfig::enabled_providers`'s `MAX_PROVIDERS` cap upstream, so this
+/// never needs its own limit. Deltas for whichever attempt runs push into
+/// `tx`; the final `ProviderId` that served is returned. The per-attempt
 /// `ChatRequest` (with that provider's `default_model`) is built here, so
 /// the caller never has to know which provider will serve.
 ///
@@ -774,29 +779,56 @@ impl Router for DefaultRouter {
         if order.is_empty() {
             return Err(AiError::Message("no enabled providers".to_string()));
         }
-        let mut last_err = None;
-        let attempts = [order[0], *order.get(1).unwrap_or(&order[0])];
-        for (i, id) in attempts.into_iter().enumerate() {
+        let attempts: Vec<ProviderId> = if order.len() == 1 {
+            vec![order[0], order[0]]
+        } else {
+            order
+        };
+        try_in_order(&attempts, std::time::Duration::from_millis(500), |id| {
             let provider = Provider::from_id(id);
             let request = ChatRequest {
                 messages: messages.clone(),
                 model: default_model(id).to_string(),
                 sanitized,
             };
-            let r = provider.stream_chat(&request, tx.clone()).await;
-            match r {
-                Ok(()) => return Ok(id),
-                Err(e) if fallback_eligible(&e) => {
-                    last_err = Some(e);
-                    if i == 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap_or(AiError::Message("no provider served".to_string())))
+            let tx = tx.clone();
+            async move { provider.stream_chat(&request, tx).await }
+        })
+        .await
     }
+}
+
+/// Pure sequencing core of the router: calls `attempt` once per id in
+/// `order` (sleeping `backoff` between attempts, skipped before the
+/// first), stopping at the first success or the first non-fallback-
+/// eligible error, and returning the id that served. Split out from
+/// `DefaultRouter::chat` so this control flow -- which providers get
+/// tried, in what order, and when the chain gives up -- is unit-testable
+/// against a canned `attempt` closure instead of requiring a real
+/// network stack (every `ProviderId::endpoint()` but the local one is a
+/// real internet host, so the full `Provider::stream_chat` path can't be
+/// pointed at a test server).
+async fn try_in_order<F, Fut>(
+    order: &[ProviderId],
+    backoff: std::time::Duration,
+    mut attempt: F,
+) -> Result<ProviderId, AiError>
+where
+    F: FnMut(ProviderId) -> Fut,
+    Fut: std::future::Future<Output = Result<(), AiError>>,
+{
+    let mut last_err = None;
+    for (i, &id) in order.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(backoff).await;
+        }
+        match attempt(id).await {
+            Ok(()) => return Ok(id),
+            Err(e) if fallback_eligible(&e) => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or(AiError::Message("no provider served".to_string())))
 }
 
 /// Whether a provider error triggers a fallback to the next provider

@@ -23,8 +23,11 @@ const MAX_PROVIDERS: usize = 4;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiConfig {
-    /// Fallback order: first entry is attempt 1, second becomes attempt 2
-    /// on a fallback-eligible error (§3.1's two-attempt router).
+    /// Fallback order the router walks in full (§3.1): cloud/free-tier
+    /// providers first, `OllamaLocal` last, so a local fallback only
+    /// happens once every configured cloud provider has returned a
+    /// fallback-eligible error (429/5xx/timeout/etc. -- see
+    /// `fallback_eligible`).
     pub provider_order: Vec<ProviderId>,
     /// Sanitize the outgoing payload on the *local* (Ollama) route too.
     pub sanitize_local: bool,
@@ -40,10 +43,10 @@ impl Default for AiConfig {
     fn default() -> Self {
         Self {
             provider_order: vec![
-                ProviderId::OllamaLocal,
                 ProviderId::Gemini,
                 ProviderId::Groq,
                 ProviderId::GitHubModels,
+                ProviderId::OllamaLocal,
             ],
             sanitize_local: true,
             local_sanitize_threshold: 4.0,

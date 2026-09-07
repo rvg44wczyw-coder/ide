@@ -19,9 +19,9 @@ use serde_json::json;
 
 use crate::{
     classify_status, default_model, extract_delta, extract_text, fallback_eligible,
-    parse_sse_event, truncate, AiConfig, AiError, ChatDelta, ChatMessage, ChatRequest, ChatRole,
-    DefaultRouter, HttpTransport, Provider, ProviderId, Router, SseParser, WireRequest,
-    OLLAMA_FIM_MODEL,
+    parse_sse_event, truncate, try_in_order, AiConfig, AiError, ChatDelta, ChatMessage,
+    ChatRequest, ChatRole, DefaultRouter, HttpTransport, Provider, ProviderId, Router, SseParser,
+    WireRequest, OLLAMA_FIM_MODEL,
 };
 
 /// Minimal self-cleaning temp project root (creates `.ide/`).
@@ -53,10 +53,10 @@ fn default_matches_doc_section_2_3() {
     assert_eq!(
         d.provider_order,
         vec![
-            ProviderId::OllamaLocal,
             ProviderId::Gemini,
             ProviderId::Groq,
             ProviderId::GitHubModels,
+            ProviderId::OllamaLocal,
         ]
     );
     assert!(d.sanitize_local);
@@ -65,10 +65,16 @@ fn default_matches_doc_section_2_3() {
 }
 
 #[test]
-fn enabled_providers_always_leads_with_ollama() {
+fn enabled_providers_falls_back_to_ollama_alone_with_no_cloud_credentials_set() {
+    // Assumes no GEMINI_API_KEY/GROQ_API_KEY/GITHUB_MODELS_TOKEN is set in
+    // the test environment (true for CI and a typical dev shell) -- see
+    // this file's module doc for why env-dependent assertions are scoped
+    // to structural guarantees rather than exact env state. Cloud-first
+    // `provider_order` means the three cloud entries are filtered out by
+    // `enabled()` here, leaving only the always-enabled local provider.
     let d = AiConfig::default();
     let enabled = d.enabled_providers();
-    assert_eq!(enabled.first(), Some(&ProviderId::OllamaLocal));
+    assert_eq!(enabled, vec![ProviderId::OllamaLocal]);
 }
 
 #[test]
@@ -432,6 +438,114 @@ async fn router_with_no_enabled_providers_reports_error() {
         .unwrap_err();
     assert!(matches!(err, AiError::Message(msg) if msg.contains("no enabled providers")));
     assert!(rx.try_iter().next().is_none());
+}
+
+// ------------------------------------------------------------------------
+// `try_in_order`: the router's provider-sequencing core, tested against a
+// canned `attempt` closure so the full chain-of-fallbacks logic is proven
+// without any real network call (regression coverage for the bug where
+// the router used to give up after exactly two attempts regardless of how
+// many providers were enabled).
+// ------------------------------------------------------------------------
+
+#[tokio::test]
+async fn try_in_order_walks_every_provider_in_order_before_the_one_that_succeeds() {
+    use std::sync::{Arc, Mutex};
+
+    let order = [
+        ProviderId::Gemini,
+        ProviderId::Groq,
+        ProviderId::GitHubModels,
+        ProviderId::OllamaLocal,
+    ];
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_closure = calls.clone();
+
+    let result = try_in_order(&order, std::time::Duration::from_millis(0), move |id| {
+        let calls = calls_for_closure.clone();
+        async move {
+            calls.lock().unwrap().push(id);
+            if id == ProviderId::OllamaLocal {
+                Ok(())
+            } else {
+                Err(AiError::RateLimited)
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(result.unwrap(), ProviderId::OllamaLocal);
+    assert_eq!(*calls.lock().unwrap(), order.to_vec());
+}
+
+#[tokio::test]
+async fn try_in_order_stops_immediately_on_a_non_fallback_eligible_error() {
+    use std::sync::{Arc, Mutex};
+
+    let order = [
+        ProviderId::Gemini,
+        ProviderId::Groq,
+        ProviderId::OllamaLocal,
+    ];
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_closure = calls.clone();
+
+    let result = try_in_order(&order, std::time::Duration::from_millis(0), move |id| {
+        let calls = calls_for_closure.clone();
+        async move {
+            calls.lock().unwrap().push(id);
+            Err(AiError::Http(404))
+        }
+    })
+    .await;
+
+    assert!(matches!(result, Err(AiError::Http(404))));
+    // Only the first provider was tried -- a credential/request problem
+    // isn't fixed by switching providers, so the chain must not continue.
+    assert_eq!(*calls.lock().unwrap(), vec![ProviderId::Gemini]);
+}
+
+#[tokio::test]
+async fn try_in_order_returns_the_last_error_once_every_provider_is_exhausted() {
+    let order = [
+        ProviderId::Gemini,
+        ProviderId::Groq,
+        ProviderId::OllamaLocal,
+    ];
+
+    let result = try_in_order(&order, std::time::Duration::from_millis(0), |_id| async {
+        Err(AiError::RateLimited)
+    })
+    .await;
+
+    assert!(matches!(result, Err(AiError::RateLimited)));
+}
+
+#[tokio::test]
+async fn try_in_order_retries_a_single_provider_when_it_is_the_only_one_enabled() {
+    use std::sync::{Arc, Mutex};
+
+    // Mirrors `DefaultRouter::chat`'s own single-provider duplication.
+    let order = [ProviderId::OllamaLocal, ProviderId::OllamaLocal];
+    let attempt_count = Arc::new(Mutex::new(0usize));
+    let count_for_closure = attempt_count.clone();
+
+    let result = try_in_order(&order, std::time::Duration::from_millis(0), move |_id| {
+        let count = count_for_closure.clone();
+        async move {
+            let mut count = count.lock().unwrap();
+            *count += 1;
+            if *count < 2 {
+                Err(AiError::RateLimited)
+            } else {
+                Ok(())
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(result.unwrap(), ProviderId::OllamaLocal);
+    assert_eq!(*attempt_count.lock().unwrap(), 2);
 }
 
 // ------------------------------------------------------------------------
