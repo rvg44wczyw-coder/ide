@@ -2431,10 +2431,16 @@ impl App {
     /// tui-ai-hybrid-fallback.md` §2.4): `Esc` closes the dock, `Enter`
     /// submits (refuses while a reply is streaming -- one request at a
     /// time), `Backspace` and ordinary chars edit the input. Same shape
-    /// as `handle_claude_chat_key`.
+    /// as `handle_claude_chat_key`. A request still in flight is cancelled
+    /// (detached, per `AiPanel::cancel`'s doc comment) before closing, so
+    /// re-opening the dock never shows a stuck "in flight" state from a
+    /// wedged transport (`hacker` fix round).
     fn handle_ai_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
         match key.code {
             KeyCode::Esc => {
+                if self.ai.is_in_flight() {
+                    self.ai.cancel();
+                }
                 self.toggle_ai_panel();
             }
             KeyCode::Backspace => {
@@ -17696,6 +17702,23 @@ mod tests {
             .unwrap()
             .message
             .contains("one AI request at a time"));
+    }
+
+    #[test]
+    fn ai_panel_esc_while_in_flight_cancels_before_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.ai = AiPanel::with_runner(dir.path().to_path_buf(), ai_fake);
+        app.run_action(Action::ToggleAiPanel);
+
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(app.ai.is_in_flight());
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.ai.is_in_flight(), "Esc must cancel a wedged request");
+        assert!(!app.ai_panel_open);
     }
 
     #[test]

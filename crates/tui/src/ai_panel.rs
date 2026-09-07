@@ -109,6 +109,19 @@ impl AiPanel {
         self.rx.is_some()
     }
 
+    /// Manual recovery backstop for a wedged request (`hacker` fix round):
+    /// drops the receiver so `poll` stops waiting on it and `is_in_flight`
+    /// goes false immediately, letting the user submit a fresh request
+    /// without waiting out the transport's own timeout. The orphaned
+    /// background thread keeps running until its own read times out or its
+    /// channel send fails (`run_request`'s loop already checks
+    /// `tx.send(..).is_err()` and returns), but it can no longer touch
+    /// anything this panel reads. A no-op when nothing is in flight.
+    pub fn cancel(&mut self) {
+        self.rx = None;
+        self.streaming = false;
+    }
+
     /// Compose the single line that actually leaves for the provider:
     /// prompt + any selection/whole-file context folded in. `None` for a
     /// blank/whitespace-only prompt (no request).
@@ -313,8 +326,11 @@ fn run_request(prepared: PreparedRequest) {
         let (delta_tx, delta_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let messages = vec![ChatMessage::user(outgoing)];
+        let sanitized = map.is_some();
         tokio::spawn(async move {
-            let res = DefaultRouter.chat(messages, &order, delta_tx).await;
+            let res = DefaultRouter
+                .chat(messages, &order, sanitized, delta_tx)
+                .await;
             let _ = result_tx.send(res);
         });
         // Drive the router task forward while draining deltas as they
@@ -433,6 +449,55 @@ mod tests {
             panel.history.len(),
             1,
             "in-flight submit pushes nothing new"
+        );
+    }
+
+    #[test]
+    fn cancel_clears_in_flight_and_lets_a_new_request_start() {
+        let mut panel = AiPanel::new(temp_root());
+        panel.prepare("first".into(), AiContext::None).unwrap();
+        assert!(panel.is_in_flight());
+
+        panel.cancel();
+        assert!(!panel.is_in_flight());
+
+        // A fresh submit is no longer blocked by the (now-detached)
+        // in-flight state.
+        let second = panel.prepare("second".into(), AiContext::None);
+        assert!(second.is_some());
+        assert_eq!(
+            panel.history,
+            vec![
+                AiDisplayMessage::User("first".to_string()),
+                AiDisplayMessage::User("second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn cancel_is_a_noop_when_nothing_is_in_flight() {
+        let mut panel = AiPanel::new(temp_root());
+        panel.cancel();
+        assert!(!panel.is_in_flight());
+        assert!(panel.history.is_empty());
+    }
+
+    #[test]
+    fn cancel_orphans_the_old_channel_so_late_sends_are_silently_dropped() {
+        // A message the (now-orphaned) background thread tries to send
+        // after `cancel` must not resurrect the old request in `history`
+        // via a later `poll` -- there is no receiver left to drain.
+        let mut panel = AiPanel::new(temp_root());
+        let prepared = panel.prepare("first".into(), AiContext::None).unwrap();
+        panel.cancel();
+        assert!(prepared
+            .tx
+            .send(AiDisplayMessage::Assistant("late reply".to_string()))
+            .is_err());
+        assert!(!panel.poll());
+        assert_eq!(
+            panel.history,
+            vec![AiDisplayMessage::User("first".to_string())]
         );
     }
 

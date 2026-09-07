@@ -1,10 +1,15 @@
-//! Zero-trust masking of sensitive substrings before they're sent to a
-//! cloud LLM endpoint, and restoration of the originals into the reply
-//! (`docs/features/tui-ai-hybrid-fallback.md` §2.2, T49). One-shot, per
-//! request/response pair -- never persisted, never shared between
-//! requests. The masking guarantee ("no secret in any cloud payload")
-//! is the security boundary the `hacker` pass reviews; it is proven by
-//! this module's tests, not asserted.
+//! Best-effort, heuristic masking of sensitive substrings before they're
+//! sent to a cloud LLM endpoint, and restoration of the originals into the
+//! reply (`docs/features/tui-ai-hybrid-fallback.md` §2.2, T49). One-shot,
+//! per request/response pair -- never persisted, never shared between
+//! requests. This is *not* a zero-trust guarantee: known-shape regexes
+//! (JWTs, key prefixes, private IPs, PEM blocks, common `NAME=value`
+//! secret assignments) and an entropy-gated opaque-token sweep catch the
+//! common cases, but a secret in a shape/entropy range none of these
+//! cover will still reach the cloud provider unmasked. Treat this as
+//! defense-in-depth alongside the local-vs-cloud routing choice
+//! (`docs/features/tui-ai-hybrid-fallback.md` §3.3), not as the sole
+//! control (`hacker` fix round -- see that doc's revision notes).
 
 use std::collections::HashMap;
 
@@ -148,6 +153,28 @@ pub fn mask_secrets(s: &mut Sanitizer, input: &str) -> String {
 /// the route's threshold is set.
 pub fn mask_secrets_with_threshold(s: &mut Sanitizer, input: &str, threshold: f64) -> String {
     let known: &[&str] = &[
+        // PEM private-key blocks (RSA/EC/OpenSSH/PKCS8/generic) -- a
+        // structural match, not entropy-gated, since a key's base64 body
+        // can occasionally dip below the opaque-token threshold on short
+        // keys. Runs first since it's the most specific/unambiguous shape.
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+        // Generic low-entropy secret assignments (`PASSWORD=hunter2`,
+        // `api_key: "abc123"`, `TOKEN=...`) that the opaque-token entropy
+        // gate below would otherwise miss -- a short, dictionary-word
+        // value has low Shannon entropy and sails past any threshold
+        // (`hacker` fix round). Masks the whole `name = value` match, not
+        // just the value, which is the coarser but simpler option given
+        // `replace_matches` only ever substitutes a full match. Runs
+        // *before* the JWT/token-prefix/IP patterns below: those are all
+        // narrower value-shapes that can appear as the right-hand side of
+        // one of these assignments (e.g. `token=eyJ...`), and once this
+        // pattern swallows the whole assignment into one placeholder, a
+        // later pass matching a shape *inside* that placeholder text would
+        // double-mask it into a second, nested placeholder -- restoring
+        // that back out depends on `HashMap` iteration order in
+        // `restore_originals`, which is unspecified, so the safe fix is to
+        // never let it happen: mask the coarsest shape first.
+        r#"(?i)\b\w*(?:secret|passwd|password|token|api[_-]?key|access[_-]?key)\w*\s*[:=]\s*['"]?[^\s'",]{4,}['"]?"#,
         // JWT: three base64url segments, first always begins `eyJ`.
         r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
         // Common token/key prefixes (sk-/ghp_/gho_/gsk_/AIza/AKIA etc.).
@@ -341,6 +368,59 @@ mod tests {
         assert!(!out.contains("eyJhbGci"));
         assert!(out.contains("__IDE_SAN_0__"));
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn mask_secrets_hides_a_low_entropy_password_assignment() {
+        // `hunter2` alone has low Shannon entropy and would sail past the
+        // opaque-token gate -- the generic `NAME=value` pattern must catch
+        // it regardless.
+        let mut s = Sanitizer::new();
+        let out = mask_secrets(&mut s, "PASSWORD=hunter2");
+        assert!(!out.contains("hunter2"));
+        assert!(out.contains("__IDE_SAN"));
+    }
+
+    #[test]
+    fn mask_secrets_hides_a_quoted_api_key_assignment() {
+        let mut s = Sanitizer::new();
+        let out = mask_secrets(&mut s, r#"api_key: "abc123""#);
+        assert!(!out.contains("abc123"));
+        assert!(out.contains("__IDE_SAN"));
+    }
+
+    #[test]
+    fn mask_secrets_does_not_touch_an_unrelated_key_value_pair() {
+        // "key" alone (not api_key/access_key) and an ordinary word value
+        // must not trip the generic pattern -- it isn't a secret keyword.
+        let mut s = Sanitizer::new();
+        let out = mask_secrets(&mut s, "key=value");
+        assert_eq!(out, "key=value");
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn mask_secrets_hides_a_pem_private_key_block() {
+        let mut s = Sanitizer::new();
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD91\n-----END RSA PRIVATE KEY-----";
+        let out = mask_secrets(&mut s, pem);
+        assert!(!out.contains("MIIBOgIBAAJBAKj34GkxFhD91"));
+        assert!(out.contains("__IDE_SAN"));
+    }
+
+    #[test]
+    fn mask_secrets_restores_a_jwt_nested_inside_a_secret_assignment_unambiguously() {
+        // Regression for the double-masking hazard the generic
+        // secret-assignment pattern could otherwise cause: `token=<jwt>`
+        // must round-trip back to the exact original regardless of
+        // `HashMap` iteration order, which is why the coarser
+        // secret-assignment pattern runs before the JWT-shape pattern.
+        let mut s = Sanitizer::new();
+        let input = "token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeK";
+        let masked = mask_secrets(&mut s, input);
+        assert!(!masked.contains("__IDE_SAN_1__"), "must not double-mask");
+        let map = as_map(&s);
+        assert_eq!(restore_originals(&masked, &map), input);
     }
 
     #[test]

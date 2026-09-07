@@ -245,6 +245,7 @@ fn chat_wire_openai_shape_for_non_gemini() {
             },
         ],
         model: "some-model".into(),
+        sanitized: true,
     };
     for id in [
         ProviderId::OllamaLocal,
@@ -276,6 +277,7 @@ fn chat_wire_gemini_shape_populates_query_key() {
             },
         ],
         model: default_model(ProviderId::Gemini).into(),
+        sanitized: true,
     };
     let wire = Provider::from_id(ProviderId::Gemini)
         .chat_wire(&req)
@@ -425,7 +427,7 @@ fn runtime() -> tokio::runtime::Runtime {
 async fn router_with_no_enabled_providers_reports_error() {
     let (_tx, rx) = mpsc::channel();
     let err = DefaultRouter
-        .chat(vec![ChatMessage::user("hi")], &[], _tx)
+        .chat(vec![ChatMessage::user("hi")], &[], true, _tx)
         .await
         .unwrap_err();
     assert!(matches!(err, AiError::Message(msg) if msg.contains("no enabled providers")));
@@ -479,7 +481,7 @@ fn post_json_returns_status_and_body() {
         let _ = sock.write_all(body.as_bytes());
         let _ = sock.shutdown(Shutdown::Both);
     });
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     let (status, bytes) = runtime()
         .block_on(transport.post_json(
             &format!("http://127.0.0.1:{port}/v1/foo"),
@@ -499,7 +501,7 @@ fn post_json_surfaces_non_2xx_status() {
         let _ = sock.write_all(head.as_bytes());
         let _ = sock.shutdown(Shutdown::Both);
     });
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     let (status, _) = runtime()
         .block_on(transport.post_json(&format!("http://127.0.0.1:{port}/"), json!({}), None))
         .unwrap();
@@ -520,7 +522,7 @@ fn post_json_sends_bearer_authorization_header() {
         let _ = sock.write_all(body.as_bytes());
         let _ = sock.shutdown(Shutdown::Both);
     });
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     runtime()
         .block_on(transport.post_json(
             &format!("http://127.0.0.1:{port}/v1/foo"),
@@ -552,7 +554,7 @@ fn post_stream_sends_bearer_authorization_header() {
         bearer: Some("sekrit".into()),
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx, false))
         .expect("stream completes");
@@ -576,11 +578,100 @@ fn dispatch_streaming_surfaces_error_status() {
         bearer: None,
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     let err = runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx, false))
         .unwrap_err();
     assert!(matches!(err, AiError::Http(500)), "{err}");
+}
+
+#[test]
+fn dispatch_times_out_on_a_stalled_stream() {
+    // Server sends SSE headers, then never writes another byte -- the
+    // connection stays open (no `connection: close`, socket held past the
+    // end of this test's own timeout window). Regression for the
+    // permanent-wedge bug: without a per-chunk idle timeout this would
+    // hang the caller forever.
+    let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n";
+    let port = mock_server(move |mut sock| {
+        drain_request(&mut sock);
+        let _ = sock.write_all(head.as_bytes());
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let _ = sock.shutdown(Shutdown::Both);
+    });
+    let (tx, _rx) = mpsc::channel();
+    let wire = WireRequest {
+        uri: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        body: json!({"stream": true}),
+        bearer: None,
+        gemini: false,
+    };
+    let transport = HttpTransport::new().unwrap();
+    let err = runtime()
+        .block_on(Provider::Ollama.dispatch_with_timeout(
+            &transport,
+            wire,
+            tx,
+            false,
+            std::time::Duration::from_millis(50),
+        ))
+        .unwrap_err();
+    assert!(matches!(err, AiError::Timeout), "{err}");
+}
+
+#[test]
+fn dispatch_rejects_an_sse_stream_that_never_terminates_an_event() {
+    // A malformed/hostile server that keeps sending bytes with no blank
+    // line (SSE event terminator) must not grow `SseParser::buf`
+    // unboundedly -- regression for the buffer-size cap.
+    let oversized = "x".repeat(crate::MAX_SSE_BUFFER_BYTES + 1);
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+        oversized.len()
+    );
+    let port = mock_server(move |mut sock| {
+        drain_request(&mut sock);
+        let _ = sock.write_all(head.as_bytes());
+        let _ = sock.write_all(oversized.as_bytes());
+        let _ = sock.shutdown(Shutdown::Both);
+    });
+    let (tx, _rx) = mpsc::channel();
+    let wire = WireRequest {
+        uri: format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        body: json!({"stream": true}),
+        bearer: None,
+        gemini: false,
+    };
+    let transport = HttpTransport::new().unwrap();
+    let err = runtime()
+        .block_on(Provider::Ollama.dispatch(&transport, wire, tx, false))
+        .unwrap_err();
+    assert!(
+        matches!(&err, AiError::Message(m) if m.contains("maximum buffered size")),
+        "{err}"
+    );
+}
+
+#[test]
+fn stream_chat_refuses_a_cloud_request_that_is_not_sanitized() {
+    // Runtime gate (§5 hacker fix round): even with the request otherwise
+    // well-formed, an unsanitized request to a cloud provider is refused
+    // before any network I/O -- no mock server is started, so a bug that
+    // let this through would surface as a connection-refused error
+    // instead of this specific message.
+    let (tx, _rx) = mpsc::channel();
+    let request = ChatRequest {
+        messages: vec![ChatMessage::user("hello")],
+        model: default_model(ProviderId::Gemini).into(),
+        sanitized: false,
+    };
+    let err = runtime()
+        .block_on(Provider::from_id(ProviderId::Gemini).stream_chat(&request, tx))
+        .unwrap_err();
+    assert!(
+        matches!(&err, AiError::Message(m) if m.contains("sanitized")),
+        "{err}"
+    );
 }
 
 #[test]
@@ -599,7 +690,7 @@ fn dispatch_fim_branch_surfaces_error_status() {
         bearer: None,
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     let err = runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx, true))
         .unwrap_err();
@@ -627,7 +718,7 @@ fn dispatch_streaming_stops_when_readers_leave() {
         bearer: None,
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx, false))
         .expect("dispatch exits cleanly when the reader is gone");
@@ -654,7 +745,7 @@ fn dispatch_streaming_keeps_partial_without_done_marker() {
         bearer: None,
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx, false))
         .expect("partial reply still completes Ok");
@@ -692,7 +783,7 @@ fn dispatch_streaming_stops_at_reply_cap() {
         bearer: None,
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx.clone(), false))
         .expect("dispatch exits cleanly at the cap");
@@ -720,7 +811,7 @@ fn post_json_reports_connection_refused() {
         drop(l);
         p
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     let err = runtime()
         .block_on(transport.post_json(&format!("http://127.0.0.1:{port}/"), json!({}), None))
         .unwrap_err();
@@ -751,7 +842,7 @@ fn dispatch_streams_sse_deltas_end_to_end() {
         bearer: None,
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx, false))
         .expect("stream completes");
@@ -779,7 +870,7 @@ fn dispatch_returns_stream_ended_on_empty_body() {
         bearer: None,
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     let err = runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx, false))
         .unwrap_err();
@@ -803,7 +894,7 @@ fn dispatch_fim_branch_pushes_whole_body_text() {
         bearer: None,
         gemini: false,
     };
-    let transport = HttpTransport::new();
+    let transport = HttpTransport::new().unwrap();
     runtime()
         .block_on(Provider::Ollama.dispatch(&transport, wire, tx.clone(), true))
         .expect("fim completes");

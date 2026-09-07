@@ -108,6 +108,15 @@ impl ChatMessage {
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub model: String,
+    /// Whether `messages` has already passed through `ide-sanitizer`'s
+    /// masking. `stream_chat` refuses to reach a cloud provider unless this
+    /// is `true` -- a *runtime* gate, not just the `sanitizer` compile-time
+    /// feature, so a build with the feature on but a caller that skipped
+    /// masking (or a config with masking disabled) still can't leak raw
+    /// text to a cloud endpoint (`docs/features/tui-ai-hybrid-fallback.md`
+    /// §5, `hacker` fix round). Local-only routes (`OllamaLocal`) ignore
+    /// this field entirely.
+    pub sanitized: bool,
 }
 
 /// A single streamed completion delta.
@@ -141,6 +150,17 @@ pub enum AiError {
 pub const MAX_REPLY_CHARS: usize = 200_000;
 /// FIM context cap (§3.4): prefix and suffix are each truncated here.
 pub const MAX_FIM_CONTEXT_CHARS: usize = 4096;
+/// SSE parser buffer cap: a malicious/broken server that never sends the
+/// blank-line event terminator (or a `data:` line without end) must not
+/// grow `SseParser::buf` without bound -- `MAX_REPLY_CHARS` alone doesn't
+/// cover this since that cap only applies to *extracted* text, checked
+/// after an event is already fully parsed (`hacker` fix round).
+pub const MAX_SSE_BUFFER_BYTES: usize = 1_048_576;
+/// Per-chunk idle timeout on the SSE stream: a server that accepts the
+/// connection, sends headers, then never sends another byte would
+/// otherwise hang `dispatch`'s read loop forever with no error ever
+/// reaching the panel (`hacker` fix round).
+const STREAM_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// FIM model served by Ollama (`local-tab-coder`).
 pub const OLLAMA_FIM_MODEL: &str = "local-tab-coder";
 
@@ -170,10 +190,18 @@ pub(crate) struct HttpTransport {
 }
 
 impl HttpTransport {
-    pub(crate) fn new() -> Self {
+    /// Fallible, not `.expect()`-panicking: a system with no usable native
+    /// CA trust store (a minimal container/Linux install, e.g.) must not
+    /// crash the background thread building this -- that thread's death
+    /// would otherwise leak a permanently in-flight request with no error
+    /// ever reaching the panel (`docs/features/tui-ai-hybrid-fallback.md`
+    /// §5, `hacker` fix round). Built even for the Ollama-only local route,
+    /// which never actually needs TLS, since `HttpsConnector` is the one
+    /// connector type this transport uses for every provider.
+    pub(crate) fn new() -> Result<Self, AiError> {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_native_roots()
-            .expect("load native TLS roots")
+            .map_err(|e| AiError::Message(format!("failed to load native TLS roots: {e}")))?
             .https_or_http()
             .enable_http1()
             .build();
@@ -182,7 +210,7 @@ impl HttpTransport {
             http_body_util::Full<bytes::Bytes>,
         > = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build(https);
-        HttpTransport { client }
+        Ok(HttpTransport { client })
     }
 
     /// POST `json` to `uri`, return `(status, body_bytes)`. Never logs or
@@ -212,9 +240,17 @@ impl HttpTransport {
                 .map_err(|_| AiError::Timeout)?
                 .map_err(map_conn_error)?;
         let status = resp.status().as_u16();
-        let body = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .map_err(|e| AiError::Message(format!("failed to read response: {e}")))?;
+        // The header-fetch above and this body read are two separate
+        // `await`s -- bounding only the first left a non-streaming request
+        // (FIM) able to hang forever mid-body-read on a server that sends
+        // headers promptly then stalls (`hacker` fix round).
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            http_body_util::BodyExt::collect(resp.into_body()),
+        )
+        .await
+        .map_err(|_| AiError::Timeout)?
+        .map_err(|e| AiError::Message(format!("failed to read response: {e}")))?;
         Ok((status, body.to_bytes()))
     }
 
@@ -342,12 +378,16 @@ impl Provider {
         request: &ChatRequest,
         tx: Sender<Result<ChatDelta, AiError>>,
     ) -> Result<(), AiError> {
-        if self.id().is_cloud() && cfg!(not(feature = "sanitizer")) {
+        // Runtime gate, not just the `sanitizer` compile-time feature: a
+        // build with the feature enabled but a caller that skipped masking
+        // (or a config with masking disabled) must not reach a cloud
+        // provider with raw request text either (`hacker` fix round).
+        if self.id().is_cloud() && (cfg!(not(feature = "sanitizer")) || !request.sanitized) {
             return Err(AiError::Message(
-                "cloud route requires the sanitizer feature".to_string(),
+                "cloud route requires a sanitized request".to_string(),
             ));
         }
-        let transport = HttpTransport::new();
+        let transport = HttpTransport::new()?;
         let wire = self.chat_wire(request)?;
         self.dispatch(&transport, wire, tx, false).await
     }
@@ -371,7 +411,7 @@ impl Provider {
             "messages": [{"role": "user", "content": prompt}],
             "stream": false,
         });
-        let transport = HttpTransport::new();
+        let transport = HttpTransport::new()?;
         let (status, bytes) = transport.post_json(&uri, body, None).await?;
         if status >= 400 {
             return Err(classify_status(status));
@@ -380,13 +420,29 @@ impl Provider {
     }
 
     /// Dispatch a prepared wire request: `fim=true` reads the whole body;
-    /// otherwise it streams SSE lines and pushes each delta.
+    /// otherwise it streams SSE lines and pushes each delta. Thin wrapper
+    /// over [`Provider::dispatch_with_timeout`] fixing the real
+    /// [`STREAM_CHUNK_TIMEOUT`] -- split out so tests can exercise the
+    /// idle-timeout path itself with a short duration instead of a real
+    /// 60-second wait.
     async fn dispatch(
         &self,
         transport: &HttpTransport,
         wire: WireRequest,
         tx: Sender<Result<ChatDelta, AiError>>,
         fim: bool,
+    ) -> Result<(), AiError> {
+        self.dispatch_with_timeout(transport, wire, tx, fim, STREAM_CHUNK_TIMEOUT)
+            .await
+    }
+
+    async fn dispatch_with_timeout(
+        &self,
+        transport: &HttpTransport,
+        wire: WireRequest,
+        tx: Sender<Result<ChatDelta, AiError>>,
+        fim: bool,
+        chunk_timeout: std::time::Duration,
     ) -> Result<(), AiError> {
         if fim {
             let (status, bytes) = transport
@@ -409,9 +465,19 @@ impl Provider {
 
         let mut accumulated = 0usize;
         let mut parser = SseParser::default();
-        while let Some(chunk) = stream.text().await {
+        loop {
+            let next = match tokio::time::timeout(chunk_timeout, stream.text()).await {
+                Ok(next) => next,
+                Err(_) => return Err(AiError::Timeout),
+            };
+            let Some(chunk) = next else { break };
             let chunk = chunk?;
             parser.push(&chunk);
+            if parser.len() > MAX_SSE_BUFFER_BYTES {
+                return Err(AiError::Message(
+                    "SSE event exceeded the maximum buffered size".to_string(),
+                ));
+            }
             for (data, is_done) in parser.drain_events() {
                 if let Some(text) = extract_delta(&data, wire.gemini) {
                     let room = MAX_REPLY_CHARS.saturating_sub(accumulated);
@@ -584,6 +650,10 @@ impl SseParser {
         self.buf.push_str(chunk);
     }
 
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Drain any complete events from the buffer, returning their `data:`
     /// payloads and whether the event was the `[DONE]` marker(s).
     fn drain_events(&mut self) -> Vec<(String, bool)> {
@@ -683,6 +753,7 @@ pub trait Router {
         &self,
         messages: Vec<ChatMessage>,
         order: &[ProviderId],
+        sanitized: bool,
         tx: Sender<Result<ChatDelta, AiError>>,
     ) -> impl std::future::Future<Output = Result<ProviderId, AiError>> + Send;
 }
@@ -696,6 +767,7 @@ impl Router for DefaultRouter {
         &self,
         messages: Vec<ChatMessage>,
         order: &[ProviderId],
+        sanitized: bool,
         tx: Sender<Result<ChatDelta, AiError>>,
     ) -> Result<ProviderId, AiError> {
         let order: Vec<ProviderId> = order.iter().copied().filter(|id| id.enabled()).collect();
@@ -709,6 +781,7 @@ impl Router for DefaultRouter {
             let request = ChatRequest {
                 messages: messages.clone(),
                 model: default_model(id).to_string(),
+                sanitized,
             };
             let r = provider.stream_chat(&request, tx.clone()).await;
             match r {

@@ -384,10 +384,14 @@ lists an assistant panel; `commands.rs:895-901`). No invented binding.
 
 - Outgoing payload is passed through the sanitizer before dispatch. The
   panel's `mask_outgoing` helper (in `run_request`, before `stream_chat`
-  is called) handles masking; `stream_chat` itself does **not** enforce
-  masking — correctness relies on the panel wiring, and on the compile-time
-  `sanitizer` feature gate: when the feature is compiled **out**, `stream_chat`
-  refuses to send to any cloud provider (`AiError::Message`).
+  is called) handles masking. **As of the 2026-09-07 fix round (r6),
+  `stream_chat` *does* enforce masking at runtime**: `ChatRequest` carries
+  a `sanitized: bool` field, threaded through `Router::chat`/
+  `DefaultRouter` from `ai_panel.rs`'s `map.is_some()`, and `stream_chat`
+  refuses a cloud dispatch unless **both** the compile-time `sanitizer`
+  feature is on **and** `request.sanitized` is true. This closes the gap
+  where the original compile-time-only gate said nothing about whether
+  *this specific request* had actually been masked.
 - Local route: sanitize if `AiConfig::sanitize_local` (default true) with
   `local_sanitize_threshold`; cloud always uses `cloud_sanitize_threshold`.
   The route picks the threshold and calls `Sanitizer::mask_with_threshold`
@@ -432,7 +436,17 @@ lists an assistant panel; `commands.rs:895-901`). No invented binding.
   load (truncate, mirroring `MAX_CUSTOM_ACTIONS`); no unbounded vectors
   from provider data. Streaming deltas capped at `MAX_REPLY_CHARS =
   200_000` per reply (truncate + close); a hostile/looping model can't
-  balloon memory.
+  balloon memory. The SSE parser's own internal buffer is separately
+  capped at `MAX_SSE_BUFFER_BYTES = 1_048_576` (r6, 2026-09-07) — a
+  malformed/hostile server that never sends the event terminator can't
+  grow it unboundedly even though no event, and therefore no delta, is
+  ever extracted from it.
+- **No permanent hangs:** every network read (`post_json`'s body read,
+  `dispatch`'s per-chunk SSE read) is wrapped in a 60s
+  `tokio::time::timeout` (r6, 2026-09-07) — a server that accepts the
+  connection and then goes silent times out rather than wedging the
+  request forever. `AiPanel::cancel()` (wired to `Esc`) is the user-facing
+  manual backstop on top of that.
 - **Untrusted model output:** generated text is rendered as plain
   `Span` text only — never interpreted as input, never appended to a
   buffer except via the FIM transaction, never executed. `AiError` /
@@ -558,3 +572,34 @@ and `hyper-rustls` approved by user 2026-09-06 as `hyper` companions):
   and `dispatch`'s streaming error/reader-gone/partial-without-done/reply-cap
   paths — all ≥ the rust-tui-dev 80% line gate for non-rendering touched
   files.
+- **r6 (2026-09-07, post-merge security/quality fix round):** this feature
+  merged to `main` without §Purpose's own mandatory `hacker` pass actually
+  landing a findings artifact — `docs/security-findings/` had no file for
+  T49 despite `docs/roadmap.md`'s T49 row claiming a completed 2-round
+  pass. A review against the merged code found and fixed five issues (full
+  write-up: `docs/security-findings/ai-hybrid-fallback-tui-2026-09-07.md`):
+  (1) `HttpTransport::new()` could panic on a broken native TLS root store,
+  and neither `post_json`'s body read nor `dispatch`'s SSE read loop had a
+  timeout, so a server that went silent mid-response wedged a request
+  forever with no recovery short of restarting the app — fixed via a
+  fallible `HttpTransport::new() -> Result<Self, AiError>`, a 60s
+  `tokio::time::timeout` on both reads, and a new `AiPanel::cancel()`
+  wired to `Esc` as a manual backstop; (2) `SseParser::buf` had no size
+  cap, so a server that never sent the SSE blank-line terminator could
+  grow it unboundedly — fixed via `MAX_SSE_BUFFER_BYTES` (1 MiB); (3) the
+  §3.3 sanitizer gate was compile-time-feature-only, unable to tell
+  whether *this* request had actually been masked — fixed via a
+  `ChatRequest.sanitized: bool` runtime flag threaded through `Router`/
+  `DefaultRouter`/`ai_panel.rs` (see updated §3.3 above); (4) the
+  sanitizer's regex/entropy pipeline missed low-entropy `NAME=value`
+  secrets and PEM private-key blocks, and its doc comment overstated
+  "zero-trust" — fixed via two new patterns (ordered before the
+  JWT/token-prefix/IP patterns to avoid a double-masking hazard whose
+  restore correctness would otherwise depend on unspecified `HashMap`
+  iteration order) and a softened "best-effort, heuristic" doc claim; (5)
+  §4's constraints above are updated to describe the buffer cap and
+  timeout guarantees this round added, since they postdate the original
+  merge. All fixes carry new regression tests (`crates/ai/src/tests.rs`,
+  `crates/sanitizer/src/lib.rs`, `crates/tui/src/ai_panel.rs`,
+  `crates/tui/src/app.rs`) and are pure Rust with no OS-specific code —
+  unaffected by the macOS/Linux/Windows cross-platform target.
