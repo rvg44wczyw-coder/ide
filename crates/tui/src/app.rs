@@ -26,7 +26,7 @@ use crate::cargo_panel::{CargoCommand, CargoPanel};
 use crate::claude_panel::ClaudePanel;
 use crate::claude_terminal::{self, ClaudeTerminalPanel};
 use crate::clone_panel::{ClonePanel, ClonePanelField, ClonePollResult};
-use crate::commands::{commands, Action, Command};
+use crate::commands::{commands, menu_groups, Action, Command, MenuEntry};
 use crate::debug_config::{self, DebugAdapterConfig, DebugAdapterEntry};
 use crate::debug_panel::DebugPanel;
 use crate::docker_panel::{DockerLifecycleAction, DockerPanel, DockerTab};
@@ -200,6 +200,21 @@ pub(crate) enum FinderRow {
     File(ide_core::FuzzyFileMatch),
     Symbol(Symbol),
     Command(&'static Command),
+}
+
+/// The top menu bar's open/selected/flyout state (`docs/features/
+/// tui-menu-bar.md` §2.2, T54). `open` indexes into `commands::
+/// menu_groups()`; `selected` indexes into that group's own `entries`
+/// (top-level dropdown rows, `Item`s and `Submenu`s alike); `submenu_
+/// selected`, when `Some`, indexes into the currently-selected `Submenu`
+/// entry's own id list (one flyout level deep, never nested further).
+/// `Default` is "closed at the first menu, no flyout" -- the exact value
+/// `close_menu_bar`/`close_all_overlays` reset to.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct MenuBarState {
+    pub(crate) open: Option<usize>,
+    pub(crate) selected: usize,
+    pub(crate) submenu_selected: Option<usize>,
 }
 
 /// The unified finder's ("Search Everywhere") typed query and list
@@ -1009,6 +1024,14 @@ pub struct App {
     pub(crate) colon_command: Option<ColonCommandState>,
     /// `docs/features/tui-unified-finder.md` §2.2, T46.
     pub(crate) unified_finder: Option<UnifiedFinderState>,
+    /// `docs/features/tui-menu-bar.md` §2.2, T54 -- the always-visible top
+    /// menu bar's open/selected/flyout state. `open: None` is "closed",
+    /// same presence-is-visibility convention every other overlay here
+    /// uses; unlike most of them this one is a plain struct (not wrapped
+    /// in another `Option`) since the bar itself is *always* rendered
+    /// (`ui::render_menu_bar` draws the row regardless), only its dropdown/
+    /// flyout are conditional on `open`/`submenu_selected`.
+    pub(crate) menu_bar: MenuBarState,
     /// `docs/features/tui-unified-finder.md` §2.3, T46 -- the `⇧⇧` gesture's
     /// double-tap tracker. A process-lifetime field, not per-overlay state
     /// (must keep ticking regardless of whether `unified_finder` is open).
@@ -1319,6 +1342,7 @@ impl App {
             palette: None,
             colon_command: None,
             unified_finder: None,
+            menu_bar: MenuBarState::default(),
             shift_double_tap: crate::double_tap::DoubleTap::default(),
             created_at: std::time::Instant::now(),
             find: None,
@@ -2374,6 +2398,11 @@ impl App {
         // toggle-function precedent guarantees it's already `None` by the
         // time some other overlay opens.
         self.unified_finder = None;
+        // Same reasoning again (`docs/features/tui-menu-bar.md` §2.2, T54):
+        // opening any other overlay must close the menu bar, and
+        // `open_menu_bar` itself calls this before setting `menu_bar` back
+        // open, so the two can never both be `Some`/non-default at once.
+        self.menu_bar = MenuBarState::default();
         self.goto = None;
         self.notifications_open = false;
         self.hover_open = false;
@@ -2957,6 +2986,148 @@ impl App {
     /// construct.
     fn go_to_keys_screen(&mut self) {
         self.active_screen = AppScreen::Keys;
+    }
+
+    /// Opens the top menu bar on `menu_groups()[group_index]` (`docs/
+    /// features/tui-menu-bar.md` §2.2, T54) -- via a label click or an
+    /// `Alt+<mnemonic>` press. Mirrors `go_to_git_screen`'s save-and-
+    /// restore-around-`close_all_overlays` pattern: opening the menu bar is
+    /// reachable while on the Git screen (its label stays clickable there,
+    /// same as `screen_tabs`, per `handle_mouse_click`), and a naive
+    /// `close_all_overlays()` call would unconditionally clear `git_panel`
+    /// out from under it, desyncing `active_screen == Git` from `git_panel
+    /// == None` -- exactly the bug class T44's round-1 review already found
+    /// and fixed for `go_to_git_screen`/`go_to_run_screen`. Unlike that
+    /// pattern, this never forces `git_panel` to `Some` -- it only
+    /// preserves whatever it already was, since opening the menu bar never
+    /// changes `active_screen`.
+    fn open_menu_bar(&mut self, group_index: usize) {
+        let existing_git_panel = self.git_panel.take();
+        self.close_all_overlays();
+        self.git_panel = existing_git_panel;
+        self.menu_bar = MenuBarState {
+            open: Some(group_index),
+            selected: 0,
+            submenu_selected: None,
+        };
+    }
+
+    fn close_menu_bar(&mut self) {
+        self.menu_bar = MenuBarState::default();
+    }
+
+    /// Looks `id` up in `commands::commands()` and runs its `Action` --
+    /// shared by every menu-bar selection path (`docs/features/
+    /// tui-menu-bar.md` §2.2/§3.2/§3.3, T54) so keyboard `Enter` and a
+    /// mouse click on the same row resolve identically. `id` always comes
+    /// from `commands::menu_groups()`, whose completeness is enforced by
+    /// `commands::tests::menu_completeness_covers_every_command_exactly_
+    /// once`, so the lookup is not expected to ever miss in practice --
+    /// falling through to a no-op rather than panicking is still the right
+    /// shape here, matching every other "resolve an id/index into an
+    /// action" helper in this file (e.g. `handle_palette_key`'s own
+    /// `filtered.get(...)`).
+    fn run_action_by_id(&mut self, id: &str) -> LoopSignal {
+        if let Some(action) = commands()
+            .iter()
+            .find(|command| command.id == id)
+            .map(|command| command.action)
+        {
+            return self.run_action(action);
+        }
+        LoopSignal::Continue
+    }
+
+    /// Every key while the menu bar is open (`docs/features/
+    /// tui-menu-bar.md` §3.2, T54). `Left`/`Right` move between top-level
+    /// menus with wrapping (mirrors a real OS menu bar); `Up`/`Down` move
+    /// within the open dropdown/flyout with clamping, matching this
+    /// crate's established list-cursor convention (e.g. `handle_palette_
+    /// key`'s own `Up`/`Down` arms) rather than the wrap `Left`/`Right`
+    /// just used one level up -- the two axes are deliberately asymmetric.
+    /// An `Alt+<mnemonic>` press while already open jumps straight to that
+    /// menu (closing any open flyout), the same gesture that opens the bar
+    /// in the first place from `handle_key`.
+    fn handle_menu_bar_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(open) = self.menu_bar.open else {
+            return LoopSignal::Continue;
+        };
+        let groups = menu_groups();
+        if key.modifiers == KeyModifiers::ALT {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(idx) = groups
+                    .iter()
+                    .position(|group| group.mnemonic.eq_ignore_ascii_case(&c))
+                {
+                    self.menu_bar.open = Some(idx);
+                    self.menu_bar.selected = 0;
+                    self.menu_bar.submenu_selected = None;
+                    return LoopSignal::Continue;
+                }
+            }
+        }
+        match key.code {
+            KeyCode::Esc => {
+                if self.menu_bar.submenu_selected.is_some() {
+                    self.menu_bar.submenu_selected = None;
+                } else {
+                    self.close_menu_bar();
+                }
+            }
+            KeyCode::Left if self.menu_bar.submenu_selected.is_none() => {
+                self.menu_bar.open = Some(if open == 0 {
+                    groups.len() - 1
+                } else {
+                    open - 1
+                });
+                self.menu_bar.selected = 0;
+            }
+            KeyCode::Right if self.menu_bar.submenu_selected.is_none() => {
+                self.menu_bar.open = Some((open + 1) % groups.len());
+                self.menu_bar.selected = 0;
+            }
+            KeyCode::Up => {
+                if let Some(sub) = self.menu_bar.submenu_selected {
+                    if sub > 0 {
+                        self.menu_bar.submenu_selected = Some(sub - 1);
+                    }
+                } else if self.menu_bar.selected > 0 {
+                    self.menu_bar.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(sub) = self.menu_bar.submenu_selected {
+                    if let MenuEntry::Submenu(_, ids) = groups[open].entries[self.menu_bar.selected]
+                    {
+                        if sub + 1 < ids.len() {
+                            self.menu_bar.submenu_selected = Some(sub + 1);
+                        }
+                    }
+                } else if self.menu_bar.selected + 1 < groups[open].entries.len() {
+                    self.menu_bar.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let entry = groups[open].entries[self.menu_bar.selected];
+                match (entry, self.menu_bar.submenu_selected) {
+                    (MenuEntry::Item(id), _) => {
+                        self.close_menu_bar();
+                        return self.run_action_by_id(id);
+                    }
+                    (MenuEntry::Submenu(_, ids), Some(sub)) => {
+                        if let Some(&id) = ids.get(sub) {
+                            self.close_menu_bar();
+                            return self.run_action_by_id(id);
+                        }
+                    }
+                    (MenuEntry::Submenu(_, _), None) => {
+                        self.menu_bar.submenu_selected = Some(0);
+                    }
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
     }
 
     /// Handles every key while `BottomDockTab::Cargo` is the bottom dock's
@@ -6343,6 +6514,9 @@ impl App {
                 self.toggle_unified_finder();
             }
         }
+        if self.menu_bar.open.is_some() {
+            return self.handle_menu_bar_key(key);
+        }
         if self.palette.is_some() {
             return self.handle_palette_key(key);
         }
@@ -6529,6 +6703,28 @@ impl App {
             self.open_colon_command();
             return LoopSignal::Continue;
         }
+        // `docs/features/tui-menu-bar.md` §3.1/§3.2, T54 -- same rank as
+        // the colon-command trigger immediately above: must sit before the
+        // global keymap lookup below (`Alt`-modified letters aren't bound
+        // to anything today, but a future binding could collide) and is
+        // gated on `!any_popup_open()` so it can't fire out from under an
+        // already-open, unrelated overlay. Not gated on `is_text_editing_
+        // focused()` -- unlike `:`, `Alt+<letter>` is never a character an
+        // editor would otherwise insert, so there's no ambiguity to guard
+        // against while typing.
+        if key.modifiers == KeyModifiers::ALT && !self.any_popup_open() {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(idx) = menu_groups()
+                    .iter()
+                    .position(|group| group.mnemonic.eq_ignore_ascii_case(&c))
+                {
+                    self.menu_bar.open = Some(idx);
+                    self.menu_bar.selected = 0;
+                    self.menu_bar.submenu_selected = None;
+                    return LoopSignal::Continue;
+                }
+            }
+        }
         if let Some(action) = self.keymap.action_for(key.modifiers, key.code) {
             return self.run_action(action);
         }
@@ -6585,6 +6781,7 @@ impl App {
         self.palette.is_some()
             || self.colon_command.is_some()
             || self.unified_finder.is_some()
+            || self.menu_bar.open.is_some()
             || self.find.is_some()
             || self.goto.is_some()
             || self.notifications_open
@@ -6656,14 +6853,92 @@ impl App {
         }
     }
 
+    /// Every mouse click while the menu bar is open (`docs/features/
+    /// tui-menu-bar.md` §3.3, T54), checked in priority order: a flyout
+    /// row (topmost layer) first, then a dropdown row, then a different
+    /// bar label (switches menus without closing), and finally "anywhere
+    /// else" -- which closes the bar and does nothing further, the
+    /// standard "click outside dismisses the menu" convention, deliberately
+    /// not also performing the click's other effect.
+    fn handle_menu_bar_click(&mut self, point: (u16, u16), hits: &crate::ui::HitMap) {
+        let Some(open) = self.menu_bar.open else {
+            return;
+        };
+        if let Some(&(_, id_index)) = hits
+            .menu_submenu_items
+            .iter()
+            .find(|(rect, _)| rect.contains(point.into()))
+        {
+            let groups = menu_groups();
+            if let MenuEntry::Submenu(_, ids) = groups[open].entries[self.menu_bar.selected] {
+                if let Some(&id) = ids.get(id_index) {
+                    self.close_menu_bar();
+                    self.run_action_by_id(id);
+                    return;
+                }
+            }
+        }
+        if let Some(&(_, entry_index)) = hits
+            .menu_dropdown_items
+            .iter()
+            .find(|(rect, _)| rect.contains(point.into()))
+        {
+            self.menu_bar.selected = entry_index;
+            let groups = menu_groups();
+            match groups[open].entries[entry_index] {
+                MenuEntry::Item(id) => {
+                    self.close_menu_bar();
+                    self.run_action_by_id(id);
+                }
+                MenuEntry::Submenu(_, _) => {
+                    self.menu_bar.submenu_selected = Some(0);
+                }
+            }
+            return;
+        }
+        if let Some(&(_, group_index)) = hits
+            .menu_bar_labels
+            .iter()
+            .find(|(rect, _)| rect.contains(point.into()))
+        {
+            self.menu_bar.open = Some(group_index);
+            self.menu_bar.selected = 0;
+            self.menu_bar.submenu_selected = None;
+            return;
+        }
+        self.close_menu_bar();
+    }
+
     /// Position-based, independent of `self.focus` (§3.2). A popup owns
     /// all input while open, so a click doesn't reach the base view at
     /// all in that case, matching wheel scroll's own popup-priority rule.
     fn handle_mouse_click(&mut self, event: MouseEvent, hits: &crate::ui::HitMap) {
+        let point: (u16, u16) = (event.column, event.row);
+        // `docs/features/tui-menu-bar.md` §3.3, T54 -- checked before the
+        // generic `any_true_popup_open()` gate below (that gate itself now
+        // includes `menu_bar.open.is_some()`, so without this the menu bar
+        // would swallow every click on itself and never respond), mirroring
+        // the exact "check this specific state's own regions before the
+        // generic popup-blocking gate" pattern `tui-panel-pane-scroll.md`
+        // established for Git-screen scroll (T53).
+        if self.menu_bar.open.is_some() {
+            self.handle_menu_bar_click(point, hits);
+            return;
+        }
         if self.any_true_popup_open() {
             return;
         }
-        let point: (u16, u16) = (event.column, event.row);
+        // Click-to-open on a menu-bar label (§3.1/§3.3) -- checked here,
+        // ahead of `screen_tabs`, so it works on every `AppScreen`
+        // including Git (`any_true_popup_open()` above deliberately
+        // excludes the Git screen, same as `screen_tabs`'s own click
+        // handling right below).
+        for &(rect, group_index) in &hits.menu_bar_labels {
+            if rect.contains(point.into()) {
+                self.open_menu_bar(group_index);
+                return;
+            }
+        }
         for &(rect, screen) in &hits.screen_tabs {
             if rect.contains(point.into()) {
                 match screen {
@@ -21160,7 +21435,11 @@ mod tests {
             .len();
         set_caret(&mut app, end);
 
-        let backend = ratatui::backend::TestBackend::new(80, 10);
+        // 11 rows, not 10 -- `EDITOR_CHROME_ROWS` (T54's new persistent
+        // menu bar row) consumes one more of the fixed terminal height
+        // than this test's original 10-row fixture accounted for; bumped
+        // by exactly one to restore the same body-row budget.
+        let backend = ratatui::backend::TestBackend::new(80, 11);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|f| crate::ui::render(f, &app, &mut crate::ui::HitMap::default()))
@@ -21196,7 +21475,10 @@ mod tests {
         app.open_or_focus_tab(dir.path().join("f.go")).unwrap();
         app.focus = Focus::Editor;
 
-        let backend = ratatui::backend::TestBackend::new(80, 10);
+        // See `cursor_lands_after_a_wide_cjk_character_not_mid_glyph`'s own
+        // comment: 11 rows, not 10, to keep the same body-row budget after
+        // T54's new persistent menu bar row.
+        let backend = ratatui::backend::TestBackend::new(80, 11);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|f| crate::ui::render(f, &app, &mut crate::ui::HitMap::default()))
@@ -24403,5 +24685,489 @@ mod tests {
 
         app.run_action(Action::ExtractVariable);
         assert!(app.via_refactor_preview);
+    }
+
+    // ---- Top menu bar (docs/features/tui-menu-bar.md, T54) ----
+
+    fn alt_key(c: char) -> KeyEvent {
+        key(KeyModifiers::ALT, KeyCode::Char(c))
+    }
+
+    #[test]
+    fn close_all_overlays_clears_the_menu_bar() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.menu_bar = MenuBarState {
+            open: Some(2),
+            selected: 3,
+            submenu_selected: Some(1),
+        };
+
+        app.close_all_overlays();
+
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_menu_bar() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.menu_bar.open = Some(0);
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn open_menu_bar_closes_other_overlays() {
+        // `self.palette` deliberately isn't cleared by `close_all_overlays`
+        // (see that function's own comment on why) -- `unified_finder` is,
+        // so it's the right overlay to prove this against.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState::default());
+
+        app.open_menu_bar(3);
+
+        assert!(app.unified_finder.is_none());
+        assert_eq!(app.menu_bar.open, Some(3));
+        assert_eq!(app.menu_bar.selected, 0);
+        assert_eq!(app.menu_bar.submenu_selected, None);
+    }
+
+    #[test]
+    fn open_menu_bar_preserves_git_panel_state_and_active_screen_when_opened_from_the_git_screen() {
+        // Mirrors `go_to_git_screen_closes_other_overlays_but_preserves_
+        // git_panel_state`'s own regression shape -- opening the menu bar
+        // must not desync `active_screen == Git` from `git_panel == None`
+        // (T44's round-1 review bug class), and must not discard whatever
+        // draft state `git_panel` was already holding.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        app.git_panel.as_mut().unwrap().diff_scroll = 7;
+
+        app.open_menu_bar(5);
+
+        assert_eq!(app.active_screen, AppScreen::Git);
+        assert_eq!(app.git_panel.as_ref().unwrap().diff_scroll, 7);
+        assert_eq!(app.menu_bar.open, Some(5));
+    }
+
+    #[test]
+    fn alt_mnemonic_opens_the_matching_menu() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.handle_key(alt_key('f'));
+
+        let file_index = menu_groups()
+            .iter()
+            .position(|g| g.title == "File")
+            .unwrap();
+        assert_eq!(app.menu_bar.open, Some(file_index));
+        assert_eq!(app.menu_bar.selected, 0);
+    }
+
+    #[test]
+    fn alt_mnemonic_does_not_open_the_bar_while_a_popup_is_already_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.palette = Some(PaletteState {
+            query: String::new(),
+            selected: 0,
+            filtered: vec![],
+        });
+
+        app.handle_key(alt_key('f'));
+
+        assert_eq!(app.menu_bar.open, None);
+        assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn alt_mnemonic_while_the_bar_is_already_open_jumps_to_that_menu() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        app.menu_bar.selected = 2;
+
+        app.handle_key(alt_key('e'));
+
+        let edit_index = menu_groups()
+            .iter()
+            .position(|g| g.title == "Edit")
+            .unwrap();
+        assert_eq!(app.menu_bar.open, Some(edit_index));
+        assert_eq!(app.menu_bar.selected, 0);
+    }
+
+    #[test]
+    fn handle_menu_bar_key_left_and_right_wrap_between_top_level_menus() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+
+        app.handle_key(plain_key(KeyCode::Left));
+        assert_eq!(app.menu_bar.open, Some(menu_groups().len() - 1));
+
+        app.handle_key(plain_key(KeyCode::Right));
+        assert_eq!(app.menu_bar.open, Some(0));
+    }
+
+    #[test]
+    fn handle_menu_bar_key_up_and_down_clamp_within_the_open_dropdown() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.menu_bar.selected, 0, "must clamp, not wrap, at the top");
+
+        let last = menu_groups()[0].entries.len() - 1;
+        for _ in 0..(last + 5) {
+            app.handle_key(plain_key(KeyCode::Down));
+        }
+        assert_eq!(
+            app.menu_bar.selected, last,
+            "must clamp, not wrap, at the bottom"
+        );
+    }
+
+    #[test]
+    fn handle_menu_bar_key_enter_on_an_item_runs_its_action_and_closes_everything() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some());
+        let window_index = menu_groups()
+            .iter()
+            .position(|g| g.title == "Window")
+            .unwrap();
+        let toggle_left_dock_index = menu_groups()[window_index]
+            .entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Item("ToggleLeftDock")))
+            .unwrap();
+        app.open_menu_bar(window_index);
+        app.menu_bar.selected = toggle_left_dock_index;
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.left_dock.is_none());
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn handle_menu_bar_key_enter_on_a_submenu_opens_a_flyout_without_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let run_index = menu_groups().iter().position(|g| g.title == "Run").unwrap();
+        let debug_submenu_index = menu_groups()[run_index]
+            .entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Submenu("Debug", _)))
+            .unwrap();
+        app.open_menu_bar(run_index);
+        app.menu_bar.selected = debug_submenu_index;
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.menu_bar.open, Some(run_index));
+        assert_eq!(app.menu_bar.submenu_selected, Some(0));
+    }
+
+    #[test]
+    fn handle_menu_bar_key_enter_on_a_flyout_item_runs_it_and_closes_everything() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let run_index = menu_groups().iter().position(|g| g.title == "Run").unwrap();
+        let (debug_submenu_index, ids) = menu_groups()[run_index]
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| match e {
+                MenuEntry::Submenu("Debug", ids) => Some((i, *ids)),
+                _ => None,
+            })
+            .unwrap();
+        let toggle_debug_panel_index = ids.iter().position(|id| *id == "ToggleDebugPanel").unwrap();
+        app.open_menu_bar(run_index);
+        app.menu_bar.selected = debug_submenu_index;
+        app.menu_bar.submenu_selected = Some(toggle_debug_panel_index);
+        assert!(!app.debug_panel_open);
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.debug_panel_open);
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn handle_menu_bar_key_esc_closes_just_the_flyout_then_the_whole_bar() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        app.menu_bar.submenu_selected = Some(0);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+        assert_eq!(app.menu_bar.open, Some(0));
+        assert_eq!(app.menu_bar.submenu_selected, None);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn run_action_by_id_runs_the_matching_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some());
+
+        app.run_action_by_id("ToggleLeftDock");
+
+        assert!(app.left_dock.is_none());
+    }
+
+    #[test]
+    fn run_action_by_id_with_an_unknown_id_is_a_harmless_no_op() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some());
+
+        app.run_action_by_id("NotARealCommandId");
+
+        assert!(app.left_dock.is_some());
+    }
+
+    #[test]
+    fn mouse_click_on_a_menu_bar_label_opens_that_menu() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let hits = ui::HitMap {
+            menu_bar_labels: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                0,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar.open, Some(0));
+    }
+
+    #[test]
+    fn mouse_click_on_a_menu_bar_label_works_even_on_the_git_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        let hits = ui::HitMap {
+            menu_bar_labels: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                0,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar.open, Some(0));
+        assert_eq!(app.active_screen, AppScreen::Git);
+        assert!(app.git_panel.is_some());
+    }
+
+    #[test]
+    fn mouse_click_on_a_dropdown_item_runs_it_and_closes_the_bar() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some());
+        let window_index = menu_groups()
+            .iter()
+            .position(|g| g.title == "Window")
+            .unwrap();
+        let toggle_left_dock_index = menu_groups()[window_index]
+            .entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Item("ToggleLeftDock")))
+            .unwrap();
+        app.open_menu_bar(window_index);
+        let row = Rect {
+            x: 0,
+            y: 1,
+            width: 20,
+            height: 1,
+        };
+        let hits = ui::HitMap {
+            menu_dropdown_items: vec![(row, toggle_left_dock_index)],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            &hits,
+        );
+
+        assert!(app.left_dock.is_none());
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn mouse_click_on_a_dropdown_submenu_row_opens_the_flyout_without_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let run_index = menu_groups().iter().position(|g| g.title == "Run").unwrap();
+        let debug_submenu_index = menu_groups()[run_index]
+            .entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Submenu("Debug", _)))
+            .unwrap();
+        app.open_menu_bar(run_index);
+        let row = Rect {
+            x: 0,
+            y: 1,
+            width: 20,
+            height: 1,
+        };
+        let hits = ui::HitMap {
+            menu_dropdown_items: vec![(row, debug_submenu_index)],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar.open, Some(run_index));
+        assert_eq!(app.menu_bar.submenu_selected, Some(0));
+    }
+
+    #[test]
+    fn mouse_click_on_a_submenu_item_runs_it_and_closes_everything() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let run_index = menu_groups().iter().position(|g| g.title == "Run").unwrap();
+        let (debug_submenu_index, ids) = menu_groups()[run_index]
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| match e {
+                MenuEntry::Submenu("Debug", ids) => Some((i, *ids)),
+                _ => None,
+            })
+            .unwrap();
+        let toggle_debug_panel_index = ids.iter().position(|id| *id == "ToggleDebugPanel").unwrap();
+        app.open_menu_bar(run_index);
+        app.menu_bar.selected = debug_submenu_index;
+        app.menu_bar.submenu_selected = Some(0);
+        assert!(!app.debug_panel_open);
+        let row = Rect {
+            x: 0,
+            y: 1,
+            width: 20,
+            height: 1,
+        };
+        let hits = ui::HitMap {
+            menu_submenu_items: vec![(row, toggle_debug_panel_index)],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            &hits,
+        );
+
+        assert!(app.debug_panel_open);
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn mouse_click_on_a_different_bar_label_while_open_switches_menus_without_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        let hits = ui::HitMap {
+            menu_bar_labels: vec![
+                (
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 6,
+                        height: 1,
+                    },
+                    0,
+                ),
+                (
+                    Rect {
+                        x: 6,
+                        y: 0,
+                        width: 6,
+                        height: 1,
+                    },
+                    1,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 7, 0),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar.open, Some(1));
+        assert_eq!(app.menu_bar.selected, 0);
+        assert_eq!(app.menu_bar.submenu_selected, None);
+    }
+
+    #[test]
+    fn mouse_click_outside_everything_while_the_bar_is_open_closes_it_without_side_effects() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        // A `screen_tabs` hit deliberately overlaps the click point --
+        // proves the outside click is fully consumed by the menu bar and
+        // never falls through to the normal dispatch below it in the same
+        // call (`docs/features/tui-menu-bar.md` §3.3, T54).
+        let hits = ui::HitMap {
+            screen_tabs: vec![(
+                Rect {
+                    x: 50,
+                    y: 50,
+                    width: 3,
+                    height: 1,
+                },
+                AppScreen::Run,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 50, 50),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar, MenuBarState::default());
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Editor,
+            "the outside click must not also switch screens"
+        );
     }
 }

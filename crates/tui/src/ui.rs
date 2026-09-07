@@ -30,6 +30,7 @@ use crate::app::{
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
 use crate::clone_panel::ClonePanelField;
+use crate::commands::{commands, menu_groups, MenuEntry};
 use crate::docker_panel::DockerTab;
 use crate::editor::cursor_line_column;
 use crate::folding::VisualLines;
@@ -68,8 +69,9 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// so it never had this failure mode to begin with). The ribbon is the
 /// same kind of always-reserved row (`tui-key-hint-ribbon.md` §3.1) --
 /// unlike the `Bottom` dock tab, it is visible on every `AppScreen`, not
-/// just `Editor`.
-pub const EDITOR_CHROME_ROWS: u16 = 7;
+/// just `Editor`. The menu bar (`tui-menu-bar.md` §2.3, T54) is the same
+/// kind of always-reserved row too, one above the screen tab bar.
+pub const EDITOR_CHROME_ROWS: u16 = 8;
 
 /// Right-margin guide column (`docs/features/right-margin-guide.md` §1) --
 /// always this literal value in `ide-tui`, unlike `ide-ui` where it's
@@ -155,6 +157,18 @@ pub struct HitMap {
     /// dispatch reads `bottom_dock.as_ref().map(|d| d.tab)` to know which
     /// panel's scroll field to mutate.
     pub dock_secondary_area: Option<Rect>,
+    /// Top menu bar label click regions (`docs/features/tui-menu-bar.md`
+    /// §2.3, T54), keyed by index into `commands::menu_groups()` --
+    /// mirrors `screen_tabs`'s own `Vec<(Rect, _)>` shape.
+    pub menu_bar_labels: Vec<(Rect, usize)>,
+    /// The open dropdown's row click regions, keyed by index into that
+    /// group's own `entries` slice (`tui-menu-bar.md` §2.3, T54). Empty
+    /// whenever no menu is open.
+    pub menu_dropdown_items: Vec<(Rect, usize)>,
+    /// The open flyout's row click regions, keyed by index into the
+    /// selected `Submenu` entry's own id list (`tui-menu-bar.md` §2.3,
+    /// T54). Empty whenever no flyout is open.
+    pub menu_submenu_items: Vec<(Rect, usize)>,
 }
 
 /// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
@@ -168,16 +182,19 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         .direction(LayoutDirection::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(size);
-    let tab_bar_area = rows[0];
-    let body = rows[1];
-    let status_area = rows[2];
-    let ribbon_area = rows[3];
+    let menu_bar_area = rows[0];
+    let tab_bar_area = rows[1];
+    let body = rows[2];
+    let status_area = rows[3];
+    let ribbon_area = rows[4];
 
+    render_menu_bar(frame, app, menu_bar_area, hits);
     render_screen_tabs(frame, app, tab_bar_area, hits);
 
     match app.active_screen {
@@ -227,6 +244,13 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     render_status(frame, app, status_area);
     render_key_hint_ribbon(frame, app, ribbon_area, hits);
+
+    if let Some(open) = app.menu_bar.open {
+        let dropdown_rect = render_menu_dropdown(frame, app, open, size, hits);
+        if app.menu_bar.submenu_selected.is_some() {
+            render_menu_submenu(frame, app, open, dropdown_rect, size, hits);
+        }
+    }
 
     if app.palette.is_some() {
         render_palette(frame, app, size);
@@ -892,6 +916,208 @@ fn render_screen_tabs(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMa
     );
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The always-visible top menu bar row, one above the screen tab bar
+/// (`docs/features/tui-menu-bar.md` §2.3/§3.1, T54). The open menu (if
+/// any) is highlighted the same `Modifier::REVERSED` way `render_screen_
+/// tabs` highlights the active screen; each label's mnemonic character is
+/// underlined via `Modifier::UNDERLINED` -- a UI navigation gesture, not a
+/// `Command` keybinding (`tui-menu-bar.md` §2.1), so it's drawn here
+/// rather than sourced from `keymap::label`.
+fn render_menu_bar(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut column = area.x;
+    for (i, group) in menu_groups().iter().enumerate() {
+        let base_style = if app.menu_bar.open == Some(i) {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let width = group.title.chars().count() as u16 + 2;
+        hits.menu_bar_labels.push((
+            Rect {
+                x: column,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            i,
+        ));
+        column += width;
+
+        spans.push(Span::styled(" ", base_style));
+        let mut mnemonic_drawn = false;
+        for c in group.title.chars() {
+            if !mnemonic_drawn && c.eq_ignore_ascii_case(&group.mnemonic) {
+                spans.push(Span::styled(
+                    c.to_string(),
+                    base_style.add_modifier(Modifier::UNDERLINED),
+                ));
+                mnemonic_drawn = true;
+            } else {
+                spans.push(Span::styled(c.to_string(), base_style));
+            }
+        }
+        spans.push(Span::styled(" ", base_style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// One row's display label within an open dropdown/flyout (`tui-menu-bar
+/// .md` §2.3, T54) -- an `Item` shows its command title plus its current
+/// effective binding (mirrors `render_keymap_popup`'s own `cmd.title`/
+/// `effective_binding` pairing exactly, so a rebind made in Keymap
+/// Settings is reflected here too); a `Submenu` shows its own title plus a
+/// flyout indicator, never a binding (it isn't a command, it has none).
+fn menu_entry_label(app: &App, entry: &MenuEntry) -> String {
+    match entry {
+        MenuEntry::Item(id) => {
+            let title = commands()
+                .iter()
+                .find(|command| command.id == *id)
+                .map(|command| command.title)
+                .unwrap_or(*id);
+            match app.keymap.effective_binding(id) {
+                Some(chord) => format!("{title}  {}", crate::keymap::label(chord)),
+                None => title.to_string(),
+            }
+        }
+        MenuEntry::Submenu(title, _) => format!("{title}  \u{25b8}"),
+    }
+}
+
+/// The open top-level menu's dropdown (`tui-menu-bar.md` §2.3/§3.1, T54) --
+/// anchored under its bar label, left-aligned, clamped to stay on screen.
+/// Returns the drawn `Rect` so `render`'s caller can anchor a flyout off
+/// its right edge without recomputing this geometry a second time.
+fn render_menu_dropdown(
+    frame: &mut Frame,
+    app: &App,
+    open: usize,
+    area: Rect,
+    hits: &mut HitMap,
+) -> Rect {
+    let group = &menu_groups()[open];
+    let anchor_x = hits
+        .menu_bar_labels
+        .iter()
+        .find(|(_, i)| *i == open)
+        .map(|(rect, _)| rect.x)
+        .unwrap_or(area.x);
+    let labels: Vec<String> = group
+        .entries
+        .iter()
+        .map(|entry| menu_entry_label(app, entry))
+        .collect();
+    let content_width = labels
+        .iter()
+        .map(|label| label.chars().count() as u16)
+        .max()
+        .unwrap_or(10);
+    let width = (content_width + 4).clamp(16, area.width.saturating_sub(2).max(16));
+    let height = (group.entries.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let x = anchor_x.min(area.width.saturating_sub(width));
+    let popup = Rect {
+        x,
+        y: 1,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title(group.title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    for (i, label) in labels.into_iter().enumerate() {
+        let row_y = inner.y + i as u16;
+        if row_y >= inner.y + inner.height {
+            break;
+        }
+        let row = Rect {
+            x: inner.x,
+            y: row_y,
+            width: inner.width,
+            height: 1,
+        };
+        hits.menu_dropdown_items.push((row, i));
+        let style = if i == app.menu_bar.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), row);
+    }
+    popup
+}
+
+/// The open flyout, one level deep off the dropdown's currently-selected
+/// `Submenu` row (`tui-menu-bar.md` §2.3/§3.1, T54) -- anchored to the
+/// right of `dropdown_rect` (the `Rect` `render_menu_dropdown` just
+/// returned), clamped to stay on screen. A no-op if `menu_bar.selected`
+/// doesn't currently point at a `Submenu` entry (defensive only --
+/// `handle_menu_bar_key`/`handle_menu_bar_click` never set `submenu_
+/// selected` to `Some` unless it does).
+fn render_menu_submenu(
+    frame: &mut Frame,
+    app: &App,
+    open: usize,
+    dropdown_rect: Rect,
+    area: Rect,
+    hits: &mut HitMap,
+) {
+    let group = &menu_groups()[open];
+    let Some(MenuEntry::Submenu(title, ids)) = group.entries.get(app.menu_bar.selected) else {
+        return;
+    };
+    let Some(sub_selected) = app.menu_bar.submenu_selected else {
+        return;
+    };
+
+    let labels: Vec<String> = ids
+        .iter()
+        .map(|id| menu_entry_label(app, &MenuEntry::Item(id)))
+        .collect();
+    let content_width = labels
+        .iter()
+        .map(|label| label.chars().count() as u16)
+        .max()
+        .unwrap_or(10);
+    let width = (content_width + 4).clamp(16, area.width.saturating_sub(2).max(16));
+    let height = (ids.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let x = (dropdown_rect.x + dropdown_rect.width).min(area.width.saturating_sub(width));
+    let popup = Rect {
+        x,
+        y: dropdown_rect.y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title(*title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    for (i, label) in labels.into_iter().enumerate() {
+        let row_y = inner.y + i as u16;
+        if row_y >= inner.y + inner.height {
+            break;
+        }
+        let row = Rect {
+            x: inner.x,
+            y: row_y,
+            width: inner.width,
+            height: 1,
+        };
+        hits.menu_submenu_items.push((row, i));
+        let style = if i == sub_selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), row);
+    }
 }
 
 fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
