@@ -21,15 +21,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::agent_panel::AgentDisplayEntry;
 use crate::ai_panel::AiDisplayMessage;
 use crate::app::{
     ActionFormField, App, AppScreen, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView,
-    DebugPanelFocus, FilterField, Focus, GitPanelFocus, GitPanelState, GitPanelView, LeftDockState,
-    LeftDockTab, SearchInPathField,
+    DebugPanelFocus, FilterField, FinderRow, Focus, FormKind, GitPanelFocus, GitPanelState,
+    GitPanelView, LeftDockState, LeftDockTab, SearchInPathField,
 };
 use crate::claude_panel::ClaudeMessage;
 use crate::claude_terminal::{AnsiColor, Cell};
 use crate::clone_panel::ClonePanelField;
+use crate::commands::{commands, menu_groups, MenuEntry};
 use crate::docker_panel::DockerTab;
 use crate::editor::cursor_line_column;
 use crate::folding::VisualLines;
@@ -42,9 +44,11 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// Non-text rows around the editor's visible buffer content: the
 /// permanent screen tab bar (1 row, `docs/features/
 /// tui-screen-navigation.md` §2.3/§4, T44) plus the status
-/// bar (`render`'s own vertical split, 1 row) plus `render_editor`'s
-/// `Block`'s top/bottom borders (2 rows) plus the tab strip (1 row) plus
-/// the breadcrumbs strip (1 row, `docs/features/
+/// bar (`render`'s own vertical split, 1 row) plus the persistent
+/// key-hint ribbon (1 row, `docs/features/tui-key-hint-ribbon.md` §2.4,
+/// T48 -- the fourth and last row of `render`'s own outer split) plus
+/// `render_editor`'s `Block`'s top/bottom borders (2 rows) plus the tab
+/// strip (1 row) plus the breadcrumbs strip (1 row, `docs/features/
 /// tui-file-structure-and-breadcrumbs.md` §3.4). This
 /// crate has no scroll-follows-cursor logic inside this file (this file
 /// mutates nothing, per its own doc comment above) -- `app.rs`'s
@@ -63,8 +67,12 @@ use crate::k8s_panel::{K8sPicker, K8sTab};
 /// enters/leaves a symbol, since this constant is read before any
 /// `Layout` pass runs (`tui-file-structure-and-breadcrumbs.md` §3.4
 /// spells out why; the screen tab bar is unconditional by construction
-/// so it never had this failure mode to begin with).
-pub const EDITOR_CHROME_ROWS: u16 = 6;
+/// so it never had this failure mode to begin with). The ribbon is the
+/// same kind of always-reserved row (`tui-key-hint-ribbon.md` §3.1) --
+/// unlike the `Bottom` dock tab, it is visible on every `AppScreen`, not
+/// just `Editor`. The menu bar (`tui-menu-bar.md` §2.3, T54) is the same
+/// kind of always-reserved row too, one above the screen tab bar.
+pub const EDITOR_CHROME_ROWS: u16 = 8;
 
 /// Right-margin guide column (`docs/features/right-margin-guide.md` §1) --
 /// always this literal value in `ide-tui`, unlike `ide-ui` where it's
@@ -95,6 +103,73 @@ pub struct HitMap {
     /// §3.2.4) -- Docker/Kubernetes/Cargo/
     /// Custom Actions/Problems/Git Log, same shape as `screen_tabs`.
     pub bottom_dock_tabs: Vec<(Rect, BottomDockTab)>,
+    /// `Top`-slot custom action click regions, right-aligned on the screen
+    /// tab bar (`docs/features/tui-custom-actions-edge-slots.md` §3.1,
+    /// T47) -- mouse-click-only, no keyboard focus target (see that doc's
+    /// §3.1 for why).
+    pub top_action_hits: Vec<(Rect, crate::custom_actions::CustomAction)>,
+    /// `Outline`-slot custom action click regions, right-aligned on the
+    /// breadcrumbs row (`docs/features/tui-custom-actions-edge-slots.md`
+    /// §3.1, T47) -- same mouse-click-only scope as `top_action_hits`.
+    pub outline_action_hits: Vec<(Rect, crate::custom_actions::CustomAction)>,
+    /// `Ribbon`-slot custom action click regions, on the persistent
+    /// key-hint ribbon (`docs/features/tui-key-hint-ribbon.md` §2.4,
+    /// T48) -- same mouse-click-only scope as `top_action_hits`/
+    /// `outline_action_hits`.
+    pub ribbon_action_hits: Vec<(Rect, crate::custom_actions::CustomAction)>,
+    /// The ribbon's own `[+]` affordance click region (`docs/features/
+    /// tui-key-hint-ribbon.md` §2.4/§3.2, T48) -- a single optional
+    /// `Rect`, not a `Vec`, since there is always exactly one `[+]`.
+    pub ribbon_add_hit: Option<Rect>,
+    /// The left dock's active-tab body area (`rows[1]` in
+    /// `render_left_dock`, below its one-row tab strip) -- populated
+    /// whenever the left dock renders at all, regardless of which tab is
+    /// active (`docs/features/tui-panel-focus-and-scroll.md` §2.1, T51).
+    pub left_dock_body: Option<Rect>,
+    /// Mirrors `left_dock_body` for the bottom dock (`rows[1]` in
+    /// `render_bottom_dock`).
+    pub bottom_dock_body: Option<Rect>,
+    /// The Git panel's commit graph list, populated by `render_git_left_
+    /// column` whenever the Log view renders -- also reused verbatim by
+    /// the bottom-dock Git Log tab's own graph pane, since both share that
+    /// one render function and only one of the two is ever on screen in a
+    /// given frame (`docs/features/tui-panel-pane-scroll.md` §2.1, T53).
+    pub git_graph_area: Option<Rect>,
+    /// The Git panel's Conflicts list, populated only while `!app.git.
+    /// conflicts.is_empty()` (`tui-panel-pane-scroll.md` §2.1, T53). Not
+    /// reused by the dock's Git Log tab -- `GitLogDockState` has no
+    /// `conflicts_selected` field to scroll, so wheel-scroll over this
+    /// area in that context is deliberately left unhandled.
+    pub git_conflicts_area: Option<Rect>,
+    /// The Git panel's Diff pane, populated only when a diff (not conflict
+    /// resolution) is showing -- reused by the dock's Git Log tab like
+    /// `git_graph_area` (`tui-panel-pane-scroll.md` §2.1, T53).
+    pub git_diff_area: Option<Rect>,
+    /// The Git panel's Changes-view Staged list (`tui-panel-pane-scroll.md`
+    /// §2.1, T53).
+    pub git_staged_area: Option<Rect>,
+    /// The Git panel's Changes-view Unstaged list (`tui-panel-pane-scroll.
+    /// md` §2.1, T53).
+    pub git_unstaged_area: Option<Rect>,
+    /// The bottom dock's "secondary" pane -- Docker/Kubernetes' logs
+    /// column, Custom Actions' output row -- for whichever tab is active
+    /// (`tui-panel-pane-scroll.md` §2.2, T53). One generic field, not one
+    /// per tab, since only one bottom-dock tab is ever rendered at a time;
+    /// dispatch reads `bottom_dock.as_ref().map(|d| d.tab)` to know which
+    /// panel's scroll field to mutate.
+    pub dock_secondary_area: Option<Rect>,
+    /// Top menu bar label click regions (`docs/features/tui-menu-bar.md`
+    /// §2.3, T54), keyed by index into `commands::menu_groups()` --
+    /// mirrors `screen_tabs`'s own `Vec<(Rect, _)>` shape.
+    pub menu_bar_labels: Vec<(Rect, usize)>,
+    /// The open dropdown's row click regions, keyed by index into that
+    /// group's own `entries` slice (`tui-menu-bar.md` §2.3, T54). Empty
+    /// whenever no menu is open.
+    pub menu_dropdown_items: Vec<(Rect, usize)>,
+    /// The open flyout's row click regions, keyed by index into the
+    /// selected `Submenu` entry's own id list (`tui-menu-bar.md` §2.3,
+    /// T54). Empty whenever no flyout is open.
+    pub menu_submenu_items: Vec<(Rect, usize)>,
 }
 
 /// Reads `App`'s state only, mutates nothing on `App` -- unchanged from
@@ -108,14 +183,19 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         .direction(LayoutDirection::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(size);
-    let tab_bar_area = rows[0];
-    let body = rows[1];
-    let status_area = rows[2];
+    let menu_bar_area = rows[0];
+    let tab_bar_area = rows[1];
+    let body = rows[2];
+    let status_area = rows[3];
+    let ribbon_area = rows[4];
 
+    render_menu_bar(frame, app, menu_bar_area, hits);
     render_screen_tabs(frame, app, tab_bar_area, hits);
 
     match app.active_screen {
@@ -159,17 +239,28 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
                 render_bottom_dock(frame, app, dock, rows2[1], hits);
             }
         }
-        AppScreen::Git => render_git_panel(frame, app, body),
+        AppScreen::Git => render_git_panel(frame, app, body, hits),
         AppScreen::Run => render_cargo_panel(frame, app, body),
         AppScreen::Keys => render_keys_screen(frame, app, body),
     }
     render_status(frame, app, status_area);
+    render_key_hint_ribbon(frame, app, ribbon_area, hits);
+
+    if let Some(open) = app.menu_bar.open {
+        let dropdown_rect = render_menu_dropdown(frame, app, open, size, hits);
+        if app.menu_bar.submenu_selected.is_some() {
+            render_menu_submenu(frame, app, open, dropdown_rect, size, hits);
+        }
+    }
 
     if app.palette.is_some() {
         render_palette(frame, app, size);
     }
     if app.colon_command.is_some() {
         render_colon_command(frame, app, size);
+    }
+    if app.unified_finder.is_some() {
+        render_unified_finder(frame, app, size);
     }
     if app.goto.is_some() {
         render_goto_popup(frame, app, size);
@@ -208,6 +299,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     if app.git_gutter_popup_line.is_some() {
         render_git_gutter_popup(frame, app, size);
+    }
+    if app.gutter_context_menu.is_some() {
+        render_gutter_context_menu(frame, app, size);
     }
     if app.clone_panel_open {
         render_clone_panel(frame, app, size);
@@ -256,6 +350,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     }
     if app.debug_panel_open {
         render_debug_panel(frame, app, size);
+    }
+    if app.agent.pending_approval.is_some() {
+        render_agent_approval_popup(frame, app, size);
     }
 }
 
@@ -367,13 +464,19 @@ fn render_left_dock(
         rows[0],
         focus_style(app, Focus::LeftDock),
         &mut hits.left_dock_tabs,
-        &[(LeftDockTab::Files, "Files"), (LeftDockTab::Todos, "Todos")],
+        &[
+            (LeftDockTab::Files, "Files"),
+            (LeftDockTab::Todos, "Todos"),
+            (LeftDockTab::Actions, "Actions"),
+        ],
         dock.tab,
     );
+    hits.left_dock_body = Some(rows[1]);
 
     match dock.tab {
         LeftDockTab::Files => render_tree(frame, app, rows[1], hits),
         LeftDockTab::Todos => render_todo_panel(frame, app, rows[1], dock.todos_selected),
+        LeftDockTab::Actions => render_tree_actions_tab(frame, app, rows[1]),
     }
 }
 
@@ -439,6 +542,7 @@ fn render_bottom_dock(
         &[
             (BottomDockTab::Docker, "Docker"),
             (BottomDockTab::Ai, "AI"),
+            (BottomDockTab::Agent, "Agent"),
             (BottomDockTab::Kubernetes, "Kubernetes"),
             (BottomDockTab::Cargo, "Cargo"),
             (BottomDockTab::CustomActions, "Custom Actions"),
@@ -447,12 +551,14 @@ fn render_bottom_dock(
         ],
         dock.tab,
     );
+    hits.bottom_dock_body = Some(rows[1]);
     match dock.tab {
-        BottomDockTab::Docker => render_docker_panel(frame, app, rows[1]),
+        BottomDockTab::Docker => render_docker_panel(frame, app, rows[1], hits),
         BottomDockTab::Ai => render_ai_panel(frame, app, rows[1]),
-        BottomDockTab::Kubernetes => render_k8s_panel(frame, app, rows[1]),
+        BottomDockTab::Agent => render_agent_panel(frame, app, rows[1]),
+        BottomDockTab::Kubernetes => render_k8s_panel(frame, app, rows[1], hits),
         BottomDockTab::Cargo => render_cargo_panel(frame, app, rows[1]),
-        BottomDockTab::CustomActions => render_custom_actions_panel(frame, app, rows[1]),
+        BottomDockTab::CustomActions => render_custom_actions_panel(frame, app, rows[1], hits),
         BottomDockTab::Problems => {
             render_problems_panel(frame, app, rows[1], dock.problems_selected)
         }
@@ -464,7 +570,7 @@ fn render_bottom_dock(
                 diff_scroll: app.git_log_dock.diff_scroll,
                 ..GitPanelState::default()
             };
-            render_git_log_view(frame, app, &state, rows[1]);
+            render_git_log_view(frame, app, &state, rows[1], hits);
         }
     }
 }
@@ -502,7 +608,7 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let text_area = sections[2];
 
     render_tab_strip(frame, app, strip_area, hits);
-    render_breadcrumbs(frame, app, breadcrumbs_area);
+    render_breadcrumbs(frame, app, breadcrumbs_area, hits);
     hits.editor_text_area = Some(text_area);
 
     let Some(buf) = app.active_buffer() else {
@@ -592,6 +698,21 @@ fn render_editor(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
                     " \u{22ef}",
                     Style::default().fg(theme.fold_marker_fg),
                 ));
+            }
+            // Line-number lane (`docs/features/tui-gutter-line-numbers.md`
+            // §2.9/§3.1, T50) -- prepended before the git-gutter lane so
+            // the final left-to-right order (blame, git-gutter,
+            // line-number, text) matches `editor_lane_width`'s summation
+            // order and `ide-ui`'s own documented lane ordering
+            // ("blame left of line numbers", `crates/ui/src/editor/
+            // geometry.rs:78`).
+            let line_number_lane_width = app.line_number_lane_width();
+            if line_number_lane_width > 0 {
+                let digits = line_number_lane_width as usize - 1;
+                let number = format!("{:>digits$} ", line + 1, digits = digits);
+                let mut spans = vec![Span::styled(number, Style::default().fg(theme.gutter_fg))];
+                spans.extend(styled.spans);
+                styled = Line::from(spans);
             }
             if app.git_gutter_lane_width() > 0 {
                 let mark = app.git_gutter.iter().find(|m| m.line == line);
@@ -699,6 +820,58 @@ fn blame_lane_prefix(
     format!("{label:<BLAME_LANE_CHARS$} ")
 }
 
+/// Appends `actions`' `[Name]` labels right-aligned within `area`, after
+/// whatever's already in `spans` (which occupies `[area.x, column)`) --
+/// shared by `render_screen_tabs`' `Top` slot and `render_breadcrumbs`'
+/// `Outline` slot (`docs/features/tui-custom-actions-edge-slots.md` §3.1,
+/// T47). A no-op (no padding spacer, no hit regions) when `actions` is
+/// empty, so it never turns an otherwise-blank row non-blank.
+fn append_right_aligned_actions(
+    spans: &mut Vec<Span<'static>>,
+    hit_regions: &mut Vec<(Rect, crate::custom_actions::CustomAction)>,
+    actions: Vec<crate::custom_actions::CustomAction>,
+    area: Rect,
+    column: u16,
+) {
+    if actions.is_empty() {
+        return;
+    }
+    let items: Vec<(crate::custom_actions::CustomAction, String, u16)> = actions
+        .into_iter()
+        .map(|a| {
+            let label = format!("[{}]", a.name);
+            let width = Span::raw(label.clone()).width() as u16;
+            (a, label, width)
+        })
+        .collect();
+    let total_width: u16 =
+        items.iter().map(|(_, _, w)| *w).sum::<u16>() + 2 * items.len().saturating_sub(1) as u16;
+    let start_x = (area.x + area.width)
+        .saturating_sub(total_width)
+        .max(column);
+    if start_x > column {
+        spans.push(Span::raw(" ".repeat((start_x - column) as usize)));
+    }
+    let mut x = start_x;
+    for (i, (action, label, width)) in items.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            x += 2;
+        }
+        hit_regions.push((
+            Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            action,
+        ));
+        x += width;
+        spans.push(Span::raw(label));
+    }
+}
+
 /// Permanent screen tab bar (`docs/features/tui-screen-navigation.md`
 /// §2.3, T44) -- always rendered, the first row of every frame regardless
 /// of `active_screen`, same "unconditional chrome row" precedent
@@ -736,7 +909,234 @@ fn render_screen_tabs(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMa
         column += width;
         spans.push(Span::styled(*label, style));
     }
+
+    let top_actions = app
+        .custom_actions
+        .actions_for_slot(crate::custom_actions::ActionSlot::Top);
+    append_right_aligned_actions(
+        &mut spans,
+        &mut hits.top_action_hits,
+        top_actions,
+        area,
+        column,
+    );
+
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The always-visible top menu bar row, one above the screen tab bar
+/// (`docs/features/tui-menu-bar.md` §2.3/§3.1, T54). The open menu (if
+/// any) is highlighted the same `Modifier::REVERSED` way `render_screen_
+/// tabs` highlights the active screen; each label's mnemonic character is
+/// underlined via `Modifier::UNDERLINED` -- a UI navigation gesture, not a
+/// `Command` keybinding (`tui-menu-bar.md` §2.1), so it's drawn here
+/// rather than sourced from `keymap::label`.
+fn render_menu_bar(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut column = area.x;
+    for (i, group) in menu_groups().iter().enumerate() {
+        let base_style = if app.menu_bar.open == Some(i) {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        let width = group.title.chars().count() as u16 + 2;
+        hits.menu_bar_labels.push((
+            Rect {
+                x: column,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            i,
+        ));
+        column += width;
+
+        spans.push(Span::styled(" ", base_style));
+        let mut mnemonic_drawn = false;
+        for c in group.title.chars() {
+            if !mnemonic_drawn && c.eq_ignore_ascii_case(&group.mnemonic) {
+                spans.push(Span::styled(
+                    c.to_string(),
+                    base_style.add_modifier(Modifier::UNDERLINED),
+                ));
+                mnemonic_drawn = true;
+            } else {
+                spans.push(Span::styled(c.to_string(), base_style));
+            }
+        }
+        spans.push(Span::styled(" ", base_style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// One row's display label within an open dropdown/flyout (`tui-menu-bar
+/// .md` §2.3, T54) -- an `Item` shows its command title plus its current
+/// effective binding (mirrors `render_keymap_popup`'s own `cmd.title`/
+/// `effective_binding` pairing exactly, so a rebind made in Keymap
+/// Settings is reflected here too); a `Submenu` shows its own title plus a
+/// flyout indicator, never a binding (it isn't a command, it has none).
+fn menu_entry_label(app: &App, entry: &MenuEntry) -> String {
+    match entry {
+        MenuEntry::Item(id) => {
+            let title = commands()
+                .iter()
+                .find(|command| command.id == *id)
+                .map(|command| command.title)
+                .unwrap_or(*id);
+            match app.keymap.effective_binding(id) {
+                Some(chord) => format!("{title}  {}", crate::keymap::label(chord)),
+                None => title.to_string(),
+            }
+        }
+        MenuEntry::Submenu(title, _) => format!("{title}  \u{25b8}"),
+    }
+}
+
+/// The open top-level menu's dropdown (`tui-menu-bar.md` §2.3/§3.1, T54) --
+/// anchored under its bar label, left-aligned, clamped to stay on screen.
+/// Returns the drawn `Rect` so `render`'s caller can anchor a flyout off
+/// its right edge without recomputing this geometry a second time.
+fn render_menu_dropdown(
+    frame: &mut Frame,
+    app: &App,
+    open: usize,
+    area: Rect,
+    hits: &mut HitMap,
+) -> Rect {
+    let group = &menu_groups()[open];
+    let anchor_x = hits
+        .menu_bar_labels
+        .iter()
+        .find(|(_, i)| *i == open)
+        .map(|(rect, _)| rect.x)
+        .unwrap_or(area.x);
+    let labels: Vec<String> = group
+        .entries
+        .iter()
+        .map(|entry| menu_entry_label(app, entry))
+        .collect();
+    let content_width = labels
+        .iter()
+        .map(|label| label.chars().count() as u16)
+        .max()
+        .unwrap_or(10);
+    let width = (content_width + 4).clamp(16, area.width.saturating_sub(2).max(16));
+    let height = (group.entries.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let x = anchor_x.min(area.width.saturating_sub(width));
+    let popup = Rect {
+        x,
+        y: 1,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title(group.title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    for (i, label) in labels.into_iter().enumerate() {
+        let row_y = inner.y + i as u16;
+        if row_y >= inner.y + inner.height {
+            break;
+        }
+        let row = Rect {
+            x: inner.x,
+            y: row_y,
+            width: inner.width,
+            height: 1,
+        };
+        hits.menu_dropdown_items.push((row, i));
+        let style = if i == app.menu_bar.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), row);
+    }
+    popup
+}
+
+/// The open flyout, one level deep off the dropdown's currently-selected
+/// `Submenu` row (`tui-menu-bar.md` §2.3/§3.1, T54) -- anchored to the
+/// right of `dropdown_rect` (the `Rect` `render_menu_dropdown` just
+/// returned), clamped to stay on screen. A no-op if `menu_bar.selected`
+/// doesn't currently point at a `Submenu` entry (defensive only --
+/// `handle_menu_bar_key`/`handle_menu_bar_click` never set `submenu_
+/// selected` to `Some` unless it does).
+fn render_menu_submenu(
+    frame: &mut Frame,
+    app: &App,
+    open: usize,
+    dropdown_rect: Rect,
+    area: Rect,
+    hits: &mut HitMap,
+) {
+    let group = &menu_groups()[open];
+    let Some(MenuEntry::Submenu(title, ids)) = group.entries.get(app.menu_bar.selected) else {
+        return;
+    };
+    let Some(sub_selected) = app.menu_bar.submenu_selected else {
+        return;
+    };
+
+    let labels: Vec<String> = ids
+        .iter()
+        .map(|id| menu_entry_label(app, &MenuEntry::Item(id)))
+        .collect();
+    let content_width = labels
+        .iter()
+        .map(|label| label.chars().count() as u16)
+        .max()
+        .unwrap_or(10);
+    let width = (content_width + 4).clamp(16, area.width.saturating_sub(2).max(16));
+    let height = (ids.len() as u16 + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let x = (dropdown_rect.x + dropdown_rect.width).min(area.width.saturating_sub(width));
+    // `tui-menu-bar.md` §2.3: anchors to the highlighted `Submenu` row's
+    // own `y`, not the dropdown box's top border -- `hits.menu_dropdown_
+    // items` was already populated by this frame's earlier `render_menu_
+    // dropdown` call, keyed by entry index, so the row's real position is
+    // just a lookup, not a recomputation. Falls back to `dropdown_rect.y`
+    // defensively (should never miss: `app.menu_bar.selected` is always a
+    // valid `entries` index while a flyout is open).
+    let y = hits
+        .menu_dropdown_items
+        .iter()
+        .find(|(_, i)| *i == app.menu_bar.selected)
+        .map(|(rect, _)| rect.y)
+        .unwrap_or(dropdown_rect.y);
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title(*title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    for (i, label) in labels.into_iter().enumerate() {
+        let row_y = inner.y + i as u16;
+        if row_y >= inner.y + inner.height {
+            break;
+        }
+        let row = Rect {
+            x: inner.x,
+            y: row_y,
+            width: inner.width,
+            height: 1,
+        };
+        hits.menu_submenu_items.push((row, i));
+        let style = if i == sub_selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), row);
+    }
 }
 
 fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
@@ -787,17 +1187,34 @@ fn render_tab_strip(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap)
 /// Renders a blank row (not a placeholder) when `active_breadcrumbs()` is
 /// empty, matching `render_git_gutter`'s existing "nothing to show today"
 /// convention.
-fn render_breadcrumbs(frame: &mut Frame, app: &App, area: Rect) {
+fn render_breadcrumbs(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let crumbs = app.active_breadcrumbs();
-    if crumbs.is_empty() {
-        return;
-    }
-    let mut spans = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut column = area.x;
     for (i, symbol) in crumbs.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw(" \u{203a} "));
+            let sep = " \u{203a} ";
+            column += Span::raw(sep).width() as u16;
+            spans.push(Span::raw(sep));
         }
-        spans.push(Span::raw(symbol.name.clone()));
+        let name = symbol.name.clone();
+        column += Span::raw(name.as_str()).width() as u16;
+        spans.push(Span::raw(name));
+    }
+
+    let outline_actions = app
+        .custom_actions
+        .actions_for_slot(crate::custom_actions::ActionSlot::Outline);
+    append_right_aligned_actions(
+        &mut spans,
+        &mut hits.outline_action_hits,
+        outline_actions,
+        area,
+        column,
+    );
+
+    if spans.is_empty() {
+        return;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -832,6 +1249,75 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         text.push_str(&format!("  [{problem_count} problems]"));
     }
     frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Persistent bottom key-hint ribbon (`docs/features/
+/// tui-key-hint-ribbon.md` §2.4/§3.2, T48) -- visible under every
+/// `AppScreen`, unlike the `Bottom` dock tab which only exists inside
+/// `Editor`. Left-aligned: `App::key_hint_rows`' fixed, curated hints.
+/// Right-aligned: every `Ribbon`-slot custom action as a clickable
+/// `[Name]` label (same shared right-alignment technique `T47`'s
+/// `append_right_aligned_actions` established for `Top`/`Outline`,
+/// generalized here to also place the non-`CustomAction` `[+]` marker at
+/// the end of the same group), followed by the ribbon's own `[+]`
+/// affordance.
+fn render_key_hint_ribbon(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    use crate::custom_actions::ActionSlot;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut column = area.x;
+    for (i, (title, binding)) in app.key_hint_rows().into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            column += 2;
+        }
+        let text = format!("{binding} {title}");
+        column += Span::raw(text.as_str()).width() as u16;
+        spans.push(Span::raw(text));
+    }
+
+    let ribbon_actions = app.custom_actions.actions_for_slot(ActionSlot::Ribbon);
+    let plus_label = "[+]";
+    let plus_width = Span::raw(plus_label).width() as u16;
+    let mut right_items: Vec<(Option<crate::custom_actions::CustomAction>, String, u16)> =
+        ribbon_actions
+            .into_iter()
+            .map(|a| {
+                let label = format!("[{}]", a.name);
+                let width = Span::raw(label.clone()).width() as u16;
+                (Some(a), label, width)
+            })
+            .collect();
+    right_items.push((None, plus_label.to_string(), plus_width));
+
+    let total_width: u16 = right_items.iter().map(|(_, _, w)| *w).sum::<u16>()
+        + 2 * right_items.len().saturating_sub(1) as u16;
+    let start_x = (area.x + area.width)
+        .saturating_sub(total_width)
+        .max(column);
+    if start_x > column {
+        spans.push(Span::raw(" ".repeat((start_x - column) as usize)));
+    }
+    let mut x = start_x;
+    for (i, (action, label, width)) in right_items.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            x += 2;
+        }
+        let rect = Rect {
+            x,
+            y: area.y,
+            width,
+            height: 1,
+        };
+        match action {
+            Some(a) => hits.ribbon_action_hits.push((rect, a)),
+            None => hits.ribbon_add_hit = Some(rect),
+        }
+        x += width;
+        spans.push(Span::raw(label));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Fixed row budget for the popup body (excludes the top/bottom border),
@@ -927,6 +1413,68 @@ fn render_colon_command(frame: &mut Frame, app: &App, area: Rect) {
     let mut list_state = ListState::default();
     list_state.select(Some(state.selected));
     frame.render_stateful_widget(list, popup, &mut list_state);
+}
+
+/// `⇧⇧`'s popup (`docs/features/tui-unified-finder.md` §3.4). Same
+/// near-fullscreen-minus-margin geometry `render_go_to_file_popup` uses
+/// (not the small fixed-height box `render_palette`/`render_colon_command`
+/// use) -- a merged three-source list needs the room a single-category one
+/// doesn't. Reuses `render_scrollable_list` verbatim; no new list-
+/// rendering logic.
+fn render_unified_finder(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.unified_finder.as_ref() else {
+        return;
+    };
+    let rows = app.unified_finder_rows();
+    let width = area.width.saturating_sub(4).max(20);
+    let height = area.height.saturating_sub(4).max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let items: Vec<ListItem> = if state.query.trim().is_empty() {
+        vec![ListItem::new(Line::from(
+            "Type to search files, symbols, and actions.",
+        ))]
+    } else if rows.is_empty() {
+        vec![ListItem::new(Line::from("No results."))]
+    } else {
+        rows.iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let style = if i == state.selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let text = match row {
+                    FinderRow::File(m) => m.relative.clone(),
+                    FinderRow::Symbol(s) => {
+                        let container = s
+                            .container_name
+                            .as_deref()
+                            .map(|c| format!(" -- {c}"))
+                            .unwrap_or_default();
+                        format!("{} ({:?}){container}", s.name, s.kind)
+                    }
+                    FinderRow::Command(cmd) => format!("{}  ({})", cmd.title, cmd.id),
+                };
+                ListItem::new(Line::from(Span::styled(text, style)))
+            })
+            .collect()
+    };
+
+    let title = format!(
+        "Search Everywhere: {}  (Enter: open, Esc: close)",
+        state.query
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 fn render_goto_popup(frame: &mut Frame, app: &App, area: Rect) {
@@ -1526,9 +2074,9 @@ fn render_claude_tab_strip(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// No scroll-back in v1, same precedent as `render_cargo_panel` (`docs/
-/// features/tui-claude-panel.md` §1.1): only the tail of `history` that
-/// fits `area` renders.
+/// Scroll-back via `claude.history_scroll` (`docs/features/
+/// tui-panel-history-scroll.md` §2.3/§3.1, T52 -- revises this function's
+/// previous "no scroll-back in v1" cut, `tui-claude-panel.md` §1.1).
 fn render_claude_chat(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(LayoutDirection::Vertical)
@@ -1545,8 +2093,10 @@ fn render_claude_chat(frame: &mut Frame, app: &App, area: Rect) {
         .map(|m| claude_message_line(m, theme))
         .collect();
     let visible_rows = history_area.height as usize;
-    let start = lines.len().saturating_sub(visible_rows);
-    frame.render_widget(Paragraph::new(lines[start..].to_vec()), history_area);
+    frame.render_widget(
+        Paragraph::new(tail_window(&lines, visible_rows, app.claude.history_scroll).to_vec()),
+        history_area,
+    );
 
     let prefix = if app.claude.is_in_flight() {
         "(running) > "
@@ -1604,8 +2154,10 @@ fn render_ai_panel(frame: &mut Frame, app: &App, area: Rect) {
         .map(|m| ai_message_line(m, theme))
         .collect();
     let visible_rows = rows[1].height as usize;
-    let start = lines.len().saturating_sub(visible_rows);
-    frame.render_widget(Paragraph::new(lines[start..].to_vec()), rows[1]);
+    frame.render_widget(
+        Paragraph::new(tail_window(&lines, visible_rows, app.ai.history_scroll).to_vec()),
+        rows[1],
+    );
 
     let prefix = if app.ai.is_in_flight() {
         "(streaming) > "
@@ -1613,6 +2165,131 @@ fn render_ai_panel(frame: &mut Frame, app: &App, area: Rect) {
         "> "
     };
     frame.render_widget(Paragraph::new(format!("{prefix}{}", app.ai.input)), rows[2]);
+}
+
+/// `BottomDockTab::Agent` (`docs/features/tui-local-agent.md` §2) --
+/// mirrors `render_ai_panel`'s exact three-row shape (status/history/
+/// input); the status row additionally shows the current `PermissionMode`
+/// since that's this panel's own extra piece of visible state.
+fn render_agent_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let theme = app.theme.theme();
+
+    let mode = match app.agent.mode {
+        ide_ai::PermissionMode::Plan => "Plan",
+        ide_ai::PermissionMode::Approve => "Approve",
+        ide_ai::PermissionMode::Auto => "Auto",
+    };
+    let mut status = format!("mode: {mode}");
+    if app.agent.is_in_flight() {
+        status.push_str("  |  running");
+    }
+    let status_style = if app.agent.is_in_flight() {
+        Style::default().fg(theme.chip_fg)
+    } else {
+        Style::default().fg(theme.gutter_fg)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(status, status_style))),
+        rows[0],
+    );
+
+    let lines: Vec<Line> = app
+        .agent
+        .history
+        .iter()
+        .map(|e| agent_entry_line(e, theme))
+        .collect();
+    let visible_rows = rows[1].height as usize;
+    frame.render_widget(
+        Paragraph::new(tail_window(&lines, visible_rows, app.agent.history_scroll).to_vec()),
+        rows[1],
+    );
+
+    let prefix = if app.agent.is_in_flight() {
+        "(running) > "
+    } else {
+        "> "
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{prefix}{}", app.agent.input)),
+        rows[2],
+    );
+}
+
+fn agent_entry_line(entry: &AgentDisplayEntry, theme: &crate::theme::Theme) -> Line<'static> {
+    match entry {
+        AgentDisplayEntry::User(t) => Line::from(format!("> {t}")),
+        AgentDisplayEntry::ModelText(t) => Line::from(t.clone()),
+        AgentDisplayEntry::ToolStarted(t) => Line::from(Span::styled(
+            format!("-- {t} --"),
+            Style::default().fg(theme.gutter_fg),
+        )),
+        AgentDisplayEntry::ToolFinished(t) => Line::from(t.clone()),
+        AgentDisplayEntry::ToolCallParseFailed(t) => Line::from(Span::styled(
+            format!("(unparsed tool call) {t}"),
+            Style::default().fg(theme.gutter_fg),
+        )),
+        AgentDisplayEntry::Error(t) => Line::from(Span::styled(
+            format!("error: {t}"),
+            Style::default().fg(theme.error_text),
+        )),
+    }
+}
+
+/// `AgentPanel::pending_approval` (`docs/features/tui-local-agent.md`
+/// §2.2) -- a blocking modal, same near-fullscreen shape `render_refactor_
+/// preview` uses (a mutating tool's diff/argv preview can run long), no
+/// scroll support: `pending_approval_preview`'s content is already bounded
+/// by `diff_text`'s own truncation, so v1 skips a dedicated scroll field.
+fn render_agent_approval_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(tool) = app.agent.pending_approval.as_ref() else {
+        return;
+    };
+    let width = area.width.saturating_sub(4).max(20);
+    let height = area.height.saturating_sub(4).max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Approve {}?  (y: approve, n/Esc: deny)",
+        agent_tool_label(tool)
+    ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines: Vec<Line> = app
+        .agent
+        .pending_approval_preview()
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn agent_tool_label(tool: &ide_agent::AgentTool) -> &'static str {
+    match tool {
+        ide_agent::AgentTool::ReadFile { .. } => "ReadFile",
+        ide_agent::AgentTool::SearchCode { .. } => "SearchCode",
+        ide_agent::AgentTool::ListDirectory { .. } => "ListDirectory",
+        ide_agent::AgentTool::ReadDockerLogs { .. } => "ReadDockerLogs",
+        ide_agent::AgentTool::EditFile { .. } => "EditFile",
+        ide_agent::AgentTool::RunShellCommand { .. } => "RunShellCommand",
+        ide_agent::AgentTool::DebugControl(_) => "DebugControl",
+    }
 }
 
 fn ai_message_line(message: &AiDisplayMessage, theme: &crate::theme::Theme) -> Line<'static> {
@@ -2053,16 +2730,30 @@ fn render_problems_panel(frame: &mut Frame, app: &App, area: Rect, selected: usi
 /// -- build/test output can run to thousands of lines, so this tab shows
 /// only the tail that fits, rather than growing to `output.len()`
 /// (`docs/features/tui-cargo-panel.md` §4: no scroll-back in v1).
+/// Windows `items` to the last `visible_rows` entries, offset back by
+/// `scroll` from the tail (`docs/features/tui-panel-history-scroll.md`
+/// §2.1/§3.1, T52) -- shared by every "live-tailing log" panel (Cargo
+/// output, Claude chat, AI chat). `scroll == 0` is the tail exactly as
+/// every one of these three rendered unconditionally before this
+/// feature; increasing it slides the window backward through history.
+/// Never panics: `scroll` is clamped to `items.len()` before use.
+fn tail_window<T>(items: &[T], visible_rows: usize, scroll: u16) -> &[T] {
+    let max_scroll = items.len().saturating_sub(visible_rows);
+    let scroll = (scroll as usize).min(max_scroll);
+    let end = items.len() - scroll;
+    let start = end.saturating_sub(visible_rows);
+    &items[start..end]
+}
+
 fn render_cargo_panel(frame: &mut Frame, app: &App, area: Rect) {
     let visible_rows = area.height.saturating_sub(2) as usize;
     let output = &app.cargo.output;
-    let start = output.len().saturating_sub(visible_rows);
     let items: Vec<ListItem> = if output.is_empty() {
         vec![ListItem::new(Line::from(
             "No output yet -- press b/r/t/c/l/f to run a command.",
         ))]
     } else {
-        output[start..]
+        tail_window(output, visible_rows, app.cargo.output_scroll)
             .iter()
             .map(|line| ListItem::new(Line::from(line.as_str())))
             .collect()
@@ -2076,28 +2767,44 @@ fn render_cargo_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(List::new(items).block(block), area);
 }
 
-/// Custom Actions dock tab (`docs/features/tui-custom-actions.md` §3.1) --
-/// mirrors `render_docker_panel`'s list-plus-output-area shape rather than
-/// `render_cargo_panel`'s single list, since here the declared-action list
-/// and the running output are two logically distinct things (Cargo only
-/// ever has its six fixed built-in subcommands, never a user-declared
-/// list to select from).
-fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let theme = app.theme.theme();
-    let rows = Layout::default()
-        .direction(LayoutDirection::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(0)])
-        .split(area);
+/// A `CustomAction`'s one-line list label -- `External` keeps `T42`'s own
+/// `name  --  command args` shape; `Builtin` shows the bound `Command::id`
+/// in brackets instead of a program name, so the two kinds are visually
+/// distinguishable at a glance (`docs/features/tui-custom-actions-edge-
+/// slots.md` §2.1/§3.1, T47).
+fn custom_action_label(action: &crate::custom_actions::CustomAction) -> String {
+    match &action.kind {
+        crate::custom_actions::CustomActionKind::External { command, args } => {
+            let args = args.join(" ");
+            if args.is_empty() {
+                format!("{}  --  {}", action.name, command)
+            } else {
+                format!("{}  --  {} {}", action.name, command, args)
+            }
+        }
+        crate::custom_actions::CustomActionKind::Builtin { command_id } => {
+            format!("{}  --  [{}]", action.name, command_id)
+        }
+    }
+}
 
-    let selected = app.custom_actions.selected;
-    let items: Vec<ListItem> = if app.custom_actions.actions.is_empty() {
+/// `LeftDockTab::Actions` -- the `Tree` slot (`docs/features/
+/// tui-custom-actions-edge-slots.md` §3.1) -- a plain scrollable list, no
+/// output pane (that's `External`-run-shaped state the `Bottom` slot's own
+/// tab already owns; a `Tree`-bound action's visible effect, `External` or
+/// `Builtin` alike, shows up wherever it always would -- the Bottom dock's
+/// Output pane for a subprocess, or the rest of the UI for a `Builtin`).
+fn render_tree_actions_tab(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::custom_actions::ActionSlot;
+    let slot_actions = app.custom_actions.actions_for_slot(ActionSlot::Tree);
+    let selected = app.custom_actions.selected(ActionSlot::Tree);
+    let items: Vec<ListItem> = if slot_actions.is_empty() {
         vec![ListItem::new(Line::from(
             "No custom actions declared -- open the command palette and run \
              \"Custom Actions: Manage\" to add one.",
         ))]
     } else {
-        app.custom_actions
-            .actions
+        slot_actions
             .iter()
             .enumerate()
             .map(|(i, action)| {
@@ -2106,13 +2813,48 @@ fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Style::default()
                 };
-                let args = action.args.join(" ");
-                let label = if args.is_empty() {
-                    format!("{}  --  {}", action.name, action.command)
+                ListItem::new(Line::from(Span::styled(custom_action_label(action), style)))
+            })
+            .collect()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Actions  (Enter: run)");
+    render_scrollable_list(frame, items, block, area, selected);
+}
+
+/// Custom Actions dock tab -- the `Bottom` slot (`docs/features/
+/// tui-custom-actions-edge-slots.md` §3.1) -- mirrors `render_docker_
+/// panel`'s list-plus-output-area shape rather than `render_cargo_panel`'s
+/// single list, since here the declared-action list and the running
+/// output are two logically distinct things (Cargo only ever has its six
+/// fixed built-in subcommands, never a user-declared list to select from).
+fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
+    use crate::custom_actions::ActionSlot;
+    let theme = app.theme.theme();
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([Constraint::Length(6), Constraint::Min(0)])
+        .split(area);
+
+    let slot_actions = app.custom_actions.actions_for_slot(ActionSlot::Bottom);
+    let selected = app.custom_actions.selected(ActionSlot::Bottom);
+    let items: Vec<ListItem> = if slot_actions.is_empty() {
+        vec![ListItem::new(Line::from(
+            "No custom actions declared -- open the command palette and run \
+             \"Custom Actions: Manage\" to add one.",
+        ))]
+    } else {
+        slot_actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let style = if i == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
                 } else {
-                    format!("{}  --  {} {}", action.name, action.command, args)
+                    Style::default()
                 };
-                ListItem::new(Line::from(Span::styled(label, style)))
+                ListItem::new(Line::from(Span::styled(custom_action_label(action), style)))
             })
             .collect()
     };
@@ -2120,14 +2862,15 @@ fn render_custom_actions_panel(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title("Custom Actions  (Enter: run)");
     render_scrollable_list(frame, items, list_block, rows[0], selected);
+    hits.dock_secondary_area = Some(rows[1]);
 
     let visible_rows = rows[1].height.saturating_sub(2) as usize;
     let output = &app.custom_actions.output;
-    let start = output.len().saturating_sub(visible_rows);
+    let windowed = tail_window(output, visible_rows, app.custom_actions.output_scroll);
     let output_items: Vec<ListItem> = if output.is_empty() {
         vec![ListItem::new(Line::from("No output yet."))]
     } else {
-        output[start..]
+        windowed
             .iter()
             .map(|line| {
                 // `subprocess::run_and_stream`'s two spawn-failure message
@@ -2180,23 +2923,39 @@ fn render_manage_actions_popup(frame: &mut Frame, app: &App, area: Rect) {
                 " "
             }
         };
-        let items = vec![
+        let mut items = vec![
             ListItem::new(Line::from(format!(
                 "{} Name: {}",
                 field_marker(ActionFormField::Name),
                 state.new_name
             ))),
             ListItem::new(Line::from(format!(
-                "{} Command: {}",
-                field_marker(ActionFormField::Command),
-                state.new_command
+                "{} Kind: {:?}  (Space to toggle)",
+                field_marker(ActionFormField::Kind),
+                state.form_kind
             ))),
             ListItem::new(Line::from(format!(
+                "{} {}: {}",
+                field_marker(ActionFormField::Command),
+                match state.form_kind {
+                    FormKind::External => "Command",
+                    FormKind::Builtin => "Command id",
+                },
+                state.new_command
+            ))),
+        ];
+        if state.form_kind == FormKind::External {
+            items.push(ListItem::new(Line::from(format!(
                 "{} Args: {}",
                 field_marker(ActionFormField::Args),
                 state.new_args
-            ))),
-        ];
+            ))));
+        }
+        items.push(ListItem::new(Line::from(format!(
+            "{} Slot: {:?}  (Space to cycle)",
+            field_marker(ActionFormField::Slot),
+            state.form_slot
+        ))));
         let title = if state.editing_index.is_some() {
             "Edit Custom Action  (Tab: next field, Enter: save, Esc: cancel)"
         } else {
@@ -2219,8 +2978,7 @@ fn render_manage_actions_popup(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default()
             };
-            let args = action.args.join(" ");
-            let label = format!("{}  --  {} {}", action.name, action.command, args);
+            let label = format!("[{:?}] {}", action.slot, custom_action_label(action));
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
@@ -2721,7 +3479,7 @@ fn render_refactor_preview(frame: &mut Frame, app: &App, area: Rect) {
 /// lines -- §1's "no graph line-drawing" scope cut). Right column: either
 /// the three-way conflict-resolution view (while `git.active_conflict`/
 /// `binary_conflict` is `Some`) or the diff pane.
-fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_git_panel(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let Some(state) = app.git_panel.as_ref() else {
         return;
     };
@@ -2758,8 +3516,8 @@ fn render_git_panel(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     match state.view {
-        GitPanelView::Log => render_git_log_view(frame, app, state, content_area),
-        GitPanelView::Changes => render_git_changes(frame, app, state, content_area),
+        GitPanelView::Log => render_git_log_view(frame, app, state, content_area, hits),
+        GitPanelView::Changes => render_git_changes(frame, app, state, content_area, hits),
     }
 
     if app.git.branches_popup.open {
@@ -2798,17 +3556,19 @@ fn render_git_log_view(
     app: &App,
     state: &crate::app::GitPanelState,
     area: Rect,
+    hits: &mut HitMap,
 ) {
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    render_git_left_column(frame, app, state, columns[0]);
+    render_git_left_column(frame, app, state, columns[0], hits);
     if app.git.active_conflict.is_some() || app.git.binary_conflict.is_some() {
         render_git_conflict_resolution(frame, app, columns[1]);
     } else {
         render_git_diff(frame, app, state, columns[1]);
+        hits.git_diff_area = Some(columns[1]);
     }
 }
 
@@ -2816,7 +3576,13 @@ fn render_git_log_view(
 /// (`docs/features/tui-git-staging-branches-and-log-filters.md` §2.4,
 /// `git-commit-and-staging.md` §2.3's egui rendering content translated to
 /// plain list rows).
-fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanelState, area: Rect) {
+fn render_git_changes(
+    frame: &mut Frame,
+    app: &App,
+    state: &crate::app::GitPanelState,
+    area: Rect,
+    hits: &mut HitMap,
+) {
     let rows = Layout::default()
         .direction(LayoutDirection::Vertical)
         .constraints([
@@ -2861,6 +3627,7 @@ fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanel
         .borders(Borders::ALL)
         .title(format!("{staged_title}  (Enter: unstage)"));
     render_scrollable_list(frame, staged_items, block, rows[0], state.staged_selected);
+    hits.git_staged_area = Some(rows[0]);
 
     let (unstaged_title, unstaged_items) = status_row(
         "Unstaged",
@@ -2878,6 +3645,7 @@ fn render_git_changes(frame: &mut Frame, app: &App, state: &crate::app::GitPanel
         rows[1],
         state.unstaged_selected,
     );
+    hits.git_unstaged_area = Some(rows[1]);
 
     if let Some(path) = app.git.pending_discard.as_ref() {
         let block = Block::default()
@@ -3019,6 +3787,52 @@ fn render_git_gutter_popup(frame: &mut Frame, _app: &App, area: Rect) {
         .title("Git Gutter  (r: Revert Hunk, d: Show Diff, Esc: close)");
     let body = "r  Revert Hunk\nd  Show Diff";
     frame.render_widget(Paragraph::new(body).block(block), popup);
+}
+
+/// The line-number gutter's right-click menu (`docs/features/
+/// tui-gutter-line-numbers.md` §2.9, T50) -- same small fixed-size popup
+/// shape `render_git_gutter_popup` uses, but list-selectable via
+/// `render_scrollable_list` since it has four items, not two mnemonic
+/// single keys -- mirrors `render_bookmarks_popup`'s exact
+/// list-with-`REVERSED`-highlight shape.
+fn render_gutter_context_menu(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.gutter_context_menu.as_ref() else {
+        return;
+    };
+    let width = area.width.clamp(28, 40).min(area.width);
+    let height = 6u16.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    const LABELS: [&str; 4] = [
+        "Toggle Line Breakpoint",
+        "Toggle Bookmark",
+        "Show Bookmarks",
+        "Toggle Blame Annotations",
+    ];
+    let items: Vec<ListItem> = LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let style = if i == state.selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(*label, style)))
+        })
+        .collect();
+
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Line {}  (\u{2191}/\u{2193} select, Enter: run, Esc: close)",
+        state.line + 1
+    ));
+    render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
 fn render_git_branches_popup(frame: &mut Frame, app: &App, area: Rect) {
@@ -3305,6 +4119,7 @@ fn render_git_left_column(
     app: &App,
     state: &crate::app::GitPanelState,
     area: Rect,
+    hits: &mut HitMap,
 ) {
     let has_conflicts = !app.git.conflicts.is_empty();
     let rows = if has_conflicts {
@@ -3343,6 +4158,7 @@ fn render_git_left_column(
             .collect();
         let block = Block::default().borders(Borders::ALL).title("Conflicts");
         frame.render_widget(List::new(items).block(block), rows[1]);
+        hits.git_conflicts_area = Some(rows[1]);
         rows[2]
     } else {
         rows[1]
@@ -3375,6 +4191,7 @@ fn render_git_left_column(
         .borders(Borders::ALL)
         .title("Commits  (Tab: switch focus, Enter: view diff)");
     frame.render_widget(List::new(items).block(block), graph_area);
+    hits.git_graph_area = Some(graph_area);
 }
 
 /// Flattens every `FileDiff`'s hunks into styled lines, applying
@@ -3555,12 +4372,13 @@ fn selection_style(is_selected: bool) -> Style {
 /// or images). Right column: the selected container's logs, once fetched,
 /// or the panel's current error. The yes/no lifecycle confirm still renders
 /// as its own small centered modal on top of `area`.
-fn render_docker_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_docker_panel(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let panel = &app.docker;
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
+    hits.dock_secondary_area = Some(columns[1]);
 
     let tab_label = match panel.tab {
         DockerTab::Containers => "Containers",
@@ -3627,8 +4445,9 @@ fn render_docker_panel(frame: &mut Frame, app: &App, area: Rect) {
             columns[1],
         );
     } else {
-        let log_items: Vec<ListItem> = panel
-            .logs
+        let visible_rows = columns[1].height.saturating_sub(2) as usize;
+        let windowed = tail_window(&panel.logs, visible_rows, panel.logs_scroll);
+        let log_items: Vec<ListItem> = windowed
             .iter()
             .map(|line| ListItem::new(Line::from(line.as_str())))
             .collect();
@@ -3673,12 +4492,13 @@ fn render_docker_confirm_popup(
 /// count prompt, and the context/namespace picker each still render as
 /// their own small centered modal on top of `area`, checked in the same
 /// priority order `handle_k8s_panel_key` uses.
-fn render_k8s_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_k8s_panel(frame: &mut Frame, app: &App, area: Rect, hits: &mut HitMap) {
     let panel = &app.k8s;
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
+    hits.dock_secondary_area = Some(columns[1]);
 
     let tab_label = match panel.tab {
         K8sTab::Pods => "Pods",
@@ -3770,7 +4590,9 @@ fn render_k8s_panel(frame: &mut Frame, app: &App, area: Rect) {
             columns[1],
         );
     } else {
-        let log_items: Vec<ListItem> = right_lines
+        let visible_rows = columns[1].height.saturating_sub(2) as usize;
+        let windowed = tail_window(right_lines, visible_rows, panel.output_scroll);
+        let log_items: Vec<ListItem> = windowed
             .iter()
             .map(|line| ListItem::new(Line::from(line.as_str())))
             .collect();
@@ -3867,4 +4689,53 @@ fn render_k8s_picker_popup(
 
     let block = Block::default().borders(Borders::ALL).title(title);
     frame.render_widget(List::new(items).block(block), popup);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_window;
+
+    #[test]
+    fn tail_window_with_zero_scroll_shows_the_tail() {
+        let items: Vec<i32> = (0..10).collect();
+        assert_eq!(tail_window(&items, 3, 0), &[7, 8, 9]);
+    }
+
+    #[test]
+    fn tail_window_with_nonzero_scroll_slides_back_from_the_tail() {
+        let items: Vec<i32> = (0..10).collect();
+        assert_eq!(tail_window(&items, 3, 2), &[5, 6, 7]);
+    }
+
+    #[test]
+    fn tail_window_scroll_past_the_start_clamps_at_the_first_item() {
+        let items: Vec<i32> = (0..10).collect();
+        assert_eq!(tail_window(&items, 3, 100), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn tail_window_on_empty_items_never_panics() {
+        let items: Vec<i32> = Vec::new();
+        assert_eq!(tail_window(&items, 5, 3), &[] as &[i32]);
+        assert_eq!(tail_window(&items, 5, u16::MAX), &[] as &[i32]);
+    }
+
+    #[test]
+    fn tail_window_visible_rows_larger_than_items_shows_everything() {
+        let items: Vec<i32> = vec![1, 2, 3];
+        assert_eq!(tail_window(&items, 10, 0), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn tail_window_new_items_slide_the_window_forward_while_scrolled_back() {
+        // The auto-follow property `docs/features/
+        // tui-panel-history-scroll.md` §3.1 relies on: a fixed `scroll`
+        // depth stays that many items behind the *current* tail, not
+        // pinned to the same absolute indices, as more items arrive.
+        let mut items: Vec<i32> = (0..10).collect();
+        assert_eq!(tail_window(&items, 3, 2), &[5, 6, 7]);
+        items.push(10);
+        items.push(11);
+        assert_eq!(tail_window(&items, 3, 2), &[7, 8, 9]);
+    }
 }

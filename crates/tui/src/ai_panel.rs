@@ -16,7 +16,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use ide_ai::{AiConfig, AiError, ChatMessage, DefaultRouter, ProviderId, Router};
+use ide_ai::{
+    classify_task_role, resolve_role_route, AiConfig, AiError, ChatMessage, DefaultRouter,
+    ProviderId, Router, TaskRole,
+};
 use ide_sanitizer::{as_map, restore_originals, Sanitizer};
 
 /// Provider answer, one message per reply. Walls the panel (and anything
@@ -51,6 +54,12 @@ pub struct PreparedRequest {
     pub(crate) payload: String,
     order: Vec<ProviderId>,
     threshold: Option<f64>,
+    /// Carried through so `run_request` can resolve a `TaskRole`/
+    /// `RoleRoute` on the background thread (`docs/features/
+    /// tui-ai-task-routing.md`, T55 §2.2) -- role resolution (the
+    /// classifier call, when `auto_route` is set) is async and must not
+    /// run in `prepare`'s synchronous, frame-blocking path.
+    config: AiConfig,
     pub(crate) tx: Sender<AiDisplayMessage>,
 }
 
@@ -67,6 +76,10 @@ pub struct AiPanel {
     /// (for the status line) -- `docs/features/tui-ai-hybrid-fallback.md`
     /// §3.3.
     pub sanitized: bool,
+    /// Lines scrolled back from the live tail (`docs/features/
+    /// tui-panel-history-scroll.md` §2.4/§3.1, T52) -- same shape as
+    /// `ClaudePanel::history_scroll`.
+    pub history_scroll: u16,
     /// The last provider that served a reply, for the status line.
     pub(crate) provider: Option<String>,
     /// True while an assistant reply is still accumulating over the
@@ -96,6 +109,7 @@ impl AiPanel {
             input: String::new(),
             history: Vec::new(),
             sanitized: false,
+            history_scroll: 0,
             provider: None,
             streaming: false,
             rx: None,
@@ -156,6 +170,7 @@ impl AiPanel {
             payload,
             order,
             threshold,
+            config,
             tx,
         })
     }
@@ -241,7 +256,11 @@ impl AiPanel {
 /// (tighter) cloud threshold; a local-only chain masks at the local
 /// threshold only when `sanitize_local` is set; local with sanitizing off
 /// sends raw. Returns `None` for the only unmasked case.
-fn decide_threshold(config: &AiConfig, order: &[ProviderId]) -> Option<f64> {
+///
+/// `pub(crate)`, not private: `agent_panel.rs` (`docs/features/
+/// tui-local-agent.md` §3.3) reuses this unchanged rather than
+/// reimplementing it, exactly as that doc requires.
+pub(crate) fn decide_threshold(config: &AiConfig, order: &[ProviderId]) -> Option<f64> {
     let has_cloud = order
         .iter()
         .any(|id| !matches!(id, ProviderId::OllamaLocal));
@@ -257,7 +276,10 @@ fn decide_threshold(config: &AiConfig, order: &[ProviderId]) -> Option<f64> {
 /// The outbound half of the background run: sanitize `payload` when a
 /// threshold applies, keeping the roundtrip map (thread-local) so the
 /// reply can be restored; pass through untouched when unmasked.
-fn mask_outgoing(
+///
+/// `pub(crate)`: reused by `agent_panel.rs` (§3.3, same reasoning as
+/// `decide_threshold` above).
+pub(crate) fn mask_outgoing(
     payload: String,
     threshold: Option<f64>,
 ) -> (String, Option<HashMap<String, String>>) {
@@ -277,15 +299,22 @@ fn settle(
     accumulated: String,
     map: &Option<HashMap<String, String>>,
     outcome: Result<ProviderId, AiError>,
+    role_label: Option<&str>,
 ) -> Vec<AiDisplayMessage> {
     match outcome {
-        Ok(provider) => vec![
-            AiDisplayMessage::ProviderServing(provider.label().to_string()),
-            AiDisplayMessage::Assistant(match map {
-                Some(map) => restore_originals(&accumulated, map),
-                None => accumulated,
-            }),
-        ],
+        Ok(provider) => {
+            let label = match role_label {
+                Some(role) => format!("{} ({role})", provider.label()),
+                None => provider.label().to_string(),
+            };
+            vec![
+                AiDisplayMessage::ProviderServing(label),
+                AiDisplayMessage::Assistant(match map {
+                    Some(map) => restore_originals(&accumulated, map),
+                    None => accumulated,
+                }),
+            ]
+        }
         Err(e) => vec![AiDisplayMessage::Error(e.to_string())],
     }
 }
@@ -300,6 +329,7 @@ fn run_request(prepared: PreparedRequest) {
         payload,
         order,
         threshold,
+        config,
         tx,
     } = prepared;
     if order.is_empty() {
@@ -323,13 +353,31 @@ fn run_request(prepared: PreparedRequest) {
         }
     };
     rt.block_on(async move {
+        let sanitized = map.is_some();
+        // Role resolution (§3.1) runs here, not in `prepare`: the
+        // classifier call is async and would block the frame loop if it
+        // ran synchronously on the UI thread.
+        let role = if config.auto_route {
+            classify_task_role(config.classifier_provider, &outgoing, sanitized).await
+        } else {
+            TaskRole::General
+        };
+        let route = resolve_role_route(&config, role);
+        let role_label = config
+            .auto_route
+            .then(|| format!("{role:?}").to_lowercase());
         let (delta_tx, delta_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let messages = vec![ChatMessage::user(outgoing)];
-        let sanitized = map.is_some();
         tokio::spawn(async move {
             let res = DefaultRouter
-                .chat(messages, &order, sanitized, delta_tx)
+                .chat(
+                    messages,
+                    &route.provider_order,
+                    route.model_override.as_deref(),
+                    sanitized,
+                    delta_tx,
+                )
                 .await;
             let _ = result_tx.send(res);
         });
@@ -360,7 +408,7 @@ fn run_request(prepared: PreparedRequest) {
             let _ = tx.send(AiDisplayMessage::StreamingDelta(delta.text));
         }
         let outcome = result.expect("set by the loop above");
-        for msg in settle(accumulated, &map, outcome) {
+        for msg in settle(accumulated, &map, outcome, role_label.as_deref()) {
             let _ = tx.send(msg);
         }
     });
@@ -617,6 +665,7 @@ mod tests {
             payload: "hi".into(),
             order: Vec::new(),
             threshold: None,
+            config: AiConfig::default(),
             tx,
         });
         let msg = rx.recv().unwrap();
@@ -652,7 +701,7 @@ mod tests {
         let (masked, map) = mask_outgoing(payload.clone(), Some(4.0));
         assert_ne!(masked, payload, "masking actually changed the payload");
         let echoed = ChatMessage::user(masked.clone()).text; // the model "echoes" the masked payload
-        let msgs = settle(echoed, &map, Ok(ProviderId::OllamaLocal));
+        let msgs = settle(echoed, &map, Ok(ProviderId::OllamaLocal), None);
         assert!(matches!(
             &msgs[0],
             AiDisplayMessage::ProviderServing(p) if !p.is_empty()
@@ -674,6 +723,7 @@ mod tests {
             "plain reply".to_string(),
             &None,
             Ok(ProviderId::OllamaLocal),
+            None,
         );
         assert!(matches!(
             &msgs[1],
@@ -683,7 +733,21 @@ mod tests {
 
     #[test]
     fn settle_builds_error_message() {
-        let msgs = settle(String::new(), &None, Err(AiError::Unsupported));
+        let msgs = settle(String::new(), &None, Err(AiError::Unsupported), None);
         assert!(matches!(&msgs[0], AiDisplayMessage::Error(e) if e.contains("does not support")));
+    }
+
+    #[test]
+    fn settle_appends_role_label_to_the_provider_status_line_when_present() {
+        let msgs = settle(
+            "reply".to_string(),
+            &None,
+            Ok(ProviderId::OllamaLocal),
+            Some("planning"),
+        );
+        assert!(matches!(
+            &msgs[0],
+            AiDisplayMessage::ProviderServing(p) if p.ends_with(" (planning)")
+        ));
     }
 }

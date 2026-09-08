@@ -29,6 +29,7 @@
 //! non-supporting terminal is simply ignored, the same as any other
 //! sequence this crate already sends such a terminal.
 
+mod agent_panel;
 mod ai_panel;
 mod app;
 mod blame_gutter;
@@ -41,6 +42,7 @@ mod custom_actions;
 mod debug_config;
 mod debug_panel;
 mod docker_panel;
+mod double_tap;
 mod editor;
 mod file_structure;
 mod files_search;
@@ -253,6 +255,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // tui-go-to-file-and-symbol.md` §3.1/§3.2).
         app.sync_go_to_file();
         app.sync_go_to_symbol();
+        // Same reasoning, for the unified finder's live per-keystroke
+        // refresh (`docs/features/tui-unified-finder.md` §3.1, T46).
+        app.sync_unified_finder();
         // Polled unconditionally, not just while the Cargo panel is open,
         // so a build/test run keeps streaming into `output` in the
         // background even while the panel is closed (`docs/features/
@@ -305,6 +310,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // `Stopped`/`Terminated` event lands even while the Debug tool
         // window is closed.
         app.poll_debug();
+        // Same reasoning, for the local agentic assistant's in-flight
+        // tool-calling loop (`docs/features/tui-local-agent.md` §2.2) --
+        // unconditional so a run keeps stepping through tool calls even
+        // while the AI dock tab shows another view.
+        app.poll_agent();
         if crossterm::event::poll(Duration::from_millis(100))? {
             match crossterm::event::read()? {
                 Event::Key(key) => {

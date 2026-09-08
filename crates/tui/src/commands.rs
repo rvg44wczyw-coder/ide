@@ -235,6 +235,8 @@ pub enum Action {
     ToggleClaudePanel,
     ToggleAiPanel,
     TriggerFimAutocomplete,
+    ToggleAgentPanel,
+    CycleAgentMode,
     ToggleDockerPanel,
     ToggleK8sPanel,
     ManageCustomActions,
@@ -922,6 +924,23 @@ pub fn commands() -> &'static [Command] {
             action: Action::TriggerFimAutocomplete,
         },
         Command {
+            id: "AgentPanel",
+            title: "Agent",
+            // Palette-only, same reasoning as `AiPanel`/`ClaudePanel` above
+            // -- no JetBrains-keymap entry covers a tool-calling assistant
+            // dock tab (`docs/features/tui-local-agent.md` §2.2).
+            binding: None,
+            action: Action::ToggleAgentPanel,
+        },
+        Command {
+            id: "CycleAgentMode",
+            title: "Cycle Agent Permission Mode (Plan/Approve/Auto)",
+            // Palette-only, same reasoning as `AgentPanel` above -- this is
+            // a novel permission-level control with no JetBrains analogue.
+            binding: None,
+            action: Action::CycleAgentMode,
+        },
+        Command {
             id: "ToggleDockerPanel",
             title: "Docker",
             // Palette-only, same reasoning as `ToggleCargoPanel`/
@@ -1280,6 +1299,240 @@ pub fn binding_for(key: KeyEvent) -> Option<Action> {
         .map(|c| c.action)
 }
 
+/// One dropdown entry (`docs/features/tui-menu-bar.md` §2.1, T54): either
+/// a command by id, or a titled flyout submenu of further command ids --
+/// one level deep only, no `Submenu` in `menu_groups()` ever nests
+/// another `Submenu` (enforced by this holding `&[&str]`, not
+/// `&[MenuEntry]`).
+#[derive(Debug, Clone, Copy)]
+pub enum MenuEntry {
+    Item(&'static str),
+    Submenu(&'static str, &'static [&'static str]),
+}
+
+/// One top-level menu bar entry.
+#[derive(Debug, Clone, Copy)]
+pub struct MenuGroup {
+    pub title: &'static str,
+    /// Case-insensitive; always a character literally present in `title`
+    /// (`menu_mnemonic_is_present_in_its_own_title`). `Alt+<mnemonic>`
+    /// opens this menu directly, from anywhere -- a UI navigation
+    /// gesture, not a `Command` keybinding (`tui-menu-bar.md` §2.1 spells
+    /// out why CLAUDE.md's "never invent a binding" rule doesn't apply
+    /// here).
+    pub mnemonic: char,
+    pub entries: &'static [MenuEntry],
+}
+
+/// The menu bar's own grouping of every command in [`commands`]
+/// (`docs/features/tui-menu-bar.md` §2.1, T54) -- a deliberately
+/// *different* taxonomy from `ide-ui`'s own `native-menu-bar.md` §2.1
+/// table (that one is a hand-picked subset; this one is exhaustive,
+/// verified by `menu_completeness_covers_every_command_exactly_once`
+/// below). Not itself involved in dispatch -- `App::handle_menu_bar_key`/
+/// `handle_menu_bar_click` resolve an entry's id back through
+/// [`commands`] and run its `action` exactly like the palette does.
+pub fn menu_groups() -> &'static [MenuGroup] {
+    use MenuEntry::{Item, Submenu};
+    const GROUPS: &[MenuGroup] = &[
+        MenuGroup {
+            title: "File",
+            mnemonic: 'F',
+            entries: &[
+                Item("SaveAll"),
+                Item("ReloadFromDisk"),
+                Item("DismissExternalChange"),
+                Item("NewScratchFile"),
+                Item("ScratchFiles"),
+                Item("Exit"),
+            ],
+        },
+        MenuGroup {
+            title: "Edit",
+            mnemonic: 'E',
+            entries: &[
+                Item("Undo"),
+                Item("Redo"),
+                Item("Find"),
+                Item("Replace"),
+                Item("FindInPath"),
+                Item("ReplaceInPath"),
+                Item("ToggleCase"),
+                Item("DuplicateLines"),
+                Item("DeleteLines"),
+                Item("JoinLines"),
+                Item("JumpToMatchingBracket"),
+                Submenu(
+                    "Move",
+                    &[
+                        "MoveLinesUp",
+                        "MoveLinesDown",
+                        "MoveStatementsUp",
+                        "MoveStatementsDown",
+                    ],
+                ),
+                Submenu("Comment", &["ToggleLineComment", "ToggleBlockComment"]),
+                Submenu(
+                    "Selection",
+                    &[
+                        "ExtendSelection",
+                        "ShrinkSelection",
+                        "AddNextOccurrence",
+                        "UnselectOccurrence",
+                        "SelectAllOccurrences",
+                        "CollapseSelections",
+                    ],
+                ),
+            ],
+        },
+        MenuGroup {
+            title: "View",
+            mnemonic: 'V',
+            entries: &[
+                Item("ToggleProjectToolWindow"),
+                Item("ToggleNotifications"),
+                Item("ToggleProblems"),
+                Item("ToggleTodoPanel"),
+                Item("ShowBookmarks"),
+                Item("ToggleBookmark"),
+                Item("QuickDocumentation"),
+                Item("ShowIntentionActions"),
+                Submenu(
+                    "Folding",
+                    &[
+                        "CollapseFold",
+                        "ExpandFold",
+                        "CollapseAllFolds",
+                        "ExpandAllFolds",
+                    ],
+                ),
+            ],
+        },
+        MenuGroup {
+            title: "Navigate",
+            mnemonic: 'N',
+            entries: &[
+                Item("GoToDeclaration"),
+                Item("FindUsages"),
+                Item("GoToFile"),
+                Item("GoToSymbol"),
+                Item("FileStructure"),
+                Item("RecentFiles"),
+                Item("NavigateBack"),
+                Item("NavigateForward"),
+            ],
+        },
+        MenuGroup {
+            title: "Code",
+            mnemonic: 'C',
+            entries: &[
+                Item("GenerateMenu"),
+                Item("ImplementMethods"),
+                Item("OverrideMethods"),
+                Item("CreateTest"),
+                Item("OptimizeImports"),
+                Item("Rename"),
+                Item("ReformatCode"),
+                Item("ToggleFormatOnSave"),
+                Item("TriggerFimAutocomplete"),
+            ],
+        },
+        MenuGroup {
+            title: "Refactor",
+            mnemonic: 'R',
+            entries: &[
+                Item("RefactorThis"),
+                Item("ExtractVariable"),
+                Item("ExtractMethod"),
+                Item("ExtractConstant"),
+                Item("ExtractField"),
+                Item("Inline"),
+            ],
+        },
+        MenuGroup {
+            title: "Run",
+            // 'R' is Refactor's -- 'u' is Run's own second letter.
+            mnemonic: 'u',
+            entries: &[
+                Item("GoToRunScreen"),
+                Item("ToggleCargoPanel"),
+                Submenu(
+                    "Debug",
+                    &[
+                        "Debug",
+                        "ResumeProgram",
+                        "StepOver",
+                        "StepInto",
+                        "StepOut",
+                        "ToggleLineBreakpoint",
+                        "StopDebugging",
+                        "PauseProgram",
+                        "ConfigureDebugAdapter",
+                        "ToggleDebugPanel",
+                    ],
+                ),
+            ],
+        },
+        MenuGroup {
+            title: "Git",
+            mnemonic: 'G',
+            entries: &[
+                Item("ToggleGitPanel"),
+                Item("GitBranches"),
+                Item("GitWorktrees"),
+                Item("ShowFileHistory"),
+                Item("ToggleBlameAnnotations"),
+                Item("ShowBlameForCurrentLine"),
+                Item("Fetch"),
+                Item("Pull"),
+                Item("Push"),
+                Item("ToggleClonePanel"),
+            ],
+        },
+        MenuGroup {
+            title: "Tools",
+            mnemonic: 'T',
+            entries: &[
+                Item("ManageCustomActions"),
+                Item("ToggleCustomActionsPanel"),
+                Item("ToggleDockerPanel"),
+                Item("ToggleK8sPanel"),
+                Item("ClaudePanel"),
+                Item("AiPanel"),
+                Item("AgentPanel"),
+                Item("CycleAgentMode"),
+            ],
+        },
+        MenuGroup {
+            title: "Window",
+            mnemonic: 'W',
+            entries: &[
+                Item("NextTab"),
+                Item("PreviousTab"),
+                Item("CloseTab"),
+                Item("GoToEditorScreen"),
+                Item("GoToKeysScreen"),
+                Item("ToggleLeftDock"),
+                Item("ToggleBottomDock"),
+                Item("ToggleBottomDockFocus"),
+                Item("GrowFocusedDock"),
+                Item("ShrinkFocusedDock"),
+            ],
+        },
+        MenuGroup {
+            title: "Help",
+            mnemonic: 'H',
+            entries: &[
+                Item("FindAction"),
+                Item("ToggleKeymapSettings"),
+                Item("ToggleThemeSettings"),
+                Item("ResetAllKeybindings"),
+            ],
+        },
+    ];
+    GROUPS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1591,6 +1844,94 @@ mod tests {
                     .is_none(),
                 "{id} should have no default binding"
             );
+        }
+    }
+
+    fn menu_group_ids(group: &MenuGroup) -> Vec<&'static str> {
+        group
+            .entries
+            .iter()
+            .flat_map(|entry| match entry {
+                MenuEntry::Item(id) => vec![*id],
+                MenuEntry::Submenu(_, ids) => ids.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn menu_completeness_covers_every_command_exactly_once() {
+        let mut menu_ids: Vec<&'static str> =
+            menu_groups().iter().flat_map(menu_group_ids).collect();
+        menu_ids.sort_unstable();
+        let mut command_ids: Vec<&'static str> = commands().iter().map(|c| c.id).collect();
+        command_ids.sort_unstable();
+
+        assert_eq!(
+            menu_ids.len(),
+            command_ids.len(),
+            "every command must appear in exactly one menu, and no id \
+             invented that isn't a real command"
+        );
+        assert_eq!(menu_ids, command_ids);
+
+        let mut deduped = menu_ids.clone();
+        deduped.dedup();
+        assert_eq!(
+            menu_ids.len(),
+            deduped.len(),
+            "no command id may appear in more than one menu entry"
+        );
+    }
+
+    #[test]
+    fn menu_mnemonic_is_present_in_its_own_title() {
+        for group in menu_groups() {
+            assert!(
+                group
+                    .title
+                    .chars()
+                    .any(|c| c.eq_ignore_ascii_case(&group.mnemonic)),
+                "{}'s mnemonic {:?} is not a character of its own title",
+                group.title,
+                group.mnemonic
+            );
+        }
+    }
+
+    #[test]
+    fn menu_mnemonics_are_all_distinct() {
+        let mut mnemonics: Vec<char> = menu_groups()
+            .iter()
+            .map(|g| g.mnemonic.to_ascii_lowercase())
+            .collect();
+        mnemonics.sort_unstable();
+        let mut deduped = mnemonics.clone();
+        deduped.dedup();
+        assert_eq!(
+            mnemonics, deduped,
+            "every menu must have a distinct mnemonic"
+        );
+    }
+
+    #[test]
+    fn no_submenu_entry_is_itself_a_submenu() {
+        // Enforced by `MenuEntry::Submenu`'s own type (`&[&str]`, not
+        // `&[MenuEntry]`) -- this test just documents the invariant by
+        // confirming every submenu's ids all resolve to real commands
+        // (which they could not if the table tried to smuggle a nested
+        // menu in some other way).
+        for group in menu_groups() {
+            for entry in group.entries {
+                if let MenuEntry::Submenu(_, ids) = entry {
+                    for id in *ids {
+                        assert!(
+                            commands().iter().any(|c| c.id == *id),
+                            "{id} in {}'s submenu is not a real command id",
+                            group.title
+                        );
+                    }
+                }
+            }
         }
     }
 }

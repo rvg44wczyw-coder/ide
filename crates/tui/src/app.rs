@@ -21,12 +21,13 @@ use ide_core::{
 };
 use ide_lsp::{Diagnostic, Location, LspRequest, Position, Symbol};
 
+use crate::agent_panel::AgentPanel;
 use crate::ai_panel::{AiContext, AiPanel};
 use crate::cargo_panel::{CargoCommand, CargoPanel};
 use crate::claude_panel::ClaudePanel;
 use crate::claude_terminal::{self, ClaudeTerminalPanel};
 use crate::clone_panel::{ClonePanel, ClonePanelField, ClonePollResult};
-use crate::commands::{commands, Action, Command};
+use crate::commands::{commands, menu_groups, Action, Command, MenuEntry};
 use crate::debug_config::{self, DebugAdapterConfig, DebugAdapterEntry};
 use crate::debug_panel::DebugPanel;
 use crate::docker_panel::{DockerLifecycleAction, DockerPanel, DockerTab};
@@ -188,6 +189,50 @@ pub(crate) struct ColonCommandState {
     pub(crate) query: String,
     pub(crate) filtered: Vec<&'static Command>,
     pub(crate) selected: usize,
+}
+
+/// One row in the unified finder's merged result list (`docs/features/
+/// tui-unified-finder.md` §2.1, T46).
+#[derive(Clone)]
+pub(crate) enum FinderRow {
+    /// Carries the whole `FuzzyFileMatch`, not just its `path`, so
+    /// rendering can show `relative` (the same project-relative display
+    /// `render_go_to_file_popup` already uses) without re-deriving it.
+    File(ide_core::FuzzyFileMatch),
+    Symbol(Symbol),
+    Command(&'static Command),
+}
+
+/// The top menu bar's open/selected/flyout state (`docs/features/
+/// tui-menu-bar.md` §2.2, T54). `open` indexes into `commands::
+/// menu_groups()`; `selected` indexes into that group's own `entries`
+/// (top-level dropdown rows, `Item`s and `Submenu`s alike); `submenu_
+/// selected`, when `Some`, indexes into the currently-selected `Submenu`
+/// entry's own id list (one flyout level deep, never nested further).
+/// `Default` is "closed at the first menu, no flyout" -- the exact value
+/// `close_menu_bar`/`close_all_overlays` reset to.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct MenuBarState {
+    pub(crate) open: Option<usize>,
+    pub(crate) selected: usize,
+    pub(crate) submenu_selected: Option<usize>,
+}
+
+/// The unified finder's ("Search Everywhere") typed query and list
+/// selection (`docs/features/tui-unified-finder.md` §2.2) -- same
+/// "UI-local state only, results live elsewhere" convention `GoToFileState`/
+/// `GoToSymbolState` establish. `ran_query` gates the shared `files_search`
+/// trigger exactly like `GoToFileState::ran_query`; `last_workspace_query`
+/// gates the shared `lsp.query_workspace_symbols` trigger exactly like
+/// `GoToSymbolState::last_workspace_query`. No `requested_for`/empty-query
+/// `document_symbols` fallback -- see `sync_unified_finder`'s doc comment
+/// for why the empty-query case is simply "no rows" here.
+#[derive(Default)]
+pub(crate) struct UnifiedFinderState {
+    pub(crate) query: String,
+    pub(crate) selected: usize,
+    ran_query: Option<String>,
+    last_workspace_query: Option<String>,
 }
 
 /// Zero-or-many result picker shared by Go to Declaration and Find Usages
@@ -496,6 +541,18 @@ pub(crate) struct BookmarksPopupState {
     pub(crate) selected: usize,
 }
 
+/// The line-number gutter's right-click menu (`docs/features/
+/// tui-gutter-line-numbers.md` §2.5, T50) -- `path`/`line` name the
+/// buffer line the right-click landed on (0-based, same convention
+/// `click_git_gutter_lane`/`click_blame_lane` already use), independent
+/// of wherever the caret happens to be, matching JetBrains' own gutter
+/// context menu (it acts on the clicked line, not the caret's line).
+pub(crate) struct GutterContextMenuState {
+    pub(crate) path: PathBuf,
+    pub(crate) line: usize,
+    pub(crate) selected: usize,
+}
+
 /// Rename's editable popup (`docs/features/tui-code-actions-and-rename.md`
 /// §2.3), ported from `ide-ui`'s own `RenamePopup` -- presence is
 /// visibility, no separate `show_*` bool (unlike `hover_open`'s pair with
@@ -762,19 +819,26 @@ pub(crate) enum LeftDockTab {
     #[default]
     Files,
     Todos,
+    /// `docs/features/tui-custom-actions-edge-slots.md` §3.1, T47 -- the
+    /// `Tree`-slot custom actions, filtered via `actions_for_slot(Tree)`.
+    Actions,
 }
 
 impl LeftDockTab {
     pub(crate) fn next(self) -> Self {
         match self {
             LeftDockTab::Files => LeftDockTab::Todos,
-            LeftDockTab::Todos => LeftDockTab::Files,
+            LeftDockTab::Todos => LeftDockTab::Actions,
+            LeftDockTab::Actions => LeftDockTab::Files,
         }
     }
 
     pub(crate) fn previous(self) -> Self {
-        // Only two variants -- `next`'s own cycle is its own inverse.
-        self.next()
+        match self {
+            LeftDockTab::Files => LeftDockTab::Actions,
+            LeftDockTab::Todos => LeftDockTab::Files,
+            LeftDockTab::Actions => LeftDockTab::Todos,
+        }
     }
 }
 
@@ -797,6 +861,7 @@ pub(crate) enum BottomDockTab {
     #[default]
     Docker,
     Ai,
+    Agent,
     Kubernetes,
     Cargo,
     CustomActions,
@@ -808,7 +873,8 @@ impl BottomDockTab {
     pub(crate) fn next(self) -> Self {
         match self {
             BottomDockTab::Docker => BottomDockTab::Ai,
-            BottomDockTab::Ai => BottomDockTab::Kubernetes,
+            BottomDockTab::Ai => BottomDockTab::Agent,
+            BottomDockTab::Agent => BottomDockTab::Kubernetes,
             BottomDockTab::Kubernetes => BottomDockTab::Cargo,
             BottomDockTab::Cargo => BottomDockTab::CustomActions,
             BottomDockTab::CustomActions => BottomDockTab::Problems,
@@ -821,7 +887,8 @@ impl BottomDockTab {
         match self {
             BottomDockTab::Docker => BottomDockTab::GitLog,
             BottomDockTab::Ai => BottomDockTab::Docker,
-            BottomDockTab::Kubernetes => BottomDockTab::Ai,
+            BottomDockTab::Agent => BottomDockTab::Ai,
+            BottomDockTab::Kubernetes => BottomDockTab::Agent,
             BottomDockTab::Cargo => BottomDockTab::Kubernetes,
             BottomDockTab::CustomActions => BottomDockTab::Cargo,
             BottomDockTab::Problems => BottomDockTab::CustomActions,
@@ -855,37 +922,64 @@ pub(crate) struct GitLogDockState {
     pub(crate) diff_scroll: u16,
 }
 
+/// Which of the two ways a `CustomAction` can run (`docs/features/
+/// tui-custom-actions-edge-slots.md` §2.3, T47) -- `Space` on the form's
+/// `Kind` field toggles this; `Default` is `External`, `T42`'s original
+/// (and, until this doc, only) shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FormKind {
+    #[default]
+    External,
+    Builtin,
+}
+
+impl FormKind {
+    pub(crate) fn toggle(self) -> Self {
+        match self {
+            FormKind::External => FormKind::Builtin,
+            FormKind::Builtin => FormKind::External,
+        }
+    }
+}
+
 /// Which field of the Manage Custom Actions add/edit form has focus;
-/// `Tab`/`BackTab` cycle it. Mirrors `WorktreeAddField`
-/// (`git_panel.rs`) exactly (`docs/features/tui-custom-actions.md` §2.3).
+/// `Tab`/`BackTab` cycle it in this order (`docs/features/
+/// tui-custom-actions-edge-slots.md` §2.3, T47 -- `Kind`/`Slot` are new).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ActionFormField {
     #[default]
     Name,
+    Kind,
     Command,
     Args,
+    Slot,
 }
 
 impl ActionFormField {
     pub(crate) fn next(self) -> Self {
         match self {
-            ActionFormField::Name => ActionFormField::Command,
+            ActionFormField::Name => ActionFormField::Kind,
+            ActionFormField::Kind => ActionFormField::Command,
             ActionFormField::Command => ActionFormField::Args,
-            ActionFormField::Args => ActionFormField::Name,
+            ActionFormField::Args => ActionFormField::Slot,
+            ActionFormField::Slot => ActionFormField::Name,
         }
     }
 
     pub(crate) fn prev(self) -> Self {
         match self {
-            ActionFormField::Name => ActionFormField::Args,
-            ActionFormField::Command => ActionFormField::Name,
+            ActionFormField::Name => ActionFormField::Slot,
+            ActionFormField::Kind => ActionFormField::Name,
+            ActionFormField::Command => ActionFormField::Kind,
             ActionFormField::Args => ActionFormField::Command,
+            ActionFormField::Slot => ActionFormField::Args,
         }
     }
 }
 
 /// The Manage Custom Actions popup's state (`docs/features/
-/// tui-custom-actions.md` §2.3/§3.2). `adding` doubles as "add" and "edit"
+/// tui-custom-actions.md` §2.3/§3.2, extended by `tui-custom-actions-edge-
+/// slots.md` §2.3, T47). `adding` doubles as "add" and "edit"
 /// mode (mirrors `WorktreesPopupState::adding`) -- `editing_index:
 /// Some(i)` means the form was opened via `Enter` on `actions[i]` and
 /// `Enter` in the form overwrites that index instead of pushing a new
@@ -900,12 +994,19 @@ pub(crate) struct ManageActionsPopupState {
     pub(crate) editing_index: Option<usize>,
     pub(crate) add_field: ActionFormField,
     pub(crate) new_name: String,
+    /// `External`: the program name. `Builtin`: the typed `Command::id`
+    /// (case-sensitive exact match, validated at confirm time) -- one
+    /// field reused for both, since exactly one is ever meaningful at a
+    /// time depending on `form_kind`.
     pub(crate) new_command: String,
     /// Raw typed text, space-separated -- split into `Vec<String>` only in
     /// `confirm_action_form`, the same one-parse-site discipline
     /// `confirm_debug_adapter_config`'s `args: String` field already
-    /// establishes.
+    /// establishes. Ignored (not cleared, not validated) when `form_kind
+    /// == Builtin`.
     pub(crate) new_args: String,
+    pub(crate) form_kind: FormKind,
+    pub(crate) form_slot: crate::custom_actions::ActionSlot,
 }
 
 pub struct App {
@@ -925,6 +1026,23 @@ pub struct App {
     pub(crate) palette: Option<PaletteState>,
     /// `docs/features/tui-colon-command.md` §2.1, T45.
     pub(crate) colon_command: Option<ColonCommandState>,
+    /// `docs/features/tui-unified-finder.md` §2.2, T46.
+    pub(crate) unified_finder: Option<UnifiedFinderState>,
+    /// `docs/features/tui-menu-bar.md` §2.2, T54 -- the always-visible top
+    /// menu bar's open/selected/flyout state. `open: None` is "closed",
+    /// same presence-is-visibility convention every other overlay here
+    /// uses; unlike most of them this one is a plain struct (not wrapped
+    /// in another `Option`) since the bar itself is *always* rendered
+    /// (`ui::render_menu_bar` draws the row regardless), only its dropdown/
+    /// flyout are conditional on `open`/`submenu_selected`.
+    pub(crate) menu_bar: MenuBarState,
+    /// `docs/features/tui-unified-finder.md` §2.3, T46 -- the `⇧⇧` gesture's
+    /// double-tap tracker. A process-lifetime field, not per-overlay state
+    /// (must keep ticking regardless of whether `unified_finder` is open).
+    shift_double_tap: crate::double_tap::DoubleTap,
+    /// The monotonic clock `shift_double_tap`'s `now: f64` argument is
+    /// measured against (`docs/features/tui-unified-finder.md` §2.3).
+    created_at: std::time::Instant,
     pub(crate) find: Option<FindState>,
     pub(crate) goto: Option<GotoState>,
     /// The `(path, position)` a `Ctrl+B` press actually fired from --
@@ -1026,6 +1144,11 @@ pub struct App {
     /// the mirror-the-Claude-panel shape that doc requests.
     pub(crate) ai: AiPanel,
     pub(crate) ai_panel_open: bool,
+    /// `docs/features/tui-local-agent.md` §2: the local agentic assistant
+    /// dock tab. `agent_panel_open` mirrors `ai_panel_open`'s derived
+    /// dock-tab-visibility shape.
+    pub(crate) agent: AgentPanel,
+    pub(crate) agent_panel_open: bool,
     /// A FIM autocomplete request currently awaiting its background thread
     /// (`docs/features/tui-ai-hybrid-fallback.md` §3.4): the receiver and
     /// the (path, offset) to insert into once it lands, matched against
@@ -1083,6 +1206,14 @@ pub struct App {
     /// The buffer line a sign-column click landed on, while its "Revert
     /// Hunk (r) / Show Diff (d)" popup is open. `None` when closed.
     pub(crate) git_gutter_popup_line: Option<usize>,
+    /// The line-number lane's right-click menu (`docs/features/
+    /// tui-gutter-line-numbers.md` §2.5/§3.4, T50). `None` when closed.
+    /// Deliberately not reset by `close_all_overlays` -- mirrors
+    /// `git_gutter_popup_line`'s own identical omission, safe for the
+    /// same reason: `handle_key`'s popup-priority check on this field
+    /// runs before any command dispatch that could open a competing
+    /// overlay, so it's already the exclusive input owner while open.
+    pub(crate) gutter_context_menu: Option<GutterContextMenuState>,
     /// Always alive since `docs/features/tui-tool-window-docking.md` §2.1
     /// (T33) -- a dock tab can be switched away from and back to as
     /// casually as `Tab`-cycling, so an in-flight `docker`/`kubectl` fetch
@@ -1243,6 +1374,10 @@ impl App {
             active_tab: None,
             palette: None,
             colon_command: None,
+            unified_finder: None,
+            menu_bar: MenuBarState::default(),
+            shift_double_tap: crate::double_tap::DoubleTap::default(),
+            created_at: std::time::Instant::now(),
             find: None,
             goto: None,
             goto_declaration_origin: None,
@@ -1295,6 +1430,8 @@ impl App {
             new_claude_terminal: None,
             ai: AiPanel::new(project.root().to_path_buf()),
             ai_panel_open: false,
+            agent: AgentPanel::new(project.root().to_path_buf()),
+            agent_panel_open: false,
             fim_rx: None,
             fim_target: None,
             code_actions: None,
@@ -1314,6 +1451,7 @@ impl App {
             git_gutter: Vec::new(),
             git_gutter_path: None,
             git_gutter_popup_line: None,
+            gutter_context_menu: None,
             docker: DockerPanel::default(),
             k8s: K8sPanel::default(),
             left_dock: Some(LeftDockState::default()),
@@ -1720,8 +1858,11 @@ impl App {
 
     /// `ToggleLineBreakpoint` (`docs/features/tui-debugger.md` §2.7):
     /// toggles a breakpoint on the active editor's current caret line.
-    /// There is no gutter click to also wire this to (§2.4) -- the
-    /// keyboard command is `ide-tui`'s only way to toggle a breakpoint.
+    /// Resolves the caret's line and delegates to `toggle_breakpoint_at_
+    /// line` -- the gutter's left-click/context-menu entry points
+    /// (`docs/features/tui-gutter-line-numbers.md` §2.4/§2.7, T50) share
+    /// this same underlying toggle, parameterized by an arbitrary clicked
+    /// line instead of the caret's.
     fn toggle_breakpoint_at_caret(&mut self) {
         let Some(buf) = self.active_buffer() else {
             return;
@@ -1732,6 +1873,13 @@ impl App {
             buf.buffer.text_buffer().selections().primary().head,
         )
         .0;
+        self.toggle_breakpoint_at_line(path, line);
+    }
+
+    /// Shared by `toggle_breakpoint_at_caret` and the line-number gutter's
+    /// left-click/context-menu entry points (`docs/features/
+    /// tui-gutter-line-numbers.md` §2.6, T50).
+    fn toggle_breakpoint_at_line(&mut self, path: PathBuf, line: usize) {
         self.debug.toggle_breakpoint(path, line as u32 + 1);
     }
 
@@ -2280,6 +2428,16 @@ impl App {
         // it out would let it linger open underneath a newly-opened popup
         // (`docs/features/tui-colon-command.md` §2.3, T45).
         self.colon_command = None;
+        // Included here for the same reason `colon_command` is, right
+        // above (`docs/features/tui-unified-finder.md` §2.4, T46): no
+        // toggle-function precedent guarantees it's already `None` by the
+        // time some other overlay opens.
+        self.unified_finder = None;
+        // Same reasoning again (`docs/features/tui-menu-bar.md` §2.2, T54):
+        // opening any other overlay must close the menu bar, and
+        // `open_menu_bar` itself calls this before setting `menu_bar` back
+        // open, so the two can never both be `Some`/non-default at once.
+        self.menu_bar = MenuBarState::default();
         self.goto = None;
         self.notifications_open = false;
         self.hover_open = false;
@@ -2308,6 +2466,13 @@ impl App {
         self.debug_adapter_config_popup = None;
         self.debug.show_launch_popup = false;
         self.clone_panel_open = false;
+        // A pending approval is a blocking decision the paused `AgentLoop`
+        // is waiting on -- opening some other overlay must not silently
+        // discard it (leaving the loop wedged forever with nothing on
+        // screen still asking), so treat it as a deny, mirroring what
+        // `Esc` already does at the popup-priority chain's own rank
+        // (`docs/features/tui-local-agent.md` §2.2).
+        self.agent.deny_pending();
     }
 
     /// Shared "ensure `left_dock` is open, on `tab`, and focused" mechanics
@@ -2462,6 +2627,20 @@ impl App {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.claude.input.push(c);
             }
+            // Scroll-back through chat history (`docs/features/
+            // tui-panel-history-scroll.md` §2.5/§3.1, T52).
+            KeyCode::Up => {
+                self.claude.history_scroll = self.claude.history_scroll.saturating_add(1)
+            }
+            KeyCode::Down => {
+                self.claude.history_scroll = self.claude.history_scroll.saturating_sub(1)
+            }
+            KeyCode::PageUp => {
+                self.claude.history_scroll = self.claude.history_scroll.saturating_add(10)
+            }
+            KeyCode::PageDown => {
+                self.claude.history_scroll = self.claude.history_scroll.saturating_sub(10)
+            }
             _ => {}
         }
     }
@@ -2517,9 +2696,135 @@ impl App {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.ai.input.push(c);
             }
+            // Scroll-back through chat history (`docs/features/
+            // tui-panel-history-scroll.md` §2.5/§3.1, T52).
+            KeyCode::Up => self.ai.history_scroll = self.ai.history_scroll.saturating_add(1),
+            KeyCode::Down => self.ai.history_scroll = self.ai.history_scroll.saturating_sub(1),
+            KeyCode::PageUp => self.ai.history_scroll = self.ai.history_scroll.saturating_add(10),
+            KeyCode::PageDown => self.ai.history_scroll = self.ai.history_scroll.saturating_sub(10),
             _ => {}
         }
         LoopSignal::Continue
+    }
+
+    /// `Action::ToggleAgentPanel` (`docs/features/tui-local-agent.md` §2):
+    /// mirrors `toggle_ai_panel` exactly for the `Agent` dock tab.
+    fn toggle_agent_panel(&mut self) {
+        let opening = !matches!(
+            self.bottom_dock.as_ref().map(|dock| dock.tab),
+            Some(BottomDockTab::Agent)
+        );
+        self.agent_panel_open = opening;
+        if opening {
+            self.show_bottom_dock_tab(BottomDockTab::Agent);
+            self.focus = Focus::BottomDock;
+        } else {
+            self.bottom_dock = None;
+            self.focus = Focus::Editor;
+        }
+    }
+
+    /// The Agent dock tab's single-line text field, mirroring
+    /// `handle_ai_panel_key` -- `Esc` closes the dock (cancelling an
+    /// in-flight run first, same wedged-transport backstop), `Enter`
+    /// submits, `Backspace`/chars edit the input, Up/Down/PageUp/PageDown
+    /// scroll history. A pending approval intercepts every key first (see
+    /// the pre-keymap `Esc` block in `handle_key` for why this method is
+    /// only reached once `pending_approval` is `None`).
+    fn handle_agent_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => {
+                if self.agent.is_in_flight() {
+                    self.agent.cancel();
+                }
+                self.toggle_agent_panel();
+            }
+            KeyCode::Backspace => {
+                self.agent.input.pop();
+            }
+            KeyCode::Enter => {
+                if self.agent.is_in_flight() {
+                    self.notify("one agent request at a time");
+                } else {
+                    let prompt = std::mem::take(&mut self.agent.input);
+                    self.agent.submit(prompt);
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.agent.input.push(c);
+            }
+            KeyCode::Up => self.agent.history_scroll = self.agent.history_scroll.saturating_add(1),
+            KeyCode::Down => {
+                self.agent.history_scroll = self.agent.history_scroll.saturating_sub(1)
+            }
+            KeyCode::PageUp => {
+                self.agent.history_scroll = self.agent.history_scroll.saturating_add(10)
+            }
+            KeyCode::PageDown => {
+                self.agent.history_scroll = self.agent.history_scroll.saturating_sub(10)
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// The pending-approval popup (`docs/features/tui-local-agent.md`
+    /// §2.2): `y`/`Enter` approves, `n`/`Esc` denies -- both resume the
+    /// paused `AgentLoop` via `AgentPanel::approve_pending`/
+    /// `deny_pending`.
+    fn handle_agent_approval_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.agent.approve_pending()
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.agent.deny_pending(),
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Drains the agent's event channel once per frame (mirrors
+    /// `poll_ai`/`poll_debug`). The one event `AgentPanel::poll` can't
+    /// resolve itself -- `AwaitingDebugExecution` -- is run here, on the
+    /// main thread, against this struct's own real `DebugPanel` session
+    /// (`docs/features/tui-local-agent.md` §2.2: the agent may only
+    /// control a session a human already started).
+    pub fn poll_agent(&mut self) {
+        if let Some(action) = self.agent.poll() {
+            let result = self.run_debug_action_for_agent(action);
+            self.agent.resolve_debug(result);
+        }
+    }
+
+    /// Maps one `ide_agent::DebugAction` onto the same `DebugPanel`
+    /// methods the human-facing debug keybindings already call.
+    /// `ToggleBreakpoint` works with no active session (mirroring
+    /// `DebugPanel::toggle_breakpoint`'s own doc comment); every other
+    /// variant requires one, surfaced as `ToolError::NoDebugSession`
+    /// rather than silently no-op'ing (§4: never pretend an action
+    /// happened when it didn't).
+    fn run_debug_action_for_agent(
+        &mut self,
+        action: ide_agent::DebugAction,
+    ) -> Result<String, ide_agent::ToolError> {
+        use ide_agent::DebugAction;
+        if let DebugAction::ToggleBreakpoint { path, line } = action {
+            self.debug.toggle_breakpoint(PathBuf::from(path), line);
+            return Ok("breakpoint toggled".to_string());
+        }
+        if !self.debug.is_active() {
+            return Err(ide_agent::ToolError::NoDebugSession);
+        }
+        match action {
+            DebugAction::Resume => self.debug.resume(),
+            DebugAction::StepOver => self.debug.step_over(),
+            DebugAction::StepInto => self.debug.step_into(),
+            DebugAction::StepOut => self.debug.step_out(),
+            DebugAction::Pause => self.debug.pause(),
+            DebugAction::Stop => self.debug.stop(),
+            DebugAction::ToggleBreakpoint { .. } => unreachable!(),
+        }
+        Ok("ok".to_string())
     }
 
     /// The active buffer's selection feeds the AI context (§3.2: copied at
@@ -2845,6 +3150,148 @@ impl App {
         self.active_screen = AppScreen::Keys;
     }
 
+    /// Opens the top menu bar on `menu_groups()[group_index]` (`docs/
+    /// features/tui-menu-bar.md` §2.2, T54) -- via a label click or an
+    /// `Alt+<mnemonic>` press. Mirrors `go_to_git_screen`'s save-and-
+    /// restore-around-`close_all_overlays` pattern: opening the menu bar is
+    /// reachable while on the Git screen (its label stays clickable there,
+    /// same as `screen_tabs`, per `handle_mouse_click`), and a naive
+    /// `close_all_overlays()` call would unconditionally clear `git_panel`
+    /// out from under it, desyncing `active_screen == Git` from `git_panel
+    /// == None` -- exactly the bug class T44's round-1 review already found
+    /// and fixed for `go_to_git_screen`/`go_to_run_screen`. Unlike that
+    /// pattern, this never forces `git_panel` to `Some` -- it only
+    /// preserves whatever it already was, since opening the menu bar never
+    /// changes `active_screen`.
+    fn open_menu_bar(&mut self, group_index: usize) {
+        let existing_git_panel = self.git_panel.take();
+        self.close_all_overlays();
+        self.git_panel = existing_git_panel;
+        self.menu_bar = MenuBarState {
+            open: Some(group_index),
+            selected: 0,
+            submenu_selected: None,
+        };
+    }
+
+    fn close_menu_bar(&mut self) {
+        self.menu_bar = MenuBarState::default();
+    }
+
+    /// Looks `id` up in `commands::commands()` and runs its `Action` --
+    /// shared by every menu-bar selection path (`docs/features/
+    /// tui-menu-bar.md` §2.2/§3.2/§3.3, T54) so keyboard `Enter` and a
+    /// mouse click on the same row resolve identically. `id` always comes
+    /// from `commands::menu_groups()`, whose completeness is enforced by
+    /// `commands::tests::menu_completeness_covers_every_command_exactly_
+    /// once`, so the lookup is not expected to ever miss in practice --
+    /// falling through to a no-op rather than panicking is still the right
+    /// shape here, matching every other "resolve an id/index into an
+    /// action" helper in this file (e.g. `handle_palette_key`'s own
+    /// `filtered.get(...)`).
+    fn run_action_by_id(&mut self, id: &str) -> LoopSignal {
+        if let Some(action) = commands()
+            .iter()
+            .find(|command| command.id == id)
+            .map(|command| command.action)
+        {
+            return self.run_action(action);
+        }
+        LoopSignal::Continue
+    }
+
+    /// Every key while the menu bar is open (`docs/features/
+    /// tui-menu-bar.md` §3.2, T54). `Left`/`Right` move between top-level
+    /// menus with wrapping (mirrors a real OS menu bar); `Up`/`Down` move
+    /// within the open dropdown/flyout with clamping, matching this
+    /// crate's established list-cursor convention (e.g. `handle_palette_
+    /// key`'s own `Up`/`Down` arms) rather than the wrap `Left`/`Right`
+    /// just used one level up -- the two axes are deliberately asymmetric.
+    /// An `Alt+<mnemonic>` press while already open jumps straight to that
+    /// menu (closing any open flyout), the same gesture that opens the bar
+    /// in the first place from `handle_key`.
+    fn handle_menu_bar_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(open) = self.menu_bar.open else {
+            return LoopSignal::Continue;
+        };
+        let groups = menu_groups();
+        if key.modifiers == KeyModifiers::ALT {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(idx) = groups
+                    .iter()
+                    .position(|group| group.mnemonic.eq_ignore_ascii_case(&c))
+                {
+                    self.menu_bar.open = Some(idx);
+                    self.menu_bar.selected = 0;
+                    self.menu_bar.submenu_selected = None;
+                    return LoopSignal::Continue;
+                }
+            }
+        }
+        match key.code {
+            KeyCode::Esc => {
+                if self.menu_bar.submenu_selected.is_some() {
+                    self.menu_bar.submenu_selected = None;
+                } else {
+                    self.close_menu_bar();
+                }
+            }
+            KeyCode::Left if self.menu_bar.submenu_selected.is_none() => {
+                self.menu_bar.open = Some(if open == 0 {
+                    groups.len() - 1
+                } else {
+                    open - 1
+                });
+                self.menu_bar.selected = 0;
+            }
+            KeyCode::Right if self.menu_bar.submenu_selected.is_none() => {
+                self.menu_bar.open = Some((open + 1) % groups.len());
+                self.menu_bar.selected = 0;
+            }
+            KeyCode::Up => {
+                if let Some(sub) = self.menu_bar.submenu_selected {
+                    if sub > 0 {
+                        self.menu_bar.submenu_selected = Some(sub - 1);
+                    }
+                } else if self.menu_bar.selected > 0 {
+                    self.menu_bar.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(sub) = self.menu_bar.submenu_selected {
+                    if let MenuEntry::Submenu(_, ids) = groups[open].entries[self.menu_bar.selected]
+                    {
+                        if sub + 1 < ids.len() {
+                            self.menu_bar.submenu_selected = Some(sub + 1);
+                        }
+                    }
+                } else if self.menu_bar.selected + 1 < groups[open].entries.len() {
+                    self.menu_bar.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                let entry = groups[open].entries[self.menu_bar.selected];
+                match (entry, self.menu_bar.submenu_selected) {
+                    (MenuEntry::Item(id), _) => {
+                        self.close_menu_bar();
+                        return self.run_action_by_id(id);
+                    }
+                    (MenuEntry::Submenu(_, ids), Some(sub)) => {
+                        if let Some(&id) = ids.get(sub) {
+                            self.close_menu_bar();
+                            return self.run_action_by_id(id);
+                        }
+                    }
+                    (MenuEntry::Submenu(_, _), None) => {
+                        self.menu_bar.submenu_selected = Some(0);
+                    }
+                }
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
     /// Handles every key while `BottomDockTab::Cargo` is the bottom dock's
     /// active tab and it has focus -- same interception shape as
     /// `handle_notifications_key`: plain, unmodified letters, since this
@@ -2860,6 +3307,16 @@ impl App {
             KeyCode::Char('c') => self.cargo.run(&self.project_root, CargoCommand::Check),
             KeyCode::Char('l') => self.cargo.run(&self.project_root, CargoCommand::Clippy),
             KeyCode::Char('f') => self.cargo.run(&self.project_root, CargoCommand::Fmt),
+            // Scroll-back through output (`docs/features/
+            // tui-panel-history-scroll.md` §2.5/§3.1, T52).
+            KeyCode::Up => self.cargo.output_scroll = self.cargo.output_scroll.saturating_add(1),
+            KeyCode::Down => self.cargo.output_scroll = self.cargo.output_scroll.saturating_sub(1),
+            KeyCode::PageUp => {
+                self.cargo.output_scroll = self.cargo.output_scroll.saturating_add(10)
+            }
+            KeyCode::PageDown => {
+                self.cargo.output_scroll = self.cargo.output_scroll.saturating_sub(10)
+            }
             _ => {}
         }
         LoopSignal::Continue
@@ -3595,7 +4052,11 @@ impl App {
     }
 
     /// `F3` entry point (`docs/features/tui-recent-files-and-bookmarks.md`
-    /// §3.2). No active tab: notifies and no-ops.
+    /// §3.2). No active tab: notifies and no-ops. Resolves the caret's
+    /// line and delegates to `toggle_bookmark_at_line` -- the gutter
+    /// context menu's "Toggle Bookmark" entry (`docs/features/
+    /// tui-gutter-line-numbers.md` §2.6/§3.3, T50) shares this same
+    /// underlying toggle, parameterized by the clicked line instead.
     fn toggle_bookmark_at_cursor(&mut self) {
         let Some(buf) = self.active_buffer() else {
             self.notify("No file open to bookmark.");
@@ -3607,6 +4068,13 @@ impl App {
             buf.buffer.text_buffer().selections().primary().head,
         )
         .0;
+        self.toggle_bookmark_at_line(path, line);
+    }
+
+    /// Shared by `toggle_bookmark_at_cursor` and the line-number gutter's
+    /// context-menu "Toggle Bookmark" entry (`docs/features/
+    /// tui-gutter-line-numbers.md` §2.6, T50).
+    fn toggle_bookmark_at_line(&mut self, path: PathBuf, line: usize) {
         let added = self.nav_state.toggle_bookmark(path, line);
         project_state::save(&self.project_root, &self.nav_state);
         self.notify(if added {
@@ -4015,15 +4483,35 @@ impl App {
         }
     }
 
-    /// `blame_lane_width() + git_gutter_lane_width()` -- the one value
-    /// both the mouse-click column math (`handle_mouse_click`) and
-    /// `render_editor`'s native-cursor-position fix use, so neither ever
-    /// computes the combined offset independently (`docs/features/
-    /// tui-git-gutter.md` §1.1/§2.3, the same "two things that could
-    /// drift" concern `tui-blame.md` §2.3 already resolved for its own
-    /// single lane).
+    /// `0` with no active tab; else the decimal digit width of the active
+    /// buffer's total line count, plus one column for a trailing space --
+    /// mirrors `ide-ui`'s `Metrics::gutter_width` stepping at line-count
+    /// digit boundaries (`docs/features/code-editor-widget.md` §3.3), the
+    /// same "grows only when an extra digit is actually needed" rule, not
+    /// a fixed budget (`docs/features/tui-gutter-line-numbers.md` §2.1/
+    /// §3.1, T50). Unlike `blame_lane_width`/`git_gutter_lane_width`,
+    /// this lane is never conditionally zero while a tab is open -- line
+    /// numbers are useful independent of git/blame state.
+    pub(crate) fn line_number_lane_width(&self) -> u16 {
+        match self.active_buffer() {
+            Some(buf) => {
+                let total_lines = buf.buffer.text_buffer().lines().line_count().max(1);
+                total_lines.to_string().len() as u16 + 1
+            }
+            None => 0,
+        }
+    }
+
+    /// `blame_lane_width() + git_gutter_lane_width() + line_number_lane_
+    /// width()` -- the one value both the mouse-click column math
+    /// (`handle_mouse_click`) and `render_editor`'s native-cursor-position
+    /// fix use, so neither ever computes the combined offset independently
+    /// (`docs/features/tui-git-gutter.md` §1.1/§2.3, the same "two things
+    /// that could drift" concern `tui-blame.md` §2.3 already resolved for
+    /// its own single lane; widened for the line-number lane in
+    /// `tui-gutter-line-numbers.md` §2.2, T50).
     pub(crate) fn editor_lane_width(&self) -> u16 {
-        self.blame_lane_width() + self.git_gutter_lane_width()
+        self.blame_lane_width() + self.git_gutter_lane_width() + self.line_number_lane_width()
     }
 
     /// The active tab's path, only while `git_gutter_popup_line` names a
@@ -4064,6 +4552,72 @@ impl App {
         if self.git_gutter.iter().any(|m| m.line == line) {
             self.git_gutter_popup_line = Some(line);
         }
+    }
+
+    /// Shared by `click_line_number_lane` and `handle_mouse_right_click`
+    /// (`docs/features/tui-gutter-line-numbers.md` §2.3, T50) -- same
+    /// bounds-check shape `click_blame_lane`/`click_git_gutter_lane`
+    /// already establish for mapping a click row to a buffer line, just
+    /// also returning the active tab's path since both callers need it.
+    fn resolve_gutter_line(&self, area_row: u16) -> Option<(PathBuf, usize)> {
+        let buf = self.active_buffer()?;
+        let text_buffer = buf.buffer.text_buffer();
+        let ranges = text_buffer.fold_ranges();
+        let line_count = text_buffer.lines().line_count();
+        let visual = VisualLines::build(line_count, &ranges, &buf.folded);
+        let clicked_row = buf.scroll as usize + area_row as usize;
+        if clicked_row >= visual.row_count() {
+            return None;
+        }
+        Some((buf.path.clone(), visual.buffer_line(clicked_row)))
+    }
+
+    /// Left-click on the line-number lane: toggles a breakpoint on the
+    /// clicked line, unconditionally -- independent of wherever the caret
+    /// currently sits. Mirrors `ide-ui`'s real gutter behavior
+    /// (`docs/features/debugger.md` §347: clicking a line's line-number
+    /// digits toggles a breakpoint), `docs/features/
+    /// tui-gutter-line-numbers.md` §2.4/§3.2, T50.
+    fn click_line_number_lane(&mut self, area_row: u16) {
+        if let Some((path, line)) = self.resolve_gutter_line(area_row) {
+            self.toggle_breakpoint_at_line(path, line);
+        }
+    }
+
+    /// Right-click anywhere in the editor text area (`handle_mouse`'s new
+    /// `MouseEventKind::Down(MouseButton::Right)` arm). A no-op unless the
+    /// click lands specifically inside the line-number lane's column
+    /// range -- right-clicking the blame/git-gutter lanes or the text
+    /// itself does nothing in this run, scoped exactly to the line-number
+    /// gutter (`docs/features/tui-gutter-line-numbers.md` §2.6/§4, T50).
+    fn handle_mouse_right_click(&mut self, event: MouseEvent, hits: &crate::ui::HitMap) {
+        if self.any_popup_open() {
+            return;
+        }
+        let Some(area) = hits.editor_text_area else {
+            return;
+        };
+        let point: (u16, u16) = (event.column, event.row);
+        if !area.contains(point.into()) {
+            return;
+        }
+        let col = event.column - area.x;
+        let row = event.row - area.y;
+        let blame_w = self.blame_lane_width();
+        let git_w = self.git_gutter_lane_width();
+        let line_num_start = blame_w + git_w;
+        let line_num_end = line_num_start + self.line_number_lane_width();
+        if (col as usize) < line_num_start as usize || (col as usize) >= line_num_end as usize {
+            return;
+        }
+        let Some((path, line)) = self.resolve_gutter_line(row) else {
+            return;
+        };
+        self.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line,
+            selected: 0,
+        });
     }
 
     /// Routes the git-gutter popup's two single-letter actions -- `r`
@@ -4146,6 +4700,55 @@ impl App {
         state.view = GitPanelView::Log;
         state.focus = GitPanelFocus::Diff;
         state.diff_scroll = 0;
+    }
+
+    /// Navigates/confirms the line-number gutter's right-click menu
+    /// (`docs/features/tui-gutter-line-numbers.md` §2.6/§3.3, T50) --
+    /// `Up`/`Down` clamp against the fixed 4-item list, `Enter` calls
+    /// `confirm_gutter_context_menu`, `Esc` closes, every other key is a
+    /// no-op -- same shape `handle_bookmarks_popup_key` already
+    /// establishes for a small navigable list (not
+    /// `handle_git_gutter_popup_key`'s different "any other key closes"
+    /// shape, which fits two mnemonic single keys, not four list items).
+    fn handle_gutter_context_menu_key(&mut self, key: KeyEvent) -> LoopSignal {
+        const ITEM_COUNT: usize = 4;
+        let Some(state) = self.gutter_context_menu.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => self.gutter_context_menu = None,
+            KeyCode::Up => {
+                if state.selected > 0 {
+                    state.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if state.selected + 1 < ITEM_COUNT {
+                    state.selected += 1;
+                }
+            }
+            KeyCode::Enter => self.confirm_gutter_context_menu(),
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Takes `gutter_context_menu` (closing it unconditionally -- every
+    /// one of the four actions is a plain toggle/open with nothing that
+    /// would ever need to keep the menu open) and dispatches on
+    /// `.selected` (`docs/features/tui-gutter-line-numbers.md` §2.6/§3.3,
+    /// T50).
+    fn confirm_gutter_context_menu(&mut self) {
+        let Some(state) = self.gutter_context_menu.take() else {
+            return;
+        };
+        match state.selected {
+            0 => self.toggle_breakpoint_at_line(state.path, state.line),
+            1 => self.toggle_bookmark_at_line(state.path, state.line),
+            2 => self.toggle_bookmarks_popup(),
+            3 => self.toggle_blame_annotations(),
+            _ => unreachable!("ITEM_COUNT bounds selected in handle_gutter_context_menu_key"),
+        }
     }
 
     /// Lower-level open/close primitive for `git_panel` -- no `Command`
@@ -6043,11 +6646,68 @@ impl App {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return LoopSignal::Continue;
         }
+        // The agent's pending-approval popup (`docs/features/
+        // tui-local-agent.md` §2.2) must outrank *every* other check in
+        // this function, including `menu_bar.open` right below (which is
+        // otherwise the single highest-priority check here) -- `poll_agent`
+        // runs unconditionally every frame with no gating on what other
+        // overlay is open, so a background agent run can pause on approval
+        // while the menu bar, palette, or any other overlay already has
+        // input focus. `render_agent_approval_popup` (`ui.rs`) draws this
+        // popup on top of literally everything for the same reason: input
+        // priority has to match that z-order, or the popup is visible but
+        // unreachable by keyboard (`rev` fix round 1 -- the previous
+        // placement, just above the `Ai`/`Agent` Esc-intercept blocks
+        // further down, was reachable in the common case but lost to
+        // `menu_bar`/`palette`/every other earlier check in this chain
+        // whenever one of those was already open when the pause arrived;
+        // `close_all_overlays`'s own `agent.deny_pending()` call only
+        // guards the reverse direction, opening a *new* overlay while a
+        // decision is already pending).
+        if self.agent.pending_approval.is_some() {
+            return self.handle_agent_approval_key(key);
+        }
+        // `⇧⇧` Search Everywhere (`docs/features/tui-unified-finder.md`
+        // §3.3, T46). A pure side effect, checked before the popup-
+        // priority chain below reads any state -- it never itself returns,
+        // so the same key event still flows into the rest of `handle_key`
+        // afterward exactly as it would without this check. Gated on
+        // `!is_text_editing_focused()` for the same reason `ide-ui`'s own
+        // Search Everywhere gates on `!ctx.text_edit_focused()`: without
+        // it, two quick `Shift+Down` (selection-extend) keystrokes while
+        // actually editing code would spuriously pop this open. Gated on
+        // `!any_popup_open()` (checked pre-toggle, before this call could
+        // have changed it) so the gesture can't fire out from under an
+        // already-open, unrelated overlay. `key.modifiers == SHIFT` --
+        // exactly Shift, not merely "contains" it -- is required, not
+        // `ide-ui`'s own looser `i.modifiers.shift` check: this crate binds
+        // many real chords as `CONTROL.union(SHIFT)` (`NextTab`, `Redo`,
+        // ...), and `contains(SHIFT)` would count every one of those as a
+        // tap too, so two quick presses of any single such chord (e.g.
+        // repeatedly cycling tabs with `Ctrl+Shift+]`) would spuriously
+        // pop this open -- caught by `ctrl_shift_close_bracket_cycles_to_
+        // the_next_tab_and_wraps`'s own regression test failing outright,
+        // not by inspection.
+        if !self.is_text_editing_focused()
+            && key.kind == KeyEventKind::Press
+            && key.modifiers == KeyModifiers::SHIFT
+        {
+            let now = self.created_at.elapsed().as_secs_f64();
+            if self.shift_double_tap.press(now) && !self.any_popup_open() {
+                self.toggle_unified_finder();
+            }
+        }
+        if self.menu_bar.open.is_some() {
+            return self.handle_menu_bar_key(key);
+        }
         if self.palette.is_some() {
             return self.handle_palette_key(key);
         }
         if self.colon_command.is_some() {
             return self.handle_colon_command_key(key);
+        }
+        if self.unified_finder.is_some() {
+            return self.handle_unified_finder_key(key);
         }
         if self.find.is_some() {
             return self.handle_find_key(key);
@@ -6105,6 +6765,9 @@ impl App {
         }
         if self.git_gutter_popup_line.is_some() {
             return self.handle_git_gutter_popup_key(key);
+        }
+        if self.gutter_context_menu.is_some() {
+            return self.handle_gutter_context_menu_key(key);
         }
         // `docs/features/tui-screen-navigation.md`, T44 review round --
         // gated on `active_screen`, not `git_panel.is_some()`: `git_panel`
@@ -6190,6 +6853,18 @@ impl App {
         {
             return self.handle_ai_panel_key(key);
         }
+        // Same reasoning as the AI block just above, for the Agent dock
+        // tab (`docs/features/tui-local-agent.md` §2).
+        if key.code == KeyCode::Esc
+            && self.agent_panel_open
+            && self.focus == Focus::BottomDock
+            && matches!(
+                self.bottom_dock.as_ref().map(|dock| dock.tab),
+                Some(BottomDockTab::Agent)
+            )
+        {
+            return self.handle_agent_panel_key(key);
+        }
         // `docs/features/tui-screen-navigation.md` §3.5, T44 -- must sit
         // *before* the global keymap lookup below: `Esc` is already bound
         // there (`CollapseSelections`, `commands.rs`), which would
@@ -6222,6 +6897,28 @@ impl App {
         {
             self.open_colon_command();
             return LoopSignal::Continue;
+        }
+        // `docs/features/tui-menu-bar.md` §3.1/§3.2, T54 -- same rank as
+        // the colon-command trigger immediately above: must sit before the
+        // global keymap lookup below (`Alt`-modified letters aren't bound
+        // to anything today, but a future binding could collide) and is
+        // gated on `!any_popup_open()` so it can't fire out from under an
+        // already-open, unrelated overlay. Not gated on `is_text_editing_
+        // focused()` -- unlike `:`, `Alt+<letter>` is never a character an
+        // editor would otherwise insert, so there's no ambiguity to guard
+        // against while typing.
+        if key.modifiers == KeyModifiers::ALT && !self.any_popup_open() {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(idx) = menu_groups()
+                    .iter()
+                    .position(|group| group.mnemonic.eq_ignore_ascii_case(&c))
+                {
+                    self.menu_bar.open = Some(idx);
+                    self.menu_bar.selected = 0;
+                    self.menu_bar.submenu_selected = None;
+                    return LoopSignal::Continue;
+                }
+            }
         }
         if let Some(action) = self.keymap.action_for(key.modifiers, key.code) {
             return self.run_action(action);
@@ -6267,14 +6964,19 @@ impl App {
         LoopSignal::Continue
     }
 
-    /// Mirrors `handle_key`'s own popup-priority chain above (every branch
-    /// before the `keymap.action_for`/`self.focus` dispatch) -- kept as a
-    /// single source of truth so mouse routing (`docs/features/
-    /// tui-mouse-support.md` §3.2/§3.3) never drifts from which state
-    /// `handle_key` itself currently treats as "a popup is open".
-    fn any_popup_open(&self) -> bool {
+    /// Every condition `any_popup_open` checks *except*
+    /// `active_screen == AppScreen::Git` -- split out so
+    /// `handle_mouse_click` can gate on "is a genuine modal popup open"
+    /// without also treating the Git screen itself as one (`docs/
+    /// features/tui-panel-focus-and-scroll.md` §2.2/§3.1, T51): unlike
+    /// every other member of this OR-chain, the Git screen has its own
+    /// clickable chrome (the screen-tab bar) that must stay reachable by
+    /// mouse even while it's "open".
+    fn any_true_popup_open(&self) -> bool {
         self.palette.is_some()
             || self.colon_command.is_some()
+            || self.unified_finder.is_some()
+            || self.menu_bar.open.is_some()
             || self.find.is_some()
             || self.goto.is_some()
             || self.notifications_open
@@ -6294,9 +6996,7 @@ impl App {
             || self.pending_refactor_preview.is_some()
             || self.blame_popup.is_some()
             || self.git_gutter_popup_line.is_some()
-            // Gated on `active_screen`, not `git_panel.is_some()` -- see
-            // `handle_key`'s matching check above for why.
-            || self.active_screen == AppScreen::Git
+            || self.gutter_context_menu.is_some()
             || self.clone_panel_open
             || self.keymap_popup.is_some()
             || self.theme_popup.is_some()
@@ -6312,6 +7012,19 @@ impl App {
                 && (self.k8s.confirm.is_some()
                     || self.k8s.scale_input.is_some()
                     || self.k8s.picker.is_some()))
+            || self.agent.pending_approval.is_some()
+    }
+
+    /// Mirrors `handle_key`'s own popup-priority chain above (every branch
+    /// before the `keymap.action_for`/`self.focus` dispatch) -- kept as a
+    /// single source of truth so mouse routing (`docs/features/
+    /// tui-mouse-support.md` §3.2/§3.3) never drifts from which state
+    /// `handle_key` itself currently treats as "a popup is open". Every
+    /// caller except `handle_mouse_click` wants this exact value,
+    /// Git screen included -- see `any_true_popup_open`'s own doc comment
+    /// for the one caller that doesn't.
+    fn any_popup_open(&self) -> bool {
+        self.any_true_popup_open() || self.active_screen == AppScreen::Git
     }
 
     /// Entry point for every `Event::Mouse` (`docs/features/
@@ -6329,20 +7042,106 @@ impl App {
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.handle_mouse_click(event, hits),
+            MouseEventKind::Down(MouseButton::Right) => self.handle_mouse_right_click(event, hits),
             MouseEventKind::ScrollUp => self.handle_mouse_scroll(event, hits, KeyCode::Up),
             MouseEventKind::ScrollDown => self.handle_mouse_scroll(event, hits, KeyCode::Down),
             _ => {}
         }
     }
 
+    /// Every mouse click while the menu bar is open (`docs/features/
+    /// tui-menu-bar.md` §3.3, T54), checked in priority order: a flyout
+    /// row (topmost layer) first, then a dropdown row, then a different
+    /// bar label (switches menus without closing), and finally "anywhere
+    /// else" -- which closes the bar and does nothing further, the
+    /// standard "click outside dismisses the menu" convention, deliberately
+    /// not also performing the click's other effect.
+    fn handle_menu_bar_click(&mut self, point: (u16, u16), hits: &crate::ui::HitMap) {
+        let Some(open) = self.menu_bar.open else {
+            return;
+        };
+        if let Some(&(_, id_index)) = hits
+            .menu_submenu_items
+            .iter()
+            .find(|(rect, _)| rect.contains(point.into()))
+        {
+            let groups = menu_groups();
+            if let MenuEntry::Submenu(_, ids) = groups[open].entries[self.menu_bar.selected] {
+                if let Some(&id) = ids.get(id_index) {
+                    self.close_menu_bar();
+                    self.run_action_by_id(id);
+                    return;
+                }
+            }
+        }
+        if let Some(&(_, entry_index)) = hits
+            .menu_dropdown_items
+            .iter()
+            .find(|(rect, _)| rect.contains(point.into()))
+        {
+            self.menu_bar.selected = entry_index;
+            let groups = menu_groups();
+            match groups[open].entries[entry_index] {
+                MenuEntry::Item(id) => {
+                    self.close_menu_bar();
+                    self.run_action_by_id(id);
+                }
+                MenuEntry::Submenu(_, _) => {
+                    self.menu_bar.submenu_selected = Some(0);
+                }
+            }
+            return;
+        }
+        if let Some(&(_, group_index)) = hits
+            .menu_bar_labels
+            .iter()
+            .find(|(rect, _)| rect.contains(point.into()))
+        {
+            // `tui-menu-bar.md` §3.1/§3.3: clicking the *already-open*
+            // menu's own label closes it (toggle) -- a different bar
+            // label switches without closing.
+            if group_index == open {
+                self.close_menu_bar();
+            } else {
+                self.menu_bar.open = Some(group_index);
+                self.menu_bar.selected = 0;
+                self.menu_bar.submenu_selected = None;
+            }
+            return;
+        }
+        self.close_menu_bar();
+    }
+
     /// Position-based, independent of `self.focus` (§3.2). A popup owns
     /// all input while open, so a click doesn't reach the base view at
     /// all in that case, matching wheel scroll's own popup-priority rule.
     fn handle_mouse_click(&mut self, event: MouseEvent, hits: &crate::ui::HitMap) {
-        if self.any_popup_open() {
+        let point: (u16, u16) = (event.column, event.row);
+        // `docs/features/tui-menu-bar.md` §3.3, T54 -- checked before the
+        // generic `any_true_popup_open()` gate below (that gate itself now
+        // includes `menu_bar.open.is_some()`, so without this the menu bar
+        // would swallow every click on itself and never respond), mirroring
+        // the exact "check this specific state's own regions before the
+        // generic popup-blocking gate" pattern `tui-panel-pane-scroll.md`
+        // established for Git-screen scroll (T53).
+        if self.menu_bar.open.is_some() {
+            self.handle_menu_bar_click(point, hits);
             return;
         }
-        let point: (u16, u16) = (event.column, event.row);
+        if self.any_true_popup_open() {
+            return;
+        }
+        // Click-to-open on a menu-bar label (§3.1/§3.3) -- checked here,
+        // ahead of `screen_tabs`, so it works on every `AppScreen`
+        // including Git (`any_true_popup_open()` above deliberately
+        // excludes the Git screen, same as `screen_tabs`'s own click
+        // handling right below).
+        for &(rect, group_index) in &hits.menu_bar_labels {
+            if rect.contains(point.into()) {
+                self.open_menu_bar(group_index);
+                return;
+            }
+        }
         for &(rect, screen) in &hits.screen_tabs {
             if rect.contains(point.into()) {
                 match screen {
@@ -6353,6 +7152,12 @@ impl App {
                 }
                 return;
             }
+        }
+        // No click support inside the Git screen's own body yet (`docs/
+        // features/tui-panel-focus-and-scroll.md` §1/§2.3, T51) -- only
+        // its screen-tab bar, handled above, is clickable while here.
+        if self.active_screen == AppScreen::Git {
+            return;
         }
         for &(rect, tab) in &hits.left_dock_tabs {
             if rect.contains(point.into()) {
@@ -6366,12 +7171,57 @@ impl App {
                 return;
             }
         }
+        // `Top`/`Outline`-slot custom actions (`docs/features/
+        // tui-custom-actions-edge-slots.md` §3.1, T47) -- mouse-click-only,
+        // same shared dispatch every other slot's "run the thing" path uses.
+        for (rect, action) in &hits.top_action_hits {
+            if rect.contains(point.into()) {
+                self.run_custom_action(action.clone());
+                return;
+            }
+        }
+        for (rect, action) in &hits.outline_action_hits {
+            if rect.contains(point.into()) {
+                self.run_custom_action(action.clone());
+                return;
+            }
+        }
+        // `Ribbon`-slot custom actions and the ribbon's own `[+]`
+        // affordance (`docs/features/tui-key-hint-ribbon.md` §2.5, T48).
+        for (rect, action) in &hits.ribbon_action_hits {
+            if rect.contains(point.into()) {
+                self.run_custom_action(action.clone());
+                return;
+            }
+        }
+        if let Some(rect) = hits.ribbon_add_hit {
+            if rect.contains(point.into()) {
+                self.open_new_ribbon_action_form();
+                return;
+            }
+        }
         if let Some(area) = hits.tree_area {
             if area.contains(point.into()) {
                 let row = (event.row - area.y) as usize;
                 self.tree_state.select(&self.tree, row);
                 self.handle_tree_enter();
                 self.focus = Focus::LeftDock;
+                return;
+            }
+        }
+        // Click-to-focus for dock tabs with no click behaviour of their
+        // own (Todos/Actions; Files is handled above via `tree_area`,
+        // checked first so it still wins for that tab) -- `docs/features/
+        // tui-panel-focus-and-scroll.md` §2.3/§3.2, T51.
+        if let Some(area) = hits.left_dock_body {
+            if area.contains(point.into()) {
+                self.focus = Focus::LeftDock;
+                return;
+            }
+        }
+        if let Some(area) = hits.bottom_dock_body {
+            if area.contains(point.into()) {
+                self.focus = Focus::BottomDock;
                 return;
             }
         }
@@ -6387,11 +7237,14 @@ impl App {
                 let col = event.column - area.x;
                 let row = event.row - area.y;
                 let blame_w = self.blame_lane_width();
+                let git_w = self.git_gutter_lane_width();
                 let lane = self.editor_lane_width();
                 if (col as usize) < blame_w as usize {
                     self.click_blame_lane(row);
-                } else if (col as usize) < lane as usize {
+                } else if (col as usize) < (blame_w + git_w) as usize {
                     self.click_git_gutter_lane(row);
+                } else if (col as usize) < lane as usize {
+                    self.click_line_number_lane(row);
                 } else {
                     self.click_editor_at(col - lane, row);
                 }
@@ -6478,6 +7331,65 @@ impl App {
         direction: KeyCode,
     ) {
         let synthetic = KeyEvent::new(direction, KeyModifiers::NONE);
+        let point: (u16, u16) = (event.column, event.row);
+        // The full Git screen (`docs/features/tui-panel-pane-scroll.md`
+        // §3.1, T53): its Log/Changes views render up to three
+        // simultaneously-visible sub-panes, but `any_popup_open()` below
+        // folds `active_screen == AppScreen::Git` in unconditionally and
+        // would otherwise route every wheel event through a synthetic key
+        // keyed off `state.focus`/`state.changes_focus` -- moving whichever
+        // pane last had keyboard focus, not the one under the cursor. Try
+        // position-based dispatch first; a popup (branches/worktrees) is
+        // still routed through the generic path below, since those draw
+        // over this content and `handle_git_panel_key`'s priority chain
+        // already handles them correctly.
+        if self.active_screen == AppScreen::Git
+            && !self.git.branches_popup.open
+            && !self.git.worktrees_popup.open
+        {
+            if let Some(state) = self.git_panel.as_ref() {
+                match state.view {
+                    GitPanelView::Log => {
+                        if hits.git_diff_area.is_some_and(|r| r.contains(point.into())) {
+                            self.scroll_git_log_pane(GitPanelFocus::Diff, direction);
+                            return;
+                        }
+                        if hits
+                            .git_conflicts_area
+                            .is_some_and(|r| r.contains(point.into()))
+                        {
+                            self.scroll_git_log_pane(GitPanelFocus::Conflicts, direction);
+                            return;
+                        }
+                        if hits
+                            .git_graph_area
+                            .is_some_and(|r| r.contains(point.into()))
+                        {
+                            self.scroll_git_log_pane(GitPanelFocus::Graph, direction);
+                            return;
+                        }
+                    }
+                    GitPanelView::Changes => {
+                        if self.git.pending_discard.is_none() {
+                            if hits
+                                .git_staged_area
+                                .is_some_and(|r| r.contains(point.into()))
+                            {
+                                self.scroll_git_changes_pane(ChangesFocus::Staged, direction);
+                                return;
+                            }
+                            if hits
+                                .git_unstaged_area
+                                .is_some_and(|r| r.contains(point.into()))
+                            {
+                                self.scroll_git_changes_pane(ChangesFocus::Unstaged, direction);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if self.any_popup_open() {
             self.handle_key(synthetic);
             return;
@@ -6491,9 +7403,85 @@ impl App {
             self.handle_key(synthetic);
             return;
         }
-        let point: (u16, u16) = (event.column, event.row);
+        // Run screen (`docs/features/tui-panel-history-scroll.md` §2.6,
+        // T52): same reasoning as the Keys-screen branch above -- it
+        // renders no tree/editor/dock body, so the position-based
+        // branches below would drop the event. Only meaningful now that
+        // `handle_cargo_panel_key` has an `Up`/`Down` arm to receive it
+        // (T51 left this unrouted since, at the time, there was nothing
+        // for it to do).
+        if self.active_screen == AppScreen::Run {
+            self.handle_key(synthetic);
+            return;
+        }
         if hits.tree_area.is_some_and(|r| r.contains(point.into())) {
             self.handle_tree_key(synthetic);
+            return;
+        }
+        // Dock body content (`docs/features/tui-panel-focus-and-scroll.md`
+        // §2.4/§3.3, T51) -- routes straight into the dock's own key
+        // handler, which already fully delegates `Up`/`Down` to whichever
+        // tab is active, exactly like `tree_area` above does for
+        // `handle_tree_key`.
+        if hits
+            .left_dock_body
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            self.handle_left_dock_key(synthetic);
+            return;
+        }
+        // The bottom dock's Git Log tab reuses `render_git_log_view`
+        // verbatim, so it populates the same `git_diff_area`/`git_graph_
+        // area` fields checked above for the full Git screen -- but this
+        // point is only reachable when `active_screen != AppScreen::Git`
+        // (that case already returned above), so these can only be
+        // populated here by the dock tab, dispatched against `git_log_
+        // dock`'s own fields instead of `git_panel`'s (`tui-panel-pane-
+        // scroll.md` §3.2, T53). Checked before the generic `bottom_dock_
+        // body` below since they're a more specific sub-region of it.
+        // `Conflicts` is deliberately not handled here -- `GitLogDockState`
+        // has no `conflicts_selected` field for it to scroll.
+        if hits.git_diff_area.is_some_and(|r| r.contains(point.into())) {
+            self.git_log_dock.diff_scroll = match direction {
+                KeyCode::Up => self.git_log_dock.diff_scroll.saturating_sub(1),
+                _ => self.git_log_dock.diff_scroll.saturating_add(1),
+            };
+            return;
+        }
+        if hits
+            .git_graph_area
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            match direction {
+                KeyCode::Up => {
+                    self.git_log_dock.graph_selected =
+                        self.git_log_dock.graph_selected.saturating_sub(1);
+                }
+                _ => {
+                    if self.git_log_dock.graph_selected + 1 < self.git.graph.len() {
+                        self.git_log_dock.graph_selected += 1;
+                    }
+                }
+            }
+            return;
+        }
+        // The bottom dock's other two-pane tabs (Docker/Kubernetes/Custom
+        // Actions) -- one generic field for whichever tab's "secondary"
+        // (logs/output) pane is on screen (`tui-panel-pane-scroll.md`
+        // §3.2, T53), checked before `bottom_dock_body` for the same
+        // more-specific-first reason as `git_diff_area` above.
+        if hits
+            .dock_secondary_area
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            self.scroll_dock_secondary_pane(direction);
+            return;
+        }
+        if hits
+            .bottom_dock_body
+            .is_some_and(|r| r.contains(point.into()))
+        {
+            self.handle_bottom_dock_key(synthetic);
             return;
         }
         if hits
@@ -6501,6 +7489,116 @@ impl App {
             .is_some_and(|r| r.contains(point.into()))
         {
             self.scroll_editor_view(direction);
+        }
+    }
+
+    /// Wheel-scroll for the full Git screen's Log view, dispatched by
+    /// mouse position rather than `state.focus` (`docs/features/
+    /// tui-panel-pane-scroll.md` §3.1, T53) -- mutates only the targeted
+    /// pane's own field, never `state.focus` itself, matching the "wheel
+    /// scroll never changes focus" rule `tui-mouse-support.md` §3.3
+    /// established. Clamping mirrors `handle_git_log_key`'s existing
+    /// `Up`/`Down` arms exactly, just parameterized by `pane` instead of
+    /// reading `state.focus`.
+    fn scroll_git_log_pane(&mut self, pane: GitPanelFocus, direction: KeyCode) {
+        let graph_len = self.git.graph.len();
+        let conflicts_len = self.git.conflicts.len();
+        let Some(state) = self.git_panel.as_mut() else {
+            return;
+        };
+        match pane {
+            GitPanelFocus::Graph => match direction {
+                KeyCode::Up => state.graph_selected = state.graph_selected.saturating_sub(1),
+                _ => {
+                    if state.graph_selected + 1 < graph_len {
+                        state.graph_selected += 1;
+                    }
+                }
+            },
+            GitPanelFocus::Conflicts => match direction {
+                KeyCode::Up => {
+                    state.conflicts_selected = state.conflicts_selected.saturating_sub(1)
+                }
+                _ => {
+                    if state.conflicts_selected + 1 < conflicts_len {
+                        state.conflicts_selected += 1;
+                    }
+                }
+            },
+            GitPanelFocus::Diff => match direction {
+                KeyCode::Up => state.diff_scroll = state.diff_scroll.saturating_sub(1),
+                _ => state.diff_scroll = state.diff_scroll.saturating_add(1),
+            },
+            GitPanelFocus::Filter => {}
+        }
+    }
+
+    /// Mirrors `scroll_git_log_pane` for the Changes view's Staged/
+    /// Unstaged lists (`tui-panel-pane-scroll.md` §3.1, T53), clamping
+    /// exactly like `handle_git_changes_key`'s existing `Up`/`Down` arms.
+    fn scroll_git_changes_pane(&mut self, pane: ChangesFocus, direction: KeyCode) {
+        let staged_len = self.git.status.staged.len();
+        let unstaged_len = self.git.status.unstaged.len();
+        let Some(state) = self.git_panel.as_mut() else {
+            return;
+        };
+        match pane {
+            ChangesFocus::Staged => match direction {
+                KeyCode::Up => state.staged_selected = state.staged_selected.saturating_sub(1),
+                _ => {
+                    if state.staged_selected + 1 < staged_len {
+                        state.staged_selected += 1;
+                    }
+                }
+            },
+            ChangesFocus::Unstaged => match direction {
+                KeyCode::Up => state.unstaged_selected = state.unstaged_selected.saturating_sub(1),
+                _ => {
+                    if state.unstaged_selected + 1 < unstaged_len {
+                        state.unstaged_selected += 1;
+                    }
+                }
+            },
+            ChangesFocus::Message => {}
+        }
+    }
+
+    /// Wheel-scroll for the bottom dock's "secondary" pane -- Docker/
+    /// Kubernetes' logs column, Custom Actions' output row -- dispatched
+    /// by which tab is currently active (`tui-panel-pane-scroll.md` §3.2,
+    /// T53). A no-op for tabs with no secondary-pane scroll state
+    /// (`Ai`/`Cargo`/`Problems`/`GitLog` -- the latter two are handled
+    /// elsewhere: `Problems` has no scrollable secondary pane at all, and
+    /// `GitLog` is dispatched via `git_diff_area` in `handle_mouse_scroll`
+    /// directly, not through this generic field).
+    fn scroll_dock_secondary_pane(&mut self, direction: KeyCode) {
+        let Some(dock) = self.bottom_dock.as_ref() else {
+            return;
+        };
+        match dock.tab {
+            BottomDockTab::Docker => {
+                self.docker.logs_scroll = match direction {
+                    KeyCode::Up => self.docker.logs_scroll.saturating_sub(1),
+                    _ => self.docker.logs_scroll.saturating_add(1),
+                };
+            }
+            BottomDockTab::Kubernetes => {
+                self.k8s.output_scroll = match direction {
+                    KeyCode::Up => self.k8s.output_scroll.saturating_sub(1),
+                    _ => self.k8s.output_scroll.saturating_add(1),
+                };
+            }
+            BottomDockTab::CustomActions => {
+                self.custom_actions.output_scroll = match direction {
+                    KeyCode::Up => self.custom_actions.output_scroll.saturating_sub(1),
+                    _ => self.custom_actions.output_scroll.saturating_add(1),
+                };
+            }
+            BottomDockTab::Ai
+            | BottomDockTab::Agent
+            | BottomDockTab::Cargo
+            | BottomDockTab::Problems
+            | BottomDockTab::GitLog => {}
         }
     }
 
@@ -6689,6 +7787,8 @@ impl App {
             Action::ToggleClaudePanel => self.toggle_claude_panel(),
             Action::ToggleAiPanel => self.toggle_ai_panel(),
             Action::TriggerFimAutocomplete => self.trigger_fim_autocomplete(),
+            Action::ToggleAgentPanel => self.toggle_agent_panel(),
+            Action::CycleAgentMode => self.agent.cycle_mode(),
             Action::Debug => self.trigger_debug(),
             Action::ResumeProgram => self.debug.resume(),
             Action::StepOver => self.debug.step_over(),
@@ -6740,6 +7840,7 @@ impl App {
                     LeftDockTab::Todos => {
                         self.handle_todo_panel_key(key);
                     }
+                    LeftDockTab::Actions => self.handle_tree_actions_tab_key(key),
                 }
             }
         }
@@ -6762,6 +7863,9 @@ impl App {
                     }
                     BottomDockTab::Ai => {
                         self.handle_ai_panel_key(key);
+                    }
+                    BottomDockTab::Agent => {
+                        self.handle_agent_panel_key(key);
                     }
                     BottomDockTab::Kubernetes => {
                         self.handle_k8s_panel_key(key);
@@ -8095,6 +9199,157 @@ impl App {
         self.active_screen == AppScreen::Editor && self.focus == Focus::Editor
     }
 
+    /// `⇧⇧` entry point (`docs/features/tui-unified-finder.md` §2.4, T46).
+    fn toggle_unified_finder(&mut self) {
+        let opening = self.unified_finder.is_none();
+        self.close_all_overlays();
+        if opening {
+            self.unified_finder = Some(UnifiedFinderState::default());
+        }
+    }
+
+    /// Handles every key while `unified_finder.is_some()` (§3 of that
+    /// doc). Same shape as `handle_go_to_file_key`/`handle_colon_command_
+    /// key`.
+    fn handle_unified_finder_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(state) = self.unified_finder.as_mut() else {
+            return LoopSignal::Continue;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.unified_finder = None;
+                LoopSignal::Continue
+            }
+            KeyCode::Up => {
+                if state.selected > 0 {
+                    state.selected -= 1;
+                }
+                LoopSignal::Continue
+            }
+            KeyCode::Down => {
+                let len = self.unified_finder_rows().len();
+                let state = self.unified_finder.as_mut().unwrap();
+                if state.selected + 1 < len {
+                    state.selected += 1;
+                }
+                LoopSignal::Continue
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                state.selected = 0;
+                LoopSignal::Continue
+            }
+            KeyCode::Enter => self.confirm_unified_finder(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.query.push(c);
+                state.selected = 0;
+                LoopSignal::Continue
+            }
+            _ => LoopSignal::Continue,
+        }
+    }
+
+    /// Resolves the selected row and dispatches by variant (§2.4). Closes
+    /// the overlay unconditionally first -- matching `handle_palette_key`'s
+    /// own `Enter` arm shape, not `confirm_go_to_file`'s early-return-
+    /// without-closing one.
+    fn confirm_unified_finder(&mut self) -> LoopSignal {
+        let Some(state) = self.unified_finder.as_ref() else {
+            return LoopSignal::Continue;
+        };
+        let row = self.unified_finder_rows().get(state.selected).cloned();
+        self.unified_finder = None;
+        match row {
+            Some(FinderRow::File(m)) => {
+                if let Err(err) = self.open_or_focus_tab(m.path) {
+                    self.notify(err.to_string());
+                    return LoopSignal::Continue;
+                }
+                if let Some(buf) = self.active_buffer_mut() {
+                    buf.desired_column = None;
+                    buf.buffer
+                        .text_buffer_mut()
+                        .set_selections(Selections::single(Selection::caret(0)));
+                }
+                self.push_nav_location(0);
+                LoopSignal::Continue
+            }
+            Some(FinderRow::Symbol(symbol)) => {
+                self.open_location(symbol.location);
+                LoopSignal::Continue
+            }
+            Some(FinderRow::Command(cmd)) => self.run_action(cmd.action),
+            None => LoopSignal::Continue,
+        }
+    }
+
+    /// The unified finder's currently-merged, ranked rows (`docs/features/
+    /// tui-unified-finder.md` §3.2). An empty (trimmed) query is always
+    /// `vec![]` -- unlike `go_to_symbol_rows`, this never falls back to
+    /// `lsp.document_symbols` for an empty query: a merged list has no
+    /// single active file to key that fallback off, and mixing "the
+    /// current file's outline, unranked" with "nothing, because there's no
+    /// file/command query yet" would be a visibly inconsistent row set.
+    pub(crate) fn unified_finder_rows(&self) -> Vec<FinderRow> {
+        let query = self
+            .unified_finder
+            .as_ref()
+            .map(|s| s.query.trim())
+            .unwrap_or("");
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(i64, FinderRow)> = Vec::new();
+        if let Some(results) = &self.files_search.results {
+            for m in &results.matches {
+                scored.push((m.score, FinderRow::File(m.clone())));
+            }
+        }
+        for symbol in &self.lsp.workspace_symbols {
+            if let Some(m) = ide_core::fuzzy_score(query, &symbol.name) {
+                scored.push((m.score, FinderRow::Symbol(symbol.clone())));
+            }
+        }
+        for cmd in commands() {
+            if let Some(m) = ide_core::fuzzy_score(query, cmd.title) {
+                scored.push((m.score, FinderRow::Command(cmd)));
+            }
+        }
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored.into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// Called once per frame, right alongside `sync_go_to_file`/`sync_go_
+    /// to_symbol` (§3.1). No-op unless `unified_finder.is_some()`. Reuses
+    /// `self.files_search`/`self.lsp.workspace_symbols` -- the same fields
+    /// `GoToFile`/`GoToSymbol` themselves drive, safe because only one
+    /// overlay is ever open at a time (`close_all_overlays`).
+    pub(crate) fn sync_unified_finder(&mut self) {
+        let Some(state) = &self.unified_finder else {
+            return;
+        };
+        let query = state.query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        if !self.files_search.searching {
+            let ran_already =
+                self.unified_finder.as_ref().unwrap().ran_query.as_ref() == Some(&query);
+            if !ran_already {
+                self.files_search.run(self.tree.clone(), query.clone());
+                let state = self.unified_finder.as_mut().unwrap();
+                state.ran_query = Some(query.clone());
+                state.selected = 0;
+            }
+        }
+        let state = self.unified_finder.as_mut().unwrap();
+        if Some(&query) != state.last_workspace_query.as_ref() {
+            state.last_workspace_query = Some(query.clone());
+            state.selected = 0;
+            self.lsp.query_workspace_symbols(&query);
+        }
+    }
+
     /// `ToggleKeymapSettings` command (`docs/features/tui-keymap.md`
     /// §2.4/§2.5): opens/closes the Keymap popup, closing every other
     /// overlay first (same convention `toggle_todo_panel` etc. already
@@ -8109,6 +9364,32 @@ impl App {
                 capturing: None,
             });
         }
+    }
+
+    /// `App::key_hint_rows`'s curated, fixed set of existing `Command::id`s
+    /// (`docs/features/tui-key-hint-ribbon.md` §2.2, T48) -- never an
+    /// invented binding, only ever what the live keymap already reports
+    /// for a command that already exists in `commands()` (enforced by
+    /// `key_hint_command_ids_exist_with_a_default_binding`).
+    const HINT_COMMAND_IDS: [&'static str; 6] =
+        ["SaveAll", "Undo", "Redo", "Find", "GoToFile", "FindAction"];
+
+    /// `(title, current effective binding label)` for every `HINT_COMMAND_
+    /// IDS` entry that both exists in `commands()` and currently has an
+    /// effective binding -- the user may have unbound it via Keymap
+    /// Settings (`T22`), in which case the hint is simply omitted, never
+    /// rendered as a dash placeholder (unlike `render_keys_screen`'s
+    /// reference list, this is a *hint* row, not a reference; an unbound
+    /// hint has nothing useful to hint at).
+    pub(crate) fn key_hint_rows(&self) -> Vec<(&'static str, String)> {
+        Self::HINT_COMMAND_IDS
+            .iter()
+            .filter_map(|id| {
+                let cmd = commands().iter().find(|c| c.id == *id)?;
+                let binding = self.keymap.effective_binding(cmd.id)?;
+                Some((cmd.title, crate::keymap::label(binding)))
+            })
+            .collect()
     }
 
     /// Every `commands()` entry whose title, id, or effective-binding
@@ -8244,31 +9525,90 @@ impl App {
         }
     }
 
+    /// The ribbon's own `[+]` affordance (`docs/features/
+    /// tui-key-hint-ribbon.md` §2.3/§3.2): opens Manage Custom Actions
+    /// directly in add-form mode, `form_slot` pre-seeded to `Ribbon` --
+    /// skips list mode since there's nothing to review yet, mirroring how
+    /// the list-mode `n` key already jumps straight to the form.
+    fn open_new_ribbon_action_form(&mut self) {
+        self.close_all_overlays();
+        self.manage_actions_popup = Some(ManageActionsPopupState {
+            adding: true,
+            add_field: ActionFormField::Name,
+            form_slot: crate::custom_actions::ActionSlot::Ribbon,
+            ..Default::default()
+        });
+    }
+
     /// `ToggleCustomActionsPanel` command: switches the bottom dock to the
-    /// Custom Actions tab (`docs/features/tui-custom-actions.md` §3.1),
-    /// same shape `toggle_docker_panel`/`toggle_cargo_panel` already use.
+    /// Custom Actions tab, i.e. the `Bottom` slot (`docs/features/
+    /// tui-custom-actions-edge-slots.md` §2.4/§3.1), same shape
+    /// `toggle_docker_panel`/`toggle_cargo_panel` already use.
     fn toggle_custom_actions_panel(&mut self) {
         self.show_bottom_dock_tab(BottomDockTab::CustomActions);
     }
 
-    /// Custom Actions dock tab key handling (`docs/features/
-    /// tui-custom-actions.md` §3.1): `Up`/`Down` move the selection cursor
-    /// (clamped, mirrors `handle_docker_panel_key`'s list navigation);
-    /// `Enter` runs the selected action.
-    fn handle_custom_actions_panel_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => {
-                self.custom_actions.selected = self.custom_actions.selected.saturating_sub(1);
+    /// Resolves `Builtin`/`External` dispatch for one `CustomAction`
+    /// (`docs/features/tui-custom-actions-edge-slots.md` §2.4/§3.2) -- the
+    /// single call every slot's "run the thing" path (keyboard `Enter` and
+    /// mouse click alike) goes through. `Builtin` never reaches `Custom
+    /// ActionsPanel::run`, so it never spawns a subprocess.
+    pub(crate) fn run_custom_action(&mut self, action: crate::custom_actions::CustomAction) {
+        match action.kind {
+            crate::custom_actions::CustomActionKind::Builtin { command_id } => {
+                match commands().iter().find(|c| c.id == command_id) {
+                    Some(cmd) => {
+                        let action = cmd.action;
+                        self.run_action(action);
+                    }
+                    None => {
+                        self.notify(format!("No command with id \"{command_id}\"."));
+                    }
+                }
             }
-            KeyCode::Down => {
-                let len = self.custom_actions.actions.len();
-                self.custom_actions.selected =
-                    (self.custom_actions.selected + 1).min(len.saturating_sub(1));
-            }
-            KeyCode::Enter => {
+            crate::custom_actions::CustomActionKind::External { .. } => {
                 let root = self.project_root.clone();
-                self.custom_actions.run_selected(&root);
+                self.custom_actions.run(&root, action);
             }
+        }
+    }
+
+    /// Keyboard entry point for running `slot`'s currently-selected row
+    /// (`docs/features/tui-custom-actions-edge-slots.md` §2.4). No-op if
+    /// the slot is empty or the cursor is out of range -- both defensive,
+    /// not reachable through normal navigation, which already clamps.
+    fn run_custom_action_in_slot(&mut self, slot: crate::custom_actions::ActionSlot) {
+        let actions = self.custom_actions.actions_for_slot(slot);
+        let Some(action) = actions.into_iter().nth(self.custom_actions.selected(slot)) else {
+            return;
+        };
+        self.run_custom_action(action);
+    }
+
+    /// Custom Actions dock tab key handling -- the `Bottom` slot
+    /// (`docs/features/tui-custom-actions-edge-slots.md` §3.1): `Up`/`Down`
+    /// move that slot's own selection cursor (clamped, mirrors
+    /// `handle_docker_panel_key`'s list navigation); `Enter` runs the
+    /// selected action via the shared `run_custom_action` dispatch.
+    fn handle_custom_actions_panel_key(&mut self, key: KeyEvent) {
+        use crate::custom_actions::ActionSlot;
+        match key.code {
+            KeyCode::Up => self.custom_actions.move_selection(ActionSlot::Bottom, -1),
+            KeyCode::Down => self.custom_actions.move_selection(ActionSlot::Bottom, 1),
+            KeyCode::Enter => self.run_custom_action_in_slot(ActionSlot::Bottom),
+            _ => {}
+        }
+    }
+
+    /// `LeftDockTab::Actions` key handling -- the `Tree` slot
+    /// (`docs/features/tui-custom-actions-edge-slots.md` §3.1), identical
+    /// shape to `handle_custom_actions_panel_key`'s `Bottom` slot.
+    fn handle_tree_actions_tab_key(&mut self, key: KeyEvent) {
+        use crate::custom_actions::ActionSlot;
+        match key.code {
+            KeyCode::Up => self.custom_actions.move_selection(ActionSlot::Tree, -1),
+            KeyCode::Down => self.custom_actions.move_selection(ActionSlot::Tree, 1),
+            KeyCode::Enter => self.run_custom_action_in_slot(ActionSlot::Tree),
             _ => {}
         }
     }
@@ -8304,6 +9644,8 @@ impl App {
                 state.new_name.clear();
                 state.new_command.clear();
                 state.new_args.clear();
+                state.form_kind = FormKind::default();
+                state.form_slot = crate::custom_actions::ActionSlot::default();
             }
             KeyCode::Enter => {
                 let selected = state.selected;
@@ -8313,8 +9655,19 @@ impl App {
                     state.editing_index = Some(selected);
                     state.add_field = ActionFormField::Name;
                     state.new_name = action.name;
-                    state.new_command = action.command;
-                    state.new_args = action.args.join(" ");
+                    state.form_slot = action.slot;
+                    match action.kind {
+                        crate::custom_actions::CustomActionKind::External { command, args } => {
+                            state.form_kind = FormKind::External;
+                            state.new_command = command;
+                            state.new_args = args.join(" ");
+                        }
+                        crate::custom_actions::CustomActionKind::Builtin { command_id } => {
+                            state.form_kind = FormKind::Builtin;
+                            state.new_command = command_id;
+                            state.new_args.clear();
+                        }
+                    }
                 }
             }
             KeyCode::Char('d') => {
@@ -8333,10 +9686,13 @@ impl App {
     }
 
     /// Manage Custom Actions popup, add/edit form mode (`docs/features/
-    /// tui-custom-actions.md` §3.2). `Tab`/`BackTab` cycle the three
-    /// fields, `Backspace`/`Char` edit the focused one, `Esc` discards back
-    /// to list mode, `Enter` confirms. Mirrors
-    /// `handle_git_worktree_add_key`'s exact shape.
+    /// tui-custom-actions.md` §3.2, extended by `tui-custom-actions-edge-
+    /// slots.md` §2.3, T47). `Tab`/`BackTab` cycle the five fields;
+    /// `Backspace`/`Char` edit the focused text field and no-op on `Kind`/
+    /// `Slot`; `Space` on `Kind` toggles `form_kind`, on `Slot` cycles
+    /// `form_slot` (`ActionSlot::next()`); `Esc` discards back to list
+    /// mode; `Enter` confirms. Mirrors `handle_git_worktree_add_key`'s
+    /// exact shape.
     fn handle_action_form_key(&mut self, key: KeyEvent) -> LoopSignal {
         let Some(state) = self.manage_actions_popup.as_mut() else {
             return LoopSignal::Continue;
@@ -8352,21 +9708,33 @@ impl App {
             KeyCode::Tab => state.add_field = state.add_field.next(),
             KeyCode::BackTab => state.add_field = state.add_field.prev(),
             KeyCode::Enter => self.confirm_action_form(),
+            KeyCode::Char(' ') if state.add_field == ActionFormField::Kind => {
+                state.form_kind = state.form_kind.toggle();
+            }
+            KeyCode::Char(' ') if state.add_field == ActionFormField::Slot => {
+                state.form_slot = state.form_slot.next();
+            }
             KeyCode::Backspace => {
-                let field = match state.add_field {
-                    ActionFormField::Name => &mut state.new_name,
-                    ActionFormField::Command => &mut state.new_command,
-                    ActionFormField::Args => &mut state.new_args,
+                match state.add_field {
+                    ActionFormField::Name => {
+                        state.new_name.pop();
+                    }
+                    ActionFormField::Command => {
+                        state.new_command.pop();
+                    }
+                    ActionFormField::Args => {
+                        state.new_args.pop();
+                    }
+                    ActionFormField::Kind | ActionFormField::Slot => {}
                 };
-                field.pop();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let field = match state.add_field {
-                    ActionFormField::Name => &mut state.new_name,
-                    ActionFormField::Command => &mut state.new_command,
-                    ActionFormField::Args => &mut state.new_args,
+                match state.add_field {
+                    ActionFormField::Name => state.new_name.push(c),
+                    ActionFormField::Command => state.new_command.push(c),
+                    ActionFormField::Args => state.new_args.push(c),
+                    ActionFormField::Kind | ActionFormField::Slot => {}
                 };
-                field.push(c);
             }
             _ => {}
         }
@@ -8374,37 +9742,55 @@ impl App {
     }
 
     /// Validates and saves the Manage Custom Actions add/edit form
-    /// (`docs/features/tui-custom-actions.md` §3.2): trims `name`/
-    /// `command`, rejecting (via `notify`, form stays open) if either is
-    /// empty; splits `args` on whitespace. `editing_index: Some(i)`
-    /// overwrites `actions[i]` in place (guaranteed in-bounds -- see
-    /// `ManageActionsPopupState`'s own doc comment); `None` pushes a new
-    /// entry. Persists to `.ide/custom_actions.json` on success.
+    /// (`docs/features/tui-custom-actions.md` §3.2, extended by
+    /// `tui-custom-actions-edge-slots.md` §3.3): trims `name`, rejecting
+    /// (via `notify`, form stays open) if empty. `External`: trims
+    /// `command`, rejecting if empty, splits `args` on whitespace.
+    /// `Builtin`: trims `new_command` as the typed `Command::id`,
+    /// rejecting if empty or if no command in `commands()` has that
+    /// exact id. `editing_index: Some(i)` overwrites `actions[i]` in place
+    /// (guaranteed in-bounds -- see `ManageActionsPopupState`'s own doc
+    /// comment); `None` pushes a new entry. Persists to
+    /// `.ide/custom_actions.json` on success.
     fn confirm_action_form(&mut self) {
         let Some(state) = self.manage_actions_popup.as_ref() else {
             return;
         };
         let name = state.new_name.trim().to_string();
-        let command = state.new_command.trim().to_string();
         if name.is_empty() {
             self.notify("Custom action name cannot be empty.");
             return;
         }
-        if command.is_empty() {
-            self.notify("Custom action command cannot be empty.");
-            return;
-        }
-        let args: Vec<String> = state
-            .new_args
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
-        let editing_index = state.editing_index;
-        let action = crate::custom_actions::CustomAction {
-            name,
-            command,
-            args,
+        let slot = state.form_slot;
+        let kind = match state.form_kind {
+            FormKind::External => {
+                let command = state.new_command.trim().to_string();
+                if command.is_empty() {
+                    self.notify("Custom action command cannot be empty.");
+                    return;
+                }
+                let args: Vec<String> = state
+                    .new_args
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect();
+                crate::custom_actions::CustomActionKind::External { command, args }
+            }
+            FormKind::Builtin => {
+                let command_id = state.new_command.trim().to_string();
+                if command_id.is_empty() {
+                    self.notify("Custom action command cannot be empty.");
+                    return;
+                }
+                if !commands().iter().any(|c| c.id == command_id) {
+                    self.notify(format!("No command with id \"{command_id}\"."));
+                    return;
+                }
+                crate::custom_actions::CustomActionKind::Builtin { command_id }
+            }
         };
+        let editing_index = state.editing_index;
+        let action = crate::custom_actions::CustomAction { name, slot, kind };
         match editing_index {
             Some(idx) => self.custom_actions.actions[idx] = action,
             None => self.custom_actions.actions.push(action),
@@ -8986,6 +10372,7 @@ fn workspace_text_edits_to_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_panel::AgentPreparedRequest;
     use crate::ai_panel::{AiDisplayMessage, PreparedRequest};
     use crate::commands::binding_for;
     use crate::ui;
@@ -10031,6 +11418,333 @@ mod tests {
         assert!(!app.any_popup_open());
         app.open_colon_command();
         assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn shift_shift_opens_the_unified_finder_outside_text_editing_focus() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.unified_finder.is_none());
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        assert!(app.unified_finder.is_some());
+    }
+
+    #[test]
+    fn a_single_shift_tap_does_not_open_it() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn ctrl_shift_taps_never_count_toward_the_double_tap() {
+        // Regression for the bug this doc's own §3.3 records: gating on
+        // `contains(SHIFT)` instead of `== SHIFT` made two quick presses of
+        // any `Ctrl+Shift+X` chord (e.g. repeatedly cycling tabs with
+        // `Ctrl+Shift+]`) spuriously open the finder.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.handle_key(key(
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            KeyCode::Char(']'),
+        ));
+        app.handle_key(key(
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+            KeyCode::Char(']'),
+        ));
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn the_gesture_is_suppressed_while_text_editing_focused() {
+        let (_dir, mut app) = open_rust_tab("fn main() {}\n");
+        assert!(app.is_text_editing_focused());
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn the_gesture_does_not_fire_while_another_popup_is_already_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_colon_command();
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        app.handle_key(key(KeyModifiers::SHIFT, KeyCode::Down));
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn toggle_unified_finder_opens_with_a_reset_state_and_closes() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_unified_finder();
+        assert!(app.unified_finder.is_some());
+        app.unified_finder.as_mut().unwrap().query = "x".to_string();
+
+        app.toggle_unified_finder();
+        assert!(app.unified_finder.is_none());
+
+        app.toggle_unified_finder();
+        assert_eq!(app.unified_finder.as_ref().unwrap().query, "");
+    }
+
+    #[test]
+    fn close_all_overlays_closes_the_unified_finder() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.toggle_unified_finder();
+        assert!(app.unified_finder.is_some());
+        app.close_all_overlays();
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_unified_finder() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+        app.toggle_unified_finder();
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn unified_finder_rows_is_empty_for_an_empty_query() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.workspace_symbols = vec![symbol("Whatever", PathBuf::from("/other"))];
+        app.unified_finder = Some(UnifiedFinderState::default());
+        assert!(app.unified_finder_rows().is_empty());
+    }
+
+    #[test]
+    fn unified_finder_rows_merges_and_ranks_files_symbols_and_commands_by_score() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.files_search.results = Some(ide_core::FuzzyFileResults {
+            matches: vec![ide_core::FuzzyFileMatch {
+                path: a.clone(),
+                relative: "a.txt".to_string(),
+                score: 100,
+                indices: vec![0],
+            }],
+            truncated: false,
+        });
+        app.lsp.workspace_symbols = vec![symbol("save_all", a.clone())];
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "sa".to_string(),
+            ..Default::default()
+        });
+
+        let rows = app.unified_finder_rows();
+        assert!(!rows.is_empty());
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, FinderRow::File(m) if m.relative == "a.txt")));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, FinderRow::Symbol(s) if s.name == "save_all")));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, FinderRow::Command(c) if c.title == "Save")));
+        // The file match's seeded score (100) is far above any real
+        // `fuzzy_score` result for a 2-character pattern against "save_all"
+        // or "Save", so it must rank first -- one ranked list, not three
+        // sections concatenated in source order.
+        assert!(matches!(rows.first().unwrap(), FinderRow::File(_)));
+    }
+
+    #[test]
+    fn handle_unified_finder_key_up_down_clamp_against_the_row_count() {
+        // "al" also fuzzy-matches plenty of command titles as a subsequence
+        // (e.g. anything with an 'a' followed later by an 'l'), so this
+        // clamps against the actual observed row count rather than
+        // asserting the two seeded symbols are the only rows -- the point
+        // being tested is the clamp itself, not the merge's exact size.
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.workspace_symbols = vec![symbol("alpha", a.clone()), symbol("alsorun", a)];
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "al".to_string(),
+            ..Default::default()
+        });
+        let len = app.unified_finder_rows().len();
+        assert!(len >= 2);
+
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.unified_finder.as_ref().unwrap().selected, 0);
+
+        for _ in 0..len + 5 {
+            app.handle_key(plain_key(KeyCode::Down));
+        }
+        assert_eq!(app.unified_finder.as_ref().unwrap().selected, len - 1);
+    }
+
+    #[test]
+    fn handle_unified_finder_key_backspace_and_char_update_the_query() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState::default());
+        app.handle_key(plain_key(KeyCode::Char('a')));
+        app.handle_key(plain_key(KeyCode::Char('b')));
+        assert_eq!(app.unified_finder.as_ref().unwrap().query, "ab");
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.unified_finder.as_ref().unwrap().query, "a");
+    }
+
+    #[test]
+    fn confirm_unified_finder_with_no_rows_just_closes() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState::default());
+        app.confirm_unified_finder();
+        assert!(app.unified_finder.is_none());
+    }
+
+    #[test]
+    fn confirm_unified_finder_on_a_file_row_opens_it_at_offset_zero() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.files_search.results = Some(ide_core::FuzzyFileResults {
+            matches: vec![ide_core::FuzzyFileMatch {
+                path: a,
+                relative: "a.txt".to_string(),
+                score: 10,
+                indices: vec![],
+            }],
+            truncated: false,
+        });
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "a".to_string(),
+            ..Default::default()
+        });
+        // "a" also fuzzy-matches plenty of command titles -- select the
+        // seeded file row explicitly rather than assuming it ranks first.
+        let rows = app.unified_finder_rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, FinderRow::File(m) if m.relative == "a.txt"))
+            .unwrap();
+        app.unified_finder.as_mut().unwrap().selected = idx;
+
+        app.confirm_unified_finder();
+
+        assert!(app.unified_finder.is_none());
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(caret(&app), 0);
+    }
+
+    #[test]
+    fn confirm_unified_finder_on_a_symbol_row_jumps_to_its_location() {
+        let dir = sample_project();
+        let a = dir.path().canonicalize().unwrap().join("a.txt");
+        fs::write(&a, "one\ntwo\nthree\n").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.lsp.workspace_symbols = vec![Symbol {
+            name: "target".to_string(),
+            kind: ide_lsp::SymbolKind::Function,
+            container_name: None,
+            location: location(a, 1, 0),
+        }];
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "target".to_string(),
+            ..Default::default()
+        });
+        let rows = app.unified_finder_rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, FinderRow::Symbol(s) if s.name == "target"))
+            .unwrap();
+        app.unified_finder.as_mut().unwrap().selected = idx;
+
+        app.confirm_unified_finder();
+
+        assert!(app.unified_finder.is_none());
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn confirm_unified_finder_on_a_command_row_runs_its_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "gotofile".to_string(),
+            ..Default::default()
+        });
+        let rows = app.unified_finder_rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, FinderRow::Command(c) if c.id == "GoToFile"))
+            .expect("GoToFile command should fuzzy-match \"gotofile\"");
+        app.unified_finder.as_mut().unwrap().selected = idx;
+
+        app.confirm_unified_finder();
+
+        assert!(app.unified_finder.is_none());
+        assert!(app.go_to_file.is_some());
+    }
+
+    #[test]
+    fn confirm_unified_finder_propagates_exit_for_the_exit_command() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "Exit".to_string(),
+            ..Default::default()
+        });
+        let rows = app.unified_finder_rows();
+        let idx = rows
+            .iter()
+            .position(|r| matches!(r, FinderRow::Command(c) if c.id == "Exit"))
+            .expect("Exit command should fuzzy-match \"Exit\"");
+        app.unified_finder.as_mut().unwrap().selected = idx;
+
+        let signal = app.confirm_unified_finder();
+        assert_eq!(signal, LoopSignal::Exit);
+    }
+
+    #[test]
+    fn sync_unified_finder_triggers_the_shared_files_search_and_workspace_query() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState {
+            query: "a.txt".to_string(),
+            ..Default::default()
+        });
+
+        app.sync_unified_finder();
+
+        assert!(app.files_search.searching);
+        assert_eq!(
+            app.unified_finder.as_ref().unwrap().last_workspace_query,
+            Some("a.txt".to_string())
+        );
+
+        // A second call with the same, still-in-flight query must not
+        // start a second background search.
+        app.sync_unified_finder();
+
+        wait_until(|| {
+            app.poll_search();
+            !app.files_search.searching
+        });
+        let matches = &app.files_search.results.as_ref().unwrap().matches;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].relative, "a.txt");
+    }
+
+    #[test]
+    fn sync_unified_finder_is_a_noop_with_an_empty_query() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState::default());
+        app.sync_unified_finder();
+        assert!(!app.files_search.searching);
     }
 
     #[test]
@@ -11351,6 +13065,27 @@ mod tests {
                 "letter {letter:?} should start {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn handle_cargo_panel_key_up_down_page_scroll_the_output_and_never_panic_at_zero() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(
+            app.cargo.output_scroll, 0,
+            "scrolling toward the tail with nothing scrolled back is a no-op, not underflow"
+        );
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.cargo.output_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.cargo.output_scroll, 11);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.cargo.output_scroll, 1);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.cargo.output_scroll, 0);
     }
 
     #[test]
@@ -13912,6 +15647,13 @@ mod tests {
             )],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
@@ -14092,6 +15834,13 @@ mod tests {
             )],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -14121,6 +15870,13 @@ mod tests {
                 LeftDockTab::Todos,
             )],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -14153,6 +15909,13 @@ mod tests {
                 },
                 BottomDockTab::Cargo,
             )],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -14164,6 +15927,83 @@ mod tests {
             app.bottom_dock.as_ref().map(|d| d.tab),
             Some(BottomDockTab::Cargo)
         );
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_ribbon_action_runs_it() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let action = crate::custom_actions::CustomAction {
+            name: "Toggle notifications".to_string(),
+            slot: crate::custom_actions::ActionSlot::Ribbon,
+            kind: crate::custom_actions::CustomActionKind::Builtin {
+                command_id: "ToggleNotifications".to_string(),
+            },
+        };
+        app.custom_actions.actions.push(action.clone());
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![(
+                Rect {
+                    x: 0,
+                    y: 24,
+                    width: 20,
+                    height: 1,
+                },
+                action,
+            )],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
+        };
+        assert!(!app.notifications_open);
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 24),
+            &hits,
+        );
+        assert!(app.notifications_open);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_the_ribbon_add_affordance_opens_the_form_preseeded_to_ribbon() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: Some(Rect {
+                x: 70,
+                y: 24,
+                width: 3,
+                height: 1,
+            }),
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 71, 24),
+            &hits,
+        );
+        let state = app.manage_actions_popup.as_ref().unwrap();
+        assert!(state.adding);
+        assert_eq!(state.editing_index, None);
+        assert_eq!(state.form_slot, crate::custom_actions::ActionSlot::Ribbon);
     }
 
     #[test]
@@ -14186,6 +16026,13 @@ mod tests {
             )],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
 
         app.handle_mouse(
@@ -14195,6 +16042,422 @@ mod tests {
 
         assert_eq!(app.active_screen, AppScreen::Editor);
         assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn any_true_popup_open_excludes_the_git_screen_but_any_popup_open_includes_it() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+
+        assert!(
+            !app.any_true_popup_open(),
+            "the Git screen alone is not a genuine modal popup"
+        );
+        assert!(
+            app.any_popup_open(),
+            "any_popup_open must keep including the Git screen for every other caller"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_screen_tab_switches_away_from_the_git_screen() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                AppScreen::Editor,
+            )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Editor,
+            "clicking a screen tab must work even while already on the Git screen"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_screen_tab_while_on_the_git_screen_is_still_blocked_by_a_real_popup()
+    {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        app.open_palette();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                AppScreen::Editor,
+            )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Git,
+            "a genuine modal popup must still block screen-tab clicks, Git screen or not"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_inside_the_git_screen_body_past_the_tab_bar_is_a_noop() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        let hits = ui::HitMap {
+            tree_area: Some(Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 10,
+            }),
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                AppScreen::Editor,
+            )],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            &hits,
+        );
+
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Git,
+            "no click support inside the Git screen's own body yet -- stale tree_area from a\
+             previous frame must not be acted on"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_click_inside_the_left_dock_body_focuses_the_left_dock() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.left_dock.as_mut().unwrap().tab = LeftDockTab::Todos;
+        app.focus = Focus::Editor;
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: Some(Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 10,
+            }),
+            bottom_dock_body: None,
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 5),
+            &hits,
+        );
+
+        assert_eq!(app.focus, Focus::LeftDock);
+    }
+
+    #[test]
+    fn handle_mouse_click_inside_the_bottom_dock_body_focuses_the_bottom_dock() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleProblems);
+        app.focus = Focus::Editor;
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 22),
+            &hits,
+        );
+
+        assert_eq!(app.focus, Focus::BottomDock);
+    }
+
+    #[test]
+    fn handle_mouse_click_on_a_tree_row_wins_over_the_left_dock_body_for_the_files_tab() {
+        let (_dir, mut app) = two_file_project();
+        let rows = app.tree_state.visible_rows(&app.tree);
+        assert!(rows.len() >= 2);
+        let target_name = rows[1].path.file_name().unwrap().to_owned();
+        let area = Rect {
+            x: 0,
+            y: 1,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            tree_area: Some(area),
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: Some(area),
+            bottom_dock_body: None,
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
+            &hits,
+        );
+
+        assert_eq!(app.focus, Focus::LeftDock);
+        let selected = app
+            .tree_state
+            .selected_row(&rows)
+            .expect("a row must be selected");
+        assert_eq!(selected.path.file_name().unwrap(), target_name);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_left_dock_body_moves_the_todos_selection() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.left_dock.as_mut().unwrap().tab = LeftDockTab::Todos;
+        app.todo.results = Some(crate::todo_panel::TodoResults {
+            matches: vec![
+                crate::todo_panel::TodoMatch {
+                    pattern: "TODO",
+                    inner: ide_core::SearchMatch {
+                        path: PathBuf::from("a.txt"),
+                        line: 1,
+                        column: 0,
+                        byte_offset: 0,
+                        line_text: "// TODO one".to_string(),
+                    },
+                },
+                crate::todo_panel::TodoMatch {
+                    pattern: "TODO",
+                    inner: ide_core::SearchMatch {
+                        path: PathBuf::from("b.txt"),
+                        line: 2,
+                        column: 0,
+                        byte_offset: 0,
+                        line_text: "// TODO two".to_string(),
+                    },
+                },
+            ],
+            truncated: false,
+        });
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: Some(Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 10,
+            }),
+            bottom_dock_body: None,
+            ..Default::default()
+        };
+
+        assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.left_dock.as_ref().unwrap().todos_selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_bottom_dock_body_moves_the_docker_selection() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleDockerPanel);
+        app.docker.containers = vec![sample_container("a", "web"), sample_container("b", "db")];
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(app.docker.selected, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 22), &hits);
+        assert_eq!(app.docker.selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_bottom_dock_body_moves_cargo_output_scroll() {
+        // T51's dock-body routing plus T52's new `Up`/`Down` arm on
+        // `handle_cargo_panel_key` combine with no changes to either --
+        // `docs/features/tui-panel-history-scroll.md` §3.3.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::Cargo);
+        let hits = ui::HitMap {
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+            ..ui::HitMap::default()
+        };
+
+        assert_eq!(app.cargo.output_scroll, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 22), &hits);
+        assert_eq!(app.cargo.output_scroll, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_bottom_dock_body_moves_ai_history_scroll() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAiPanel);
+        let hits = ui::HitMap {
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+            ..ui::HitMap::default()
+        };
+
+        assert_eq!(app.ai.history_scroll, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 22), &hits);
+        assert_eq!(app.ai.history_scroll, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_bottom_dock_body_is_a_noop_when_no_dock_is_open() {
+        let (_dir, mut app) = two_file_project();
+        let hits = ui::HitMap {
+            tree_area: None,
+            editor_text_area: None,
+            tab_strip: vec![],
+            screen_tabs: vec![],
+            left_dock_tabs: vec![],
+            bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: Some(Rect {
+                x: 0,
+                y: 20,
+                width: 40,
+                height: 10,
+            }),
+            ..Default::default()
+        };
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 22), &hits);
     }
 
     #[test]
@@ -17407,13 +19670,23 @@ mod tests {
     }
 
     #[test]
-    fn action_form_field_next_and_prev_cycle_through_all_three_fields() {
-        assert_eq!(ActionFormField::Name.next(), ActionFormField::Command);
+    fn action_form_field_next_and_prev_cycle_through_all_five_fields() {
+        assert_eq!(ActionFormField::Name.next(), ActionFormField::Kind);
+        assert_eq!(ActionFormField::Kind.next(), ActionFormField::Command);
         assert_eq!(ActionFormField::Command.next(), ActionFormField::Args);
-        assert_eq!(ActionFormField::Args.next(), ActionFormField::Name);
-        assert_eq!(ActionFormField::Name.prev(), ActionFormField::Args);
-        assert_eq!(ActionFormField::Command.prev(), ActionFormField::Name);
+        assert_eq!(ActionFormField::Args.next(), ActionFormField::Slot);
+        assert_eq!(ActionFormField::Slot.next(), ActionFormField::Name);
+        assert_eq!(ActionFormField::Name.prev(), ActionFormField::Slot);
+        assert_eq!(ActionFormField::Kind.prev(), ActionFormField::Name);
+        assert_eq!(ActionFormField::Command.prev(), ActionFormField::Kind);
         assert_eq!(ActionFormField::Args.prev(), ActionFormField::Command);
+        assert_eq!(ActionFormField::Slot.prev(), ActionFormField::Args);
+    }
+
+    #[test]
+    fn form_kind_toggle_flips_between_external_and_builtin() {
+        assert_eq!(FormKind::External.toggle(), FormKind::Builtin);
+        assert_eq!(FormKind::Builtin.toggle(), FormKind::External);
     }
 
     #[test]
@@ -17456,19 +19729,26 @@ mod tests {
         app.handle_key(plain_key(KeyCode::Char('n')));
         assert!(app.manage_actions_popup.as_ref().unwrap().adding);
         type_str(&mut app, "Run tests");
-        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind (left External, default)
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Command
         type_str(&mut app, "cargo");
-        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Args
         type_str(&mut app, "test --workspace");
         app.handle_key(plain_key(KeyCode::Enter));
 
         assert!(!app.manage_actions_popup.as_ref().unwrap().adding);
         assert_eq!(app.custom_actions.actions.len(), 1);
         assert_eq!(app.custom_actions.actions[0].name, "Run tests");
-        assert_eq!(app.custom_actions.actions[0].command, "cargo");
         assert_eq!(
-            app.custom_actions.actions[0].args,
-            vec!["test".to_string(), "--workspace".to_string()]
+            app.custom_actions.actions[0].slot,
+            crate::custom_actions::ActionSlot::Bottom
+        );
+        assert_eq!(
+            app.custom_actions.actions[0].kind,
+            crate::custom_actions::CustomActionKind::External {
+                command: "cargo".to_string(),
+                args: vec!["test".to_string(), "--workspace".to_string()],
+            }
         );
 
         let reloaded = crate::custom_actions::load(dir.path());
@@ -17480,8 +19760,10 @@ mod tests {
         assert!(state.adding);
         assert_eq!(state.editing_index, Some(0));
         assert_eq!(state.new_name, "Run tests");
+        assert_eq!(state.form_kind, FormKind::External);
         assert_eq!(state.new_command, "cargo");
         assert_eq!(state.new_args, "test --workspace");
+        assert_eq!(state.form_slot, crate::custom_actions::ActionSlot::Bottom);
 
         // Overwrite the name, keep the rest, save.
         for _ in 0.."Run tests".len() {
@@ -17517,7 +19799,8 @@ mod tests {
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ManageCustomActions);
         app.handle_key(plain_key(KeyCode::Char('n')));
-        app.handle_key(plain_key(KeyCode::Tab));
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Command
         type_str(&mut app, "cargo");
         app.handle_key(plain_key(KeyCode::Enter));
 
@@ -17536,6 +19819,177 @@ mod tests {
 
         assert!(app.manage_actions_popup.as_ref().unwrap().adding);
         assert!(app.custom_actions.actions.is_empty());
+    }
+
+    #[test]
+    fn confirm_action_form_space_on_kind_field_is_a_noop_not_text() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().add_field,
+            ActionFormField::Kind
+        );
+        app.handle_key(plain_key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().form_kind,
+            FormKind::Builtin
+        );
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().form_kind,
+            FormKind::Builtin
+        );
+    }
+
+    #[test]
+    fn confirm_action_form_space_on_slot_field_cycles_form_slot() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        for _ in 0..4 {
+            app.handle_key(plain_key(KeyCode::Tab)); // Name->Kind->Command->Args->Slot
+        }
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().add_field,
+            ActionFormField::Slot
+        );
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().form_slot,
+            crate::custom_actions::ActionSlot::Bottom
+        );
+        app.handle_key(plain_key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.manage_actions_popup.as_ref().unwrap().form_slot,
+            crate::custom_actions::ActionSlot::Ribbon
+        );
+    }
+
+    #[test]
+    fn confirm_action_form_builtin_with_unknown_command_id_notifies_and_keeps_form_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        type_str(&mut app, "Bad binding");
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind
+        app.handle_key(plain_key(KeyCode::Char(' '))); // -> Builtin
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Command
+        type_str(&mut app, "NotARealCommandId");
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.manage_actions_popup.as_ref().unwrap().adding);
+        assert!(app.custom_actions.actions.is_empty());
+    }
+
+    #[test]
+    fn confirm_action_form_builtin_with_a_real_command_id_saves_and_runs_via_run_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ManageCustomActions);
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        type_str(&mut app, "Toggle notifications");
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Kind
+        app.handle_key(plain_key(KeyCode::Char(' '))); // -> Builtin
+        app.handle_key(plain_key(KeyCode::Tab)); // -> Command
+        type_str(&mut app, "ToggleNotifications");
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.custom_actions.actions.len(), 1);
+        assert_eq!(
+            app.custom_actions.actions[0].kind,
+            crate::custom_actions::CustomActionKind::Builtin {
+                command_id: "ToggleNotifications".to_string(),
+            }
+        );
+
+        let action = app.custom_actions.actions[0].clone();
+        let before = app.notifications_open;
+        app.run_custom_action(action);
+        assert_eq!(app.notifications_open, !before);
+        // Never touches the External-only subprocess state.
+        assert!(app.custom_actions.running.is_none());
+    }
+
+    #[test]
+    fn run_custom_action_on_a_removed_builtin_id_notifies_without_panicking() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let action = crate::custom_actions::CustomAction {
+            name: "Stale".to_string(),
+            slot: crate::custom_actions::ActionSlot::Bottom,
+            kind: crate::custom_actions::CustomActionKind::Builtin {
+                command_id: "NoLongerRegistered".to_string(),
+            },
+        };
+        app.run_custom_action(action);
+        assert!(app.custom_actions.running.is_none());
+    }
+
+    #[test]
+    fn run_custom_action_in_slot_is_a_noop_when_the_slot_is_empty() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_custom_action_in_slot(crate::custom_actions::ActionSlot::Tree);
+        assert!(app.custom_actions.running.is_none());
+    }
+
+    #[test]
+    fn key_hint_command_ids_exist_with_a_default_binding() {
+        for id in App::HINT_COMMAND_IDS {
+            let cmd = commands()
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("HINT_COMMAND_IDS references unknown id {id}"));
+            assert!(
+                cmd.binding.is_some(),
+                "hint command {id} has no default binding"
+            );
+        }
+    }
+
+    #[test]
+    fn key_hint_rows_reports_title_and_current_binding_for_every_hint() {
+        let dir = sample_project();
+        let app = App::new(dir.path().to_path_buf()).unwrap();
+        let rows = app.key_hint_rows();
+        assert_eq!(rows.len(), App::HINT_COMMAND_IDS.len());
+        let (title, binding) = rows
+            .iter()
+            .find(|(title, _)| *title == "Save")
+            .expect("Save hint present");
+        assert_eq!(*title, "Save");
+        assert_eq!(binding, "Ctrl+s");
+    }
+
+    #[test]
+    fn key_hint_rows_omits_a_hint_the_user_has_explicitly_unbound() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap.set_override("SaveAll", None);
+        let rows = app.key_hint_rows();
+        assert!(!rows.iter().any(|(title, _)| *title == "Save"));
+        assert_eq!(rows.len(), App::HINT_COMMAND_IDS.len() - 1);
+    }
+
+    #[test]
+    fn open_new_ribbon_action_form_opens_the_form_preseeded_to_ribbon_and_closes_other_overlays() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_colon_command();
+        assert!(app.colon_command.is_some());
+
+        app.open_new_ribbon_action_form();
+
+        assert!(app.colon_command.is_none());
+        let state = app.manage_actions_popup.as_ref().unwrap();
+        assert!(state.adding);
+        assert_eq!(state.editing_index, None);
+        assert_eq!(state.form_slot, crate::custom_actions::ActionSlot::Ribbon);
+        assert_eq!(state.form_kind, FormKind::External);
     }
 
     #[test]
@@ -17992,6 +20446,24 @@ mod tests {
     }
 
     #[test]
+    fn ai_panel_up_down_page_scroll_the_history_and_never_panic_at_zero() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAiPanel);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.ai.history_scroll, 0);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.ai.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.ai.history_scroll, 11);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.ai.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.ai.history_scroll, 0);
+    }
+
+    #[test]
     fn ai_panel_typing_edits_input_and_enter_submits() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
@@ -18066,6 +20538,254 @@ mod tests {
 
         assert!(!app.ai.is_in_flight(), "Esc must cancel a wedged request");
         assert!(!app.ai_panel_open);
+    }
+
+    fn agent_noop(_prepared: AgentPreparedRequest) {}
+
+    #[test]
+    fn toggle_agent_panel_opens_and_closes_the_dock_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.agent_panel_open);
+
+        app.run_action(Action::ToggleAgentPanel);
+        assert!(app.agent_panel_open);
+        assert_eq!(app.bottom_dock.as_ref().unwrap().tab, BottomDockTab::Agent);
+        assert_eq!(app.focus, Focus::BottomDock);
+
+        app.run_action(Action::ToggleAgentPanel);
+        assert!(!app.agent_panel_open);
+        assert!(app.bottom_dock.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn agent_panel_esc_closes_the_dock_from_any_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAgentPanel);
+        assert!(app.agent_panel_open);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.agent_panel_open);
+        assert!(app.bottom_dock.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn agent_panel_up_down_page_scroll_the_history_and_never_panic_at_zero() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAgentPanel);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.agent.history_scroll, 0);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.agent.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.agent.history_scroll, 11);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.agent.history_scroll, 1);
+    }
+
+    #[test]
+    fn agent_panel_typing_edits_input_and_enter_submits() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent = AgentPanel::with_runner(dir.path().to_path_buf(), agent_noop);
+        app.run_action(Action::ToggleAgentPanel);
+
+        for c in "read a.txt".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.agent.input, "read a.tx");
+
+        app.handle_key(plain_key(KeyCode::Char('t')));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.agent.input, "", "input clears after submit");
+        assert!(app.agent.is_in_flight());
+        assert_eq!(app.agent.history.len(), 1);
+    }
+
+    #[test]
+    fn agent_panel_enter_while_in_flight_is_rejected() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent = AgentPanel::with_runner(dir.path().to_path_buf(), agent_noop);
+        app.run_action(Action::ToggleAgentPanel);
+
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(app.agent.is_in_flight());
+
+        app.handle_key(plain_key(KeyCode::Char('y')));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.agent.history.len(), 1, "second submit is refused");
+        assert!(app
+            .notifications
+            .last()
+            .unwrap()
+            .message
+            .contains("one agent request at a time"));
+    }
+
+    #[test]
+    fn agent_panel_esc_while_in_flight_cancels_before_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent = AgentPanel::with_runner(dir.path().to_path_buf(), agent_noop);
+        app.run_action(Action::ToggleAgentPanel);
+
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(app.agent.is_in_flight());
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(
+            !app.agent.is_in_flight(),
+            "Esc must cancel a wedged request"
+        );
+        assert!(!app.agent_panel_open);
+    }
+
+    #[test]
+    fn cycle_agent_mode_action_cycles_plan_approve_auto() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Plan);
+
+        app.run_action(Action::CycleAgentMode);
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Approve);
+
+        app.run_action(Action::CycleAgentMode);
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Auto);
+    }
+
+    #[test]
+    fn handle_agent_approval_key_y_approves_and_n_denies() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        assert!(app.agent.pending_approval.is_none());
+
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+        app.handle_key(plain_key(KeyCode::Char('y')));
+        assert!(app.agent.pending_approval.is_none());
+    }
+
+    #[test]
+    fn close_all_overlays_denies_a_pending_approval() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+
+        app.close_all_overlays();
+
+        assert!(app.agent.pending_approval.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_includes_a_pending_agent_approval() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+        assert!(app.any_popup_open());
+    }
+
+    /// Regression for `rev` fix round 1 (`docs/features/tui-local-agent.md`
+    /// §2.2): a pending approval must win keyboard priority over *every*
+    /// other overlay, including the menu bar -- otherwise the popup (drawn
+    /// on top of everything, `ui::render`) is visible but unreachable,
+    /// since `menu_bar.open` used to be checked first in `handle_key`.
+    #[test]
+    fn pending_approval_intercepts_keys_even_with_the_menu_bar_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        assert!(app.menu_bar.open.is_some());
+
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+
+        app.handle_key(plain_key(KeyCode::Char('y')));
+
+        assert!(
+            app.agent.pending_approval.is_none(),
+            "the approval key must reach handle_agent_approval_key, not the still-open menu bar"
+        );
+        assert!(
+            app.menu_bar.open.is_some(),
+            "handling the approval key must not itself touch the menu bar's own state"
+        );
+    }
+
+    #[test]
+    fn run_debug_action_for_agent_toggle_breakpoint_works_with_no_session() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.debug.is_active());
+
+        let result = app.run_debug_action_for_agent(ide_agent::DebugAction::ToggleBreakpoint {
+            path: "a.rs".into(),
+            line: 3,
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            app.debug.breakpoints.get(&PathBuf::from("a.rs")),
+            Some(&vec![3])
+        );
+    }
+
+    #[test]
+    fn run_debug_action_for_agent_other_actions_require_an_active_session() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.debug.is_active());
+
+        let result = app.run_debug_action_for_agent(ide_agent::DebugAction::Resume);
+
+        assert_eq!(result, Err(ide_agent::ToolError::NoDebugSession));
+    }
+
+    #[test]
+    fn poll_agent_dispatches_awaiting_debug_execution_to_the_real_debug_panel() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let tx = app.agent.test_arm_event_channel();
+        tx.send(ide_agent::AgentEvent::AwaitingDebugExecution {
+            action: ide_agent::DebugAction::ToggleBreakpoint {
+                path: "a.rs".into(),
+                line: 7,
+            },
+        })
+        .unwrap();
+
+        app.poll_agent();
+
+        assert_eq!(
+            app.debug.breakpoints.get(&PathBuf::from("a.rs")),
+            Some(&vec![7]),
+            "poll_agent must run the action against the real DebugPanel, not a stub"
+        );
     }
 
     #[test]
@@ -18177,6 +20897,24 @@ mod tests {
 
         app.handle_key(plain_key(KeyCode::Backspace));
         assert_eq!(app.claude.input, "h");
+    }
+
+    #[test]
+    fn claude_chat_up_down_page_scroll_the_history_and_never_panic_at_zero() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleClaudePanel);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.claude.history_scroll, 0);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.claude.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.claude.history_scroll, 11);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.claude.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.claude.history_scroll, 0);
     }
 
     #[test]
@@ -18874,7 +21612,7 @@ mod tests {
     // -- T33: TUI Tool Window Docking (`tui-tool-window-docking.md`) --
 
     #[test]
-    fn handle_left_dock_key_tab_and_backtab_cycle_files_and_todos() {
+    fn handle_left_dock_key_tab_and_backtab_cycle_files_todos_and_actions() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         // `left_dock` starts open on `Files`, focused, by default.
@@ -18884,14 +21622,17 @@ mod tests {
         assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Todos);
 
         app.handle_key(plain_key(KeyCode::Tab));
+        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Actions);
+
+        app.handle_key(plain_key(KeyCode::Tab));
         assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Files);
 
         app.handle_key(plain_key(KeyCode::BackTab));
-        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Todos);
+        assert_eq!(app.left_dock.as_ref().unwrap().tab, LeftDockTab::Actions);
     }
 
     #[test]
-    fn handle_bottom_dock_key_tab_cycles_through_all_seven_tabs_and_back() {
+    fn handle_bottom_dock_key_tab_cycles_through_all_eight_tabs_and_back() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
@@ -18899,6 +21640,7 @@ mod tests {
 
         let forward = [
             BottomDockTab::Ai,
+            BottomDockTab::Agent,
             BottomDockTab::Kubernetes,
             BottomDockTab::Cargo,
             BottomDockTab::CustomActions,
@@ -19162,7 +21904,11 @@ mod tests {
             .len();
         set_caret(&mut app, end);
 
-        let backend = ratatui::backend::TestBackend::new(80, 10);
+        // 11 rows, not 10 -- `EDITOR_CHROME_ROWS` (T54's new persistent
+        // menu bar row) consumes one more of the fixed terminal height
+        // than this test's original 10-row fixture accounted for; bumped
+        // by exactly one to restore the same body-row budget.
+        let backend = ratatui::backend::TestBackend::new(80, 11);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|f| crate::ui::render(f, &app, &mut crate::ui::HitMap::default()))
@@ -19198,7 +21944,10 @@ mod tests {
         app.open_or_focus_tab(dir.path().join("f.go")).unwrap();
         app.focus = Focus::Editor;
 
-        let backend = ratatui::backend::TestBackend::new(80, 10);
+        // See `cursor_lands_after_a_wide_cjk_character_not_mid_glyph`'s own
+        // comment: 11 rows, not 10, to keep the same body-row budget after
+        // T54's new persistent menu bar row.
+        let backend = ratatui::backend::TestBackend::new(80, 11);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|f| crate::ui::render(f, &app, &mut crate::ui::HitMap::default()))
@@ -19260,6 +22009,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -19304,6 +22060,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
@@ -19328,9 +22091,20 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
+        // Column 2 into the text, past the line-number lane (T50) -- no
+        // blame/git-gutter lane here, so `editor_lane_width()` is exactly
+        // `line_number_lane_width()`.
+        let lane = app.editor_lane_width();
         app.handle_mouse(
-            mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
+            mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
             &hits,
         );
         assert_eq!(app.focus, Focus::Editor);
@@ -19356,6 +22130,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         // Column 15 is well within the 20-wide hit-test area but past
         // "ab"'s own 2 characters -- must clamp to line end, not no-op.
@@ -19386,6 +22167,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 5),
@@ -19409,6 +22197,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 2),
@@ -19433,6 +22228,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert!(app.active_buffer().is_none());
@@ -19454,6 +22256,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -19656,6 +22465,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
@@ -19681,6 +22497,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 4),
@@ -19697,7 +22520,10 @@ mod tests {
             blame_annotation(0, 1, "aaaaaaa"),
             blame_annotation(1, 1, "bbbbbbb"),
         ]);
-        let lane = app.blame_lane_width();
+        // Full `editor_lane_width()`, not just `blame_lane_width()` --
+        // the line-number lane (T50, no repo here so `git_gutter_lane_
+        // width()` is 0) also sits between the blame lane and the text.
+        let lane = app.editor_lane_width();
         let hits = ui::HitMap {
             tree_area: None,
             editor_text_area: Some(Rect {
@@ -19710,6 +22536,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane + 2, 1),
@@ -19819,17 +22652,247 @@ mod tests {
     }
 
     #[test]
-    fn editor_lane_width_sums_blame_and_gutter_lanes() {
+    fn editor_lane_width_sums_blame_gutter_and_line_number_lanes() {
         let dir = git_repo_without_commits();
         git_commit(dir.path(), "f.txt", "a\nb\nc\n", "init");
         let mut app = open_committed_tab(dir.path(), "f.txt");
-        assert_eq!(app.editor_lane_width(), app.git_gutter_lane_width());
+        assert_eq!(
+            app.editor_lane_width(),
+            app.git_gutter_lane_width() + app.line_number_lane_width()
+        );
         app.toggle_blame_annotations();
         assert_eq!(
             app.editor_lane_width(),
-            app.blame_lane_width() + app.git_gutter_lane_width()
+            app.blame_lane_width() + app.git_gutter_lane_width() + app.line_number_lane_width()
         );
         assert!(app.editor_lane_width() > app.git_gutter_lane_width());
+    }
+
+    #[test]
+    fn line_number_lane_width_is_zero_with_no_active_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.line_number_lane_width(), 0);
+    }
+
+    #[test]
+    fn line_number_lane_width_grows_at_the_digit_count_boundary() {
+        let (_dir, app) = open_rust_tab("a\nb\n");
+        assert_eq!(app.line_number_lane_width(), 2);
+
+        let (_dir2, app2) = open_rust_tab(&"x\n".repeat(10));
+        assert_eq!(app2.line_number_lane_width(), 3);
+    }
+
+    #[test]
+    fn click_line_number_lane_toggles_a_breakpoint_on_the_clicked_line() {
+        let (_dir, mut app) = open_rust_tab("fn main() {\n    let x = 1;\n}\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.click_line_number_lane(1);
+        assert_eq!(app.debug.breakpoints.get(&path), Some(&vec![2]));
+    }
+
+    #[test]
+    fn click_line_number_lane_past_the_buffer_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("a\nb\n");
+        app.click_line_number_lane(50);
+        assert!(app.debug.breakpoints.is_empty());
+    }
+
+    #[test]
+    fn handle_mouse_click_on_the_line_number_lane_toggles_breakpoint_not_caret() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        let hits = ui::HitMap {
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            ..Default::default()
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
+            &hits,
+        );
+        assert_eq!(app.debug.breakpoints.get(&path), Some(&vec![2]));
+        let (line, column) = cursor_line_column(
+            app.active_buffer().unwrap().buffer.text_buffer(),
+            caret(&app),
+        );
+        assert_eq!(
+            (line, column),
+            (0, 0),
+            "the caret must not move into the gutter"
+        );
+    }
+
+    #[test]
+    fn handle_mouse_right_click_on_the_line_number_lane_opens_the_context_menu() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        let hits = ui::HitMap {
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            ..Default::default()
+        };
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Right), 0, 1),
+            &hits,
+        );
+        let state = app
+            .gutter_context_menu
+            .as_ref()
+            .expect("right-click on the line-number lane should open the menu");
+        assert_eq!(state.path, path);
+        assert_eq!(state.line, 1);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn handle_mouse_right_click_past_the_line_number_lane_is_a_noop() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let hits = ui::HitMap {
+            editor_text_area: Some(Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 5,
+            }),
+            ..Default::default()
+        };
+        let lane = app.line_number_lane_width();
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Right), lane + 3, 1),
+            &hits,
+        );
+        assert!(app.gutter_context_menu.is_none());
+    }
+
+    #[test]
+    fn handle_gutter_context_menu_key_up_down_clamp_and_esc_closes() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 0,
+        });
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.gutter_context_menu.as_ref().unwrap().selected, 0);
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.gutter_context_menu.as_ref().unwrap().selected, 3);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(
+            app.gutter_context_menu.as_ref().unwrap().selected,
+            3,
+            "must clamp at the last item"
+        );
+        app.handle_key(plain_key(KeyCode::Esc));
+        assert!(app.gutter_context_menu.is_none());
+    }
+
+    #[test]
+    fn handle_key_routes_to_the_gutter_context_menu_before_anything_else() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        let text_before = active_text(&app);
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 0,
+        });
+        app.handle_key(plain_key(KeyCode::Char('z')));
+        assert!(
+            app.gutter_context_menu.is_some(),
+            "an unrecognized key must not close the menu"
+        );
+        assert_eq!(
+            active_text(&app),
+            text_before,
+            "the key must not fall through to editor input"
+        );
+    }
+
+    #[test]
+    fn confirm_gutter_context_menu_breakpoint_toggles_the_clicked_line() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path: path.clone(),
+            line: 1,
+            selected: 0,
+        });
+        app.confirm_gutter_context_menu();
+        assert!(app.gutter_context_menu.is_none());
+        assert_eq!(app.debug.breakpoints.get(&path), Some(&vec![2]));
+    }
+
+    #[test]
+    fn confirm_gutter_context_menu_bookmark_toggles_the_clicked_line() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path: path.clone(),
+            line: 1,
+            selected: 1,
+        });
+        app.confirm_gutter_context_menu();
+        assert!(app.gutter_context_menu.is_none());
+        assert!(app
+            .nav_state
+            .bookmarks
+            .iter()
+            .any(|b| b.path == path && b.line == 1));
+    }
+
+    #[test]
+    fn confirm_gutter_context_menu_show_bookmarks_opens_the_bookmarks_popup() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 2,
+        });
+        app.confirm_gutter_context_menu();
+        assert!(app.gutter_context_menu.is_none());
+        assert!(app.bookmarks_popup.is_some());
+    }
+
+    #[test]
+    fn confirm_gutter_context_menu_blame_toggles_annotations_for_the_active_tab() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        assert!(app.active_buffer().unwrap().blame.is_none());
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 3,
+        });
+        app.confirm_gutter_context_menu();
+        assert!(app.gutter_context_menu.is_none());
+        assert!(app.active_buffer().unwrap().blame.is_some());
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_gutter_context_menu() {
+        let (_dir, mut app) = open_rust_tab("abc\ndef\n");
+        let path = app.active_buffer().unwrap().path.clone();
+        assert!(!app.any_popup_open());
+        app.gutter_context_menu = Some(GutterContextMenuState {
+            path,
+            line: 0,
+            selected: 0,
+        });
+        assert!(app.any_popup_open());
     }
 
     #[test]
@@ -19852,6 +22915,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 1),
@@ -19880,6 +22950,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
@@ -19909,6 +22986,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), lane, 1),
@@ -20094,6 +23178,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(
             mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 1),
@@ -20139,6 +23230,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
 
@@ -20165,6 +23263,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 2, 2), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 1);
@@ -20189,9 +23294,241 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 1, 1), &hits);
         assert_eq!(app.active_buffer().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_diff_pane_moves_diff_scroll_regardless_of_focus() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "b.txt", "more", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().focus,
+            GitPanelFocus::Graph,
+            "default focus is Graph"
+        );
+        let rect = Rect {
+            x: 10,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_diff_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 15, 5), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().diff_scroll, 1);
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().focus,
+            GitPanelFocus::Graph,
+            "wheel scroll must never change focus"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_graph_pane_moves_graph_selected_regardless_of_focus() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "b.txt", "more", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        assert_eq!(app.git.graph.len(), 2);
+        app.git_panel.as_mut().unwrap().focus = GitPanelFocus::Diff;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_graph_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().graph_selected, 1);
+        assert_eq!(app.git_panel.as_ref().unwrap().focus, GitPanelFocus::Diff);
+
+        // Clamped at the last row.
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().graph_selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_conflicts_pane_moves_conflicts_selected() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        app.git.conflicts = vec![
+            std::path::PathBuf::from("a.txt"),
+            std::path::PathBuf::from("b.txt"),
+        ];
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 5,
+        };
+        let hits = ui::HitMap {
+            git_conflicts_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 2), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().conflicts_selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_changes_staged_and_unstaged_panes_are_independent() {
+        let dir = sample_git_project();
+        fs::write(dir.path().join("a.txt"), "hello\nworld2").unwrap();
+        fs::write(dir.path().join("b.txt"), "new").unwrap();
+        fs::write(dir.path().join("c.txt"), "new2").unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.git.sync_status();
+        app.git.stage(std::path::Path::new("c.txt")).unwrap();
+        app.git.sync_status();
+        assert_eq!(app.git.status.unstaged.len(), 2);
+        assert_eq!(app.git.status.staged.len(), 1);
+
+        app.go_to_git_screen();
+        app.git_panel.as_mut().unwrap().view = GitPanelView::Changes;
+
+        let staged_rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 5,
+        };
+        let unstaged_rect = Rect {
+            x: 0,
+            y: 10,
+            width: 20,
+            height: 5,
+        };
+        let hits = ui::HitMap {
+            git_staged_area: Some(staged_rect),
+            git_unstaged_area: Some(unstaged_rect),
+            ..Default::default()
+        };
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 11), &hits);
+        assert_eq!(app.git_panel.as_ref().unwrap().unstaged_selected, 1);
+        assert_eq!(app.git_panel.as_ref().unwrap().staged_selected, 0);
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 1), &hits);
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().staged_selected,
+            0,
+            "staged has only one entry, so this is clamped, not moved"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_screen_falls_back_to_focus_based_scroll_while_a_popup_is_open() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        app.git.branches_popup.open = true;
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_diff_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(
+            app.git_panel.as_ref().unwrap().diff_scroll,
+            0,
+            "a real popup must still take priority over position-based dispatch"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_log_dock_diff_pane_moves_git_log_dock_diff_scroll() {
+        let dir = sample_git_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::GitLog);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_diff_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.git_log_dock.diff_scroll, 1);
+        assert!(
+            app.git_panel.is_none(),
+            "the full Git screen's own state must be untouched"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_over_git_log_dock_graph_pane_moves_git_log_dock_graph_selected() {
+        let dir = sample_git_project();
+        git_commit(dir.path(), "b.txt", "more", "second");
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.show_bottom_dock_tab(BottomDockTab::GitLog);
+        assert_eq!(app.git.graph.len(), 2);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            git_graph_area: Some(rect),
+            ..Default::default()
+        };
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.git_log_dock.graph_selected, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_dock_secondary_pane_dispatches_by_active_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+        let hits = ui::HitMap {
+            dock_secondary_area: Some(rect),
+            ..Default::default()
+        };
+
+        app.show_bottom_dock_tab(BottomDockTab::Docker);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.docker.logs_scroll, 1);
+
+        app.show_bottom_dock_tab(BottomDockTab::Kubernetes);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.k8s.output_scroll, 1);
+
+        app.show_bottom_dock_tab(BottomDockTab::CustomActions);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.custom_actions.output_scroll, 1);
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.custom_actions.output_scroll, 0);
     }
 
     #[test]
@@ -20214,6 +23551,39 @@ mod tests {
     }
 
     #[test]
+    fn wheel_scroll_while_the_claude_panel_is_open_moves_history_scroll() {
+        // Pre-existing `any_popup_open()` -> synthetic-key routing
+        // (`tui-mouse-support.md` §3.3) plus T52's new `Up`/`Down` arm on
+        // `handle_claude_chat_key` combine with no routing changes.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleClaudePanel);
+        let hits = ui::HitMap::default();
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.claude.history_scroll, 1);
+    }
+
+    #[test]
+    fn wheel_scroll_over_the_run_screen_moves_cargo_output_scroll() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToRunScreen);
+        let hits = ui::HitMap::default();
+
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 1);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 2);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 1);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 0);
+        app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
+        assert_eq!(app.cargo.output_scroll, 0);
+    }
+
+    #[test]
     fn wheel_scroll_down_over_the_editor_clamps_at_the_last_line() {
         let (_dir, mut app) = open_rust_tab("a\nb\nc\n");
         let hits = ui::HitMap {
@@ -20228,6 +23598,13 @@ mod tests {
             screen_tabs: vec![],
             left_dock_tabs: vec![],
             bottom_dock_tabs: vec![],
+            top_action_hits: vec![],
+            outline_action_hits: vec![],
+            ribbon_action_hits: vec![],
+            ribbon_add_hit: None,
+            left_dock_body: None,
+            bottom_dock_body: None,
+            ..Default::default()
         };
         for _ in 0..10 {
             app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 1, 1), &hits);
@@ -21777,5 +25154,518 @@ mod tests {
 
         app.run_action(Action::ExtractVariable);
         assert!(app.via_refactor_preview);
+    }
+
+    // ---- Top menu bar (docs/features/tui-menu-bar.md, T54) ----
+
+    fn alt_key(c: char) -> KeyEvent {
+        key(KeyModifiers::ALT, KeyCode::Char(c))
+    }
+
+    #[test]
+    fn close_all_overlays_clears_the_menu_bar() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.menu_bar = MenuBarState {
+            open: Some(2),
+            selected: 3,
+            submenu_selected: Some(1),
+        };
+
+        app.close_all_overlays();
+
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn any_popup_open_includes_the_menu_bar() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.menu_bar.open = Some(0);
+        assert!(app.any_popup_open());
+    }
+
+    #[test]
+    fn open_menu_bar_closes_other_overlays() {
+        // `self.palette` deliberately isn't cleared by `close_all_overlays`
+        // (see that function's own comment on why) -- `unified_finder` is,
+        // so it's the right overlay to prove this against.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.unified_finder = Some(UnifiedFinderState::default());
+
+        app.open_menu_bar(3);
+
+        assert!(app.unified_finder.is_none());
+        assert_eq!(app.menu_bar.open, Some(3));
+        assert_eq!(app.menu_bar.selected, 0);
+        assert_eq!(app.menu_bar.submenu_selected, None);
+    }
+
+    #[test]
+    fn open_menu_bar_preserves_git_panel_state_and_active_screen_when_opened_from_the_git_screen() {
+        // Mirrors `go_to_git_screen_closes_other_overlays_but_preserves_
+        // git_panel_state`'s own regression shape -- opening the menu bar
+        // must not desync `active_screen == Git` from `git_panel == None`
+        // (T44's round-1 review bug class), and must not discard whatever
+        // draft state `git_panel` was already holding.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        app.git_panel.as_mut().unwrap().diff_scroll = 7;
+
+        app.open_menu_bar(5);
+
+        assert_eq!(app.active_screen, AppScreen::Git);
+        assert_eq!(app.git_panel.as_ref().unwrap().diff_scroll, 7);
+        assert_eq!(app.menu_bar.open, Some(5));
+    }
+
+    #[test]
+    fn alt_mnemonic_opens_the_matching_menu() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+
+        app.handle_key(alt_key('f'));
+
+        let file_index = menu_groups()
+            .iter()
+            .position(|g| g.title == "File")
+            .unwrap();
+        assert_eq!(app.menu_bar.open, Some(file_index));
+        assert_eq!(app.menu_bar.selected, 0);
+    }
+
+    #[test]
+    fn alt_mnemonic_does_not_open_the_bar_while_a_popup_is_already_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.palette = Some(PaletteState {
+            query: String::new(),
+            selected: 0,
+            filtered: vec![],
+        });
+
+        app.handle_key(alt_key('f'));
+
+        assert_eq!(app.menu_bar.open, None);
+        assert!(app.palette.is_some());
+    }
+
+    #[test]
+    fn alt_mnemonic_while_the_bar_is_already_open_jumps_to_that_menu() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        app.menu_bar.selected = 2;
+
+        app.handle_key(alt_key('e'));
+
+        let edit_index = menu_groups()
+            .iter()
+            .position(|g| g.title == "Edit")
+            .unwrap();
+        assert_eq!(app.menu_bar.open, Some(edit_index));
+        assert_eq!(app.menu_bar.selected, 0);
+    }
+
+    #[test]
+    fn handle_menu_bar_key_left_and_right_wrap_between_top_level_menus() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+
+        app.handle_key(plain_key(KeyCode::Left));
+        assert_eq!(app.menu_bar.open, Some(menu_groups().len() - 1));
+
+        app.handle_key(plain_key(KeyCode::Right));
+        assert_eq!(app.menu_bar.open, Some(0));
+    }
+
+    #[test]
+    fn handle_menu_bar_key_up_and_down_clamp_within_the_open_dropdown() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.menu_bar.selected, 0, "must clamp, not wrap, at the top");
+
+        let last = menu_groups()[0].entries.len() - 1;
+        for _ in 0..(last + 5) {
+            app.handle_key(plain_key(KeyCode::Down));
+        }
+        assert_eq!(
+            app.menu_bar.selected, last,
+            "must clamp, not wrap, at the bottom"
+        );
+    }
+
+    #[test]
+    fn handle_menu_bar_key_enter_on_an_item_runs_its_action_and_closes_everything() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some());
+        let window_index = menu_groups()
+            .iter()
+            .position(|g| g.title == "Window")
+            .unwrap();
+        let toggle_left_dock_index = menu_groups()[window_index]
+            .entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Item("ToggleLeftDock")))
+            .unwrap();
+        app.open_menu_bar(window_index);
+        app.menu_bar.selected = toggle_left_dock_index;
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.left_dock.is_none());
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn handle_menu_bar_key_enter_on_a_submenu_opens_a_flyout_without_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let run_index = menu_groups().iter().position(|g| g.title == "Run").unwrap();
+        let debug_submenu_index = menu_groups()[run_index]
+            .entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Submenu("Debug", _)))
+            .unwrap();
+        app.open_menu_bar(run_index);
+        app.menu_bar.selected = debug_submenu_index;
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.menu_bar.open, Some(run_index));
+        assert_eq!(app.menu_bar.submenu_selected, Some(0));
+    }
+
+    #[test]
+    fn handle_menu_bar_key_enter_on_a_flyout_item_runs_it_and_closes_everything() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let run_index = menu_groups().iter().position(|g| g.title == "Run").unwrap();
+        let (debug_submenu_index, ids) = menu_groups()[run_index]
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| match e {
+                MenuEntry::Submenu("Debug", ids) => Some((i, *ids)),
+                _ => None,
+            })
+            .unwrap();
+        let toggle_debug_panel_index = ids.iter().position(|id| *id == "ToggleDebugPanel").unwrap();
+        app.open_menu_bar(run_index);
+        app.menu_bar.selected = debug_submenu_index;
+        app.menu_bar.submenu_selected = Some(toggle_debug_panel_index);
+        assert!(!app.debug_panel_open);
+
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert!(app.debug_panel_open);
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn handle_menu_bar_key_esc_closes_just_the_flyout_then_the_whole_bar() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        app.menu_bar.submenu_selected = Some(0);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+        assert_eq!(app.menu_bar.open, Some(0));
+        assert_eq!(app.menu_bar.submenu_selected, None);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn run_action_by_id_runs_the_matching_action() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some());
+
+        app.run_action_by_id("ToggleLeftDock");
+
+        assert!(app.left_dock.is_none());
+    }
+
+    #[test]
+    fn run_action_by_id_with_an_unknown_id_is_a_harmless_no_op() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some());
+
+        app.run_action_by_id("NotARealCommandId");
+
+        assert!(app.left_dock.is_some());
+    }
+
+    #[test]
+    fn mouse_click_on_a_menu_bar_label_opens_that_menu() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let hits = ui::HitMap {
+            menu_bar_labels: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                0,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar.open, Some(0));
+    }
+
+    #[test]
+    fn mouse_click_on_a_menu_bar_label_works_even_on_the_git_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.go_to_git_screen();
+        let hits = ui::HitMap {
+            menu_bar_labels: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                0,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar.open, Some(0));
+        assert_eq!(app.active_screen, AppScreen::Git);
+        assert!(app.git_panel.is_some());
+    }
+
+    #[test]
+    fn mouse_click_on_a_dropdown_item_runs_it_and_closes_the_bar() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(app.left_dock.is_some());
+        let window_index = menu_groups()
+            .iter()
+            .position(|g| g.title == "Window")
+            .unwrap();
+        let toggle_left_dock_index = menu_groups()[window_index]
+            .entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Item("ToggleLeftDock")))
+            .unwrap();
+        app.open_menu_bar(window_index);
+        let row = Rect {
+            x: 0,
+            y: 1,
+            width: 20,
+            height: 1,
+        };
+        let hits = ui::HitMap {
+            menu_dropdown_items: vec![(row, toggle_left_dock_index)],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            &hits,
+        );
+
+        assert!(app.left_dock.is_none());
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn mouse_click_on_a_dropdown_submenu_row_opens_the_flyout_without_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let run_index = menu_groups().iter().position(|g| g.title == "Run").unwrap();
+        let debug_submenu_index = menu_groups()[run_index]
+            .entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Submenu("Debug", _)))
+            .unwrap();
+        app.open_menu_bar(run_index);
+        let row = Rect {
+            x: 0,
+            y: 1,
+            width: 20,
+            height: 1,
+        };
+        let hits = ui::HitMap {
+            menu_dropdown_items: vec![(row, debug_submenu_index)],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar.open, Some(run_index));
+        assert_eq!(app.menu_bar.submenu_selected, Some(0));
+    }
+
+    #[test]
+    fn mouse_click_on_a_submenu_item_runs_it_and_closes_everything() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let run_index = menu_groups().iter().position(|g| g.title == "Run").unwrap();
+        let (debug_submenu_index, ids) = menu_groups()[run_index]
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| match e {
+                MenuEntry::Submenu("Debug", ids) => Some((i, *ids)),
+                _ => None,
+            })
+            .unwrap();
+        let toggle_debug_panel_index = ids.iter().position(|id| *id == "ToggleDebugPanel").unwrap();
+        app.open_menu_bar(run_index);
+        app.menu_bar.selected = debug_submenu_index;
+        app.menu_bar.submenu_selected = Some(0);
+        assert!(!app.debug_panel_open);
+        let row = Rect {
+            x: 0,
+            y: 1,
+            width: 20,
+            height: 1,
+        };
+        let hits = ui::HitMap {
+            menu_submenu_items: vec![(row, toggle_debug_panel_index)],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 1),
+            &hits,
+        );
+
+        assert!(app.debug_panel_open);
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn mouse_click_on_a_different_bar_label_while_open_switches_menus_without_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        let hits = ui::HitMap {
+            menu_bar_labels: vec![
+                (
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 6,
+                        height: 1,
+                    },
+                    0,
+                ),
+                (
+                    Rect {
+                        x: 6,
+                        y: 0,
+                        width: 6,
+                        height: 1,
+                    },
+                    1,
+                ),
+            ],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 7, 0),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar.open, Some(1));
+        assert_eq!(app.menu_bar.selected, 0);
+        assert_eq!(app.menu_bar.submenu_selected, None);
+    }
+
+    #[test]
+    fn mouse_click_on_the_already_open_menus_own_label_closes_it() {
+        // `docs/features/tui-menu-bar.md` §3.1/§3.3: clicking a *different*
+        // bar label switches menus (previous test); clicking the same,
+        // already-open one's own label is a toggle-close instead.
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        let hits = ui::HitMap {
+            menu_bar_labels: vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 6,
+                    height: 1,
+                },
+                0,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 1, 0),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar, MenuBarState::default());
+    }
+
+    #[test]
+    fn mouse_click_outside_everything_while_the_bar_is_open_closes_it_without_side_effects() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        // A `screen_tabs` hit deliberately overlaps the click point --
+        // proves the outside click is fully consumed by the menu bar and
+        // never falls through to the normal dispatch below it in the same
+        // call (`docs/features/tui-menu-bar.md` §3.3, T54).
+        let hits = ui::HitMap {
+            screen_tabs: vec![(
+                Rect {
+                    x: 50,
+                    y: 50,
+                    width: 3,
+                    height: 1,
+                },
+                AppScreen::Run,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 50, 50),
+            &hits,
+        );
+
+        assert_eq!(app.menu_bar, MenuBarState::default());
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Editor,
+            "the outside click must not also switch screens"
+        );
     }
 }

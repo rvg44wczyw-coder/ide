@@ -15,7 +15,7 @@ use std::sync::mpsc::Sender;
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::project::AiConfig;
+pub use crate::project::{resolve_role_route, AiConfig, PermissionMode, RoleRoute, TaskRole};
 
 mod project;
 
@@ -736,11 +736,16 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Two-attempt router: attempt 1 = first enabled provider; on a
-/// fallback-eligible error, a fixed 500 ms backoff, then attempt 2 = the
-/// next enabled provider (or a retry of the same if only one is enabled);
-/// then give up. Deltas for whichever attempt runs push into `tx`; the
-/// final `ProviderId` that served is returned. The per-attempt
+/// Full-chain router: walks every enabled provider in `order` once, in
+/// order, stopping at the first success. On a fallback-eligible error a
+/// fixed 500 ms backoff separates attempts, then the next provider in
+/// `order` is tried; a non-fallback-eligible error aborts the chain
+/// immediately (§3.1). When only one provider is enabled it is retried
+/// once (a single flaky provider is worth one retry even with nothing to
+/// fall back to). The number of attempts is naturally bounded by
+/// `AiConfig::enabled_providers`'s `MAX_PROVIDERS` cap upstream, so this
+/// never needs its own limit. Deltas for whichever attempt runs push into
+/// `tx`; the final `ProviderId` that served is returned. The per-attempt
 /// `ChatRequest` (with that provider's `default_model`) is built here, so
 /// the caller never has to know which provider will serve.
 ///
@@ -753,6 +758,7 @@ pub trait Router {
         &self,
         messages: Vec<ChatMessage>,
         order: &[ProviderId],
+        model_override: Option<&str>,
         sanitized: bool,
         tx: Sender<Result<ChatDelta, AiError>>,
     ) -> impl std::future::Future<Output = Result<ProviderId, AiError>> + Send;
@@ -767,6 +773,7 @@ impl Router for DefaultRouter {
         &self,
         messages: Vec<ChatMessage>,
         order: &[ProviderId],
+        model_override: Option<&str>,
         sanitized: bool,
         tx: Sender<Result<ChatDelta, AiError>>,
     ) -> Result<ProviderId, AiError> {
@@ -774,29 +781,59 @@ impl Router for DefaultRouter {
         if order.is_empty() {
             return Err(AiError::Message("no enabled providers".to_string()));
         }
-        let mut last_err = None;
-        let attempts = [order[0], *order.get(1).unwrap_or(&order[0])];
-        for (i, id) in attempts.into_iter().enumerate() {
+        let attempts: Vec<ProviderId> = if order.len() == 1 {
+            vec![order[0], order[0]]
+        } else {
+            order
+        };
+        try_in_order(&attempts, std::time::Duration::from_millis(500), |id| {
             let provider = Provider::from_id(id);
+            let model = model_override
+                .map(str::to_string)
+                .unwrap_or_else(|| default_model(id).to_string());
             let request = ChatRequest {
                 messages: messages.clone(),
-                model: default_model(id).to_string(),
+                model,
                 sanitized,
             };
-            let r = provider.stream_chat(&request, tx.clone()).await;
-            match r {
-                Ok(()) => return Ok(id),
-                Err(e) if fallback_eligible(&e) => {
-                    last_err = Some(e);
-                    if i == 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap_or(AiError::Message("no provider served".to_string())))
+            let tx = tx.clone();
+            async move { provider.stream_chat(&request, tx).await }
+        })
+        .await
     }
+}
+
+/// Pure sequencing core of the router: calls `attempt` once per id in
+/// `order` (sleeping `backoff` between attempts, skipped before the
+/// first), stopping at the first success or the first non-fallback-
+/// eligible error, and returning the id that served. Split out from
+/// `DefaultRouter::chat` so this control flow -- which providers get
+/// tried, in what order, and when the chain gives up -- is unit-testable
+/// against a canned `attempt` closure instead of requiring a real
+/// network stack (every `ProviderId::endpoint()` but the local one is a
+/// real internet host, so the full `Provider::stream_chat` path can't be
+/// pointed at a test server).
+async fn try_in_order<F, Fut>(
+    order: &[ProviderId],
+    backoff: std::time::Duration,
+    mut attempt: F,
+) -> Result<ProviderId, AiError>
+where
+    F: FnMut(ProviderId) -> Fut,
+    Fut: std::future::Future<Output = Result<(), AiError>>,
+{
+    let mut last_err = None;
+    for (i, &id) in order.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(backoff).await;
+        }
+        match attempt(id).await {
+            Ok(()) => return Ok(id),
+            Err(e) if fallback_eligible(&e) => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or(AiError::Message("no provider served".to_string())))
 }
 
 /// Whether a provider error triggers a fallback to the next provider
@@ -809,6 +846,108 @@ pub fn fallback_eligible(e: &AiError) -> bool {
         e,
         AiError::ConnectionRefused | AiError::Timeout | AiError::RateLimited | AiError::StreamEnded
     ) || matches!(e, AiError::Http(c) if *c >= 500)
+}
+
+/// Bounded timeout for [`classify_task_role`]'s single completion call --
+/// deliberately much shorter than [`STREAM_CHUNK_TIMEOUT`] since a slow
+/// classifier must not meaningfully delay ordinary chat latency (T55 §2.1).
+pub const CLASSIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hard cap on how much of the outgoing message [`classify_task_role`]
+/// ever sees -- classification needs a gist, not the full payload, and
+/// this keeps the extra call cheap and fast regardless of how long the
+/// user's actual message is. Applied via `truncate()`, so it never splits
+/// a multi-byte character.
+pub const MAX_CLASSIFY_INPUT_CHARS: usize = 500;
+
+const CLASSIFY_PROMPT_PREFIX: &str = "Classify the following developer request into exactly one label: general, planning, coding, review. Respond with only the label.\n\n";
+
+/// Parses a classifier's raw text response into a [`TaskRole`]: trimmed
+/// and lowercased, then matched exactly against the four labels. Any
+/// other text -- extra words, an apologetic preamble, empty output --
+/// classifies as [`TaskRole::General`] (T55 §3.1). Pure and
+/// network-free, so it's unit-tested directly rather than only through
+/// [`classify_task_role`]'s full network path.
+fn parse_task_role_label(text: &str) -> TaskRole {
+    match text.trim().to_lowercase().as_str() {
+        "planning" => TaskRole::Planning,
+        "coding" => TaskRole::Coding,
+        "review" => TaskRole::Review,
+        _ => TaskRole::General,
+    }
+}
+
+/// Classifies `latest_user_message` into a [`TaskRole`] via one short,
+/// non-streaming completion call to `classifier_provider` (T55 §2.1).
+/// Never returns an error -- a timeout, a transport error, a provider with
+/// no credential configured (`ProviderId::enabled()` is `false`), or a
+/// response that doesn't parse to a known label all classify as
+/// `TaskRole::General`, so a broken, unconfigured, or slow classifier can
+/// only ever cost one bounded extra round trip (zero, in the disabled-
+/// provider case -- no dispatch is attempted at all, mirroring
+/// `DefaultRouter::chat`'s own `enabled()` filter so this call path can't
+/// contact a provider the rest of this crate treats as disabled), never
+/// block or fail the real request.
+///
+/// `sanitized` is passed straight through to the classifier's own
+/// internal `ChatRequest.sanitized` field -- exactly `ChatRequest`'s
+/// existing contract: the caller asserts it already ran `mask_outgoing`
+/// on `latest_user_message` when `classifier_provider.is_cloud()`, and
+/// `Provider::stream_chat` enforces that assertion (refuses cloud
+/// dispatch when `sanitized` is `false`). This function does **not** mask
+/// on the caller's behalf and does **not** default `sanitized` to `true`.
+pub async fn classify_task_role(
+    classifier_provider: ProviderId,
+    latest_user_message: &str,
+    sanitized: bool,
+) -> TaskRole {
+    classify_task_role_with_timeout(
+        classifier_provider,
+        latest_user_message,
+        sanitized,
+        CLASSIFY_TIMEOUT,
+    )
+    .await
+}
+
+/// [`classify_task_role`]'s implementation, with an injectable timeout so
+/// tests can force the timeout branch without waiting the real 5s.
+async fn classify_task_role_with_timeout(
+    classifier_provider: ProviderId,
+    latest_user_message: &str,
+    sanitized: bool,
+    timeout: std::time::Duration,
+) -> TaskRole {
+    // Mirrors `DefaultRouter::chat`'s own `enabled()` filter: a provider
+    // with no credential configured must never be contacted, classifier
+    // call included -- otherwise a `classifier_provider` pointed at an
+    // uncredentialed cloud provider silently makes a real network call to
+    // it on every message despite the rest of this crate treating that
+    // provider as disabled everywhere else (`hacker` fix round, T55).
+    if !classifier_provider.enabled() {
+        return TaskRole::General;
+    }
+    let input = truncate(latest_user_message, MAX_CLASSIFY_INPUT_CHARS);
+    let provider = Provider::from_id(classifier_provider);
+    let request = ChatRequest {
+        messages: vec![ChatMessage::user(format!(
+            "{CLASSIFY_PROMPT_PREFIX}{input}"
+        ))],
+        model: default_model(classifier_provider).to_string(),
+        sanitized,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dispatch = tokio::time::timeout(timeout, provider.stream_chat(&request, tx));
+    match dispatch.await {
+        Ok(Ok(())) => {
+            let mut text = String::new();
+            for delta in rx.try_iter().flatten() {
+                text.push_str(&delta.text);
+            }
+            parse_task_role_label(&text)
+        }
+        Ok(Err(_)) | Err(_) => TaskRole::General,
+    }
 }
 
 #[cfg(test)]

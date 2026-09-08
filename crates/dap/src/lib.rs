@@ -4,7 +4,7 @@
 
 mod client;
 mod error;
-mod path;
+pub mod path;
 mod protocol;
 mod types;
 

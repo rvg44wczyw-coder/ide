@@ -30,6 +30,12 @@ type ClaudeOutcomeResult = Result<String, String>;
 pub struct ClaudePanel {
     pub input: String,
     pub history: Vec<ClaudeMessage>,
+    /// Lines scrolled back from the live tail (`docs/features/
+    /// tui-panel-history-scroll.md` §2.3/§3.1, T52) -- same shape as
+    /// `CargoPanel::output_scroll`. Never reset by `submit`/`poll`: see
+    /// that doc's §3.1 for why history growth doesn't need an explicit
+    /// reset here.
+    pub history_scroll: u16,
     queue: Vec<String>,
     rx: Option<Receiver<ClaudeOutcomeResult>>,
     runner: Runner,
@@ -53,6 +59,7 @@ impl ClaudePanel {
         Self {
             input: String::new(),
             history: Vec::new(),
+            history_scroll: 0,
             queue: Vec::new(),
             rx: None,
             runner,
