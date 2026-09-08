@@ -156,6 +156,28 @@ fn command_line(command: &str, args: &[String]) -> String {
 
 impl IdeApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // The agent approval popup (`docs/features/gui-local-agent.md` §4)
+        // must outrank *every* other check in this function -- mirrors
+        // `crates/tui/src/app.rs::handle_key`'s own identical precedent and
+        // its own doc comment on why: `egui::Modal`'s backdrop only blocks
+        // *pointer* input, so without this early return a background
+        // keyboard shortcut could still fire via the registry dispatch loop
+        // further down (`rev` fix round 1, `75f5f2d`), and -- what that
+        // narrower fix missed, since it only touched `suppress_dispatch` --
+        // `FindAction` is deliberately exempt from `suppress_dispatch`
+        // (so it can still open/reset the palette while some *other*
+        // overlay is open), which means a user could still open the
+        // command palette while approval is pending and then confirm a
+        // selection via the palette's own local Enter-handling below
+        // (`command_palette_confirm` calls `run_command` unconditionally,
+        // independent of `suppress_dispatch` entirely). Approve/Deny are
+        // deliberately not commands (mouse-only, doc §2.3), so returning
+        // here can't itself resolve the pending decision -- it only stops
+        // every other keyboard-triggered action from executing while that
+        // decision is still pending.
+        if self.agent.pending_approval.is_some() {
+            return;
+        }
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
         // Palette-local list navigation: widget-internal, not a
@@ -314,24 +336,10 @@ impl IdeApp {
         let terminal_tab_focused = self.claude_terminals.tabs().iter().any(|tab| {
             ctx.memory(|m| m.has_focus(crate::claude_terminal::terminal_tab_egui_id(tab.id)))
         });
-        // `agent.pending_approval.is_some()` (`docs/features/
-        // gui-local-agent.md` §4, `rev` fix round 1): `egui::Modal`'s own
-        // 0.36.1 implementation only intercepts *pointer* input via its
-        // backdrop -- it never touches `ctx.input()`, so without this
-        // condition a background keyboard shortcut (Cargo Run, Save All,
-        // Push, ...) could still fire through this very dispatch loop while
-        // the approval popup is open and visually blocking everything else,
-        // contradicting §4's stated "blocks input to the rest of the UI"
-        // invariant for the one input path `Modal` doesn't cover on its
-        // own. Approve/Deny are deliberately not commands (mouse-only), so
-        // this can't itself resolve the pending decision -- it only stops
-        // an unrelated action from executing silently while that decision
-        // is still pending.
         let suppress_dispatch = self.command_palette_open
             || self.search_everywhere_open
             || self.show_go_to_line
             || self.file_structure_open
-            || self.agent.pending_approval.is_some()
             || self.recent_files_open
             || self.recent_locations_open
             || terminal_tab_focused;
