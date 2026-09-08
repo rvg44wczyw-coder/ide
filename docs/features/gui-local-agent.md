@@ -394,7 +394,7 @@ already-running debug session, Plan mode refusing `DebugControl` with no
 session — all reproduce identically in the GUI, since `ide-agent` drives
 every one of those decisions and is unchanged. The only GUI-specific
 difference is presentation: the approval popup is a mouse-driven
-`egui::Window` with Approve/Deny buttons instead of a `y`/`n` keyboard
+`egui::Modal` with Approve/Deny buttons instead of a `y`/`n` keyboard
 prompt, and the diff preview is `render_diff`'s real syntax-aware diff
 view instead of TUI's plain-text `@@ -n +n @@`/`+`/`-` lines.
 
@@ -465,3 +465,13 @@ naming the asymmetry explicitly in §4 rather than leaving it an unstated
 implementation detail — the justification (this is the one popup gating
 irreversible, model-proposed actions) stands on its own, not something
 requiring a separate user decision.
+
+`rev` DOCUMENTATION REVIEW (round 2) re-verified all three round-1 fixes
+against the current text and found one residual gap the fixes themselves
+introduced:
+
+4. **[docs] §5** — round 1's fix changed §2.4/§4 to `egui::Modal` but
+   missed the parallel mention in §5's Examples section, which still read
+   "the approval popup is a mouse-driven `egui::Window`" — a direct
+   contradiction of §4's own corrected text three sections earlier. Fixed:
+   §5 now says `egui::Modal`, matching §2.4/§4.
