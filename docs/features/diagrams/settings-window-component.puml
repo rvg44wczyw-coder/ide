@@ -1,0 +1,44 @@
+@startuml settings-window-component
+skinparam componentStyle rectangle
+title G1 -- Settings window components
+
+package "ide-core" {
+  component "user_settings.rs\n(new)" as UserSettings
+  component "project_settings.rs\n(existing)" as ProjectSettings
+  component "editorconfig.rs\n(existing)" as EditorConfig
+}
+
+package "ide-ui (crates/ui/src)" {
+  component "app.rs\nIdeApp\n(show_settings_window,\nsettings_page,\nload/flush_user_settings)" as App
+  component "app/render.rs\nrender_settings_window\n(new)" as Window
+  component "render_appearance_settings_page\n(new)" as Appearance
+  component "render_editor_settings_page\n(new)" as Editor
+  component "render_code_style_settings_page\n(new)" as CodeStyle
+  component "render_language_settings_page\n(existing body, new location)" as Languages
+  component "render_keymap_settings_page\n(existing body, new location)" as Keymap
+  component "command.rs\nShowSettings /\nShowLanguageSettings /\nShowKeymapSettings" as Commands
+}
+
+file "~/.config/ide/settings.json\n(theme, keymap, format_on_save)" as UserFile
+file ".ide/preferences.json\n(custom_languages,\ndismissed_language_suggestions)" as ProjectFile
+
+Commands --> App : run_command\nsets show_settings_window +\nsettings_page
+App --> Window : render_overlays() call
+Window --> Appearance
+Window --> Editor
+Window --> CodeStyle
+Window --> Languages
+Window --> Keymap
+
+Appearance --> App : flush_user_settings()
+Editor --> App : flush_user_settings()
+CodeStyle ..> EditorConfig : reads Tab::config\n(already resolved)
+Languages --> App : flush_project_settings()\n(unchanged)
+Keymap --> App : flush_user_settings()\n(keymap overrides)
+
+App --> UserSettings : load_user_settings()\n(IdeApp::new, once)
+UserSettings --> UserFile
+App --> ProjectSettings : load_project_settings()\n(per project switch)
+ProjectSettings --> ProjectFile
+
+@enduml
