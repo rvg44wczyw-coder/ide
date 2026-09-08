@@ -7901,6 +7901,32 @@ b
     }
 
     #[test]
+    fn poll_fim_with_an_open_but_empty_channel_returns_false() {
+        let mut app = app_without_gui();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.fim_rx = Some(rx);
+
+        assert!(!app.poll_fim());
+        assert!(app.fim_rx.is_some(), "still waiting, not settled");
+    }
+
+    #[test]
+    fn poll_fim_disconnected_channel_records_an_error() {
+        let mut app = app_without_gui();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fim_rx = Some(rx);
+        drop(tx); // the background thread ended without ever sending
+
+        assert!(app.poll_fim());
+
+        assert!(app.fim_rx.is_none());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("FIM autocomplete thread ended unexpectedly")
+        );
+    }
+
+    #[test]
     fn apply_fim_insert_is_a_noop_on_empty_text() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
