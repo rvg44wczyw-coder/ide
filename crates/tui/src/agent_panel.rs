@@ -102,6 +102,18 @@ impl AgentPanel {
     /// runner, same reasoning as `AiPanel::with_runner`.
     pub(crate) fn with_runner(root: PathBuf, runner: AgentRunner) -> Self {
         let mode = AiConfig::load(&root).agent_mode;
+        // Canonicalized once, here, the same discipline `ToolExecutor::new`
+        // already applies to its own copy of the root and `crates/ui/src/
+        // agent_panel.rs::active_root` applies to its own (see that field's
+        // doc comment on the `/private/var` symlink case) -- `self.root` is
+        // now compared against a *canonicalized* target path inside
+        // `validated_edit_target`, so an uncanonicalized root (e.g. a
+        // symlinked `$TMPDIR` on macOS) would otherwise make `starts_with`
+        // spuriously fail for perfectly legitimate in-root files.
+        // Fails open to the given `root` (matching `active_root`'s
+        // `unwrap_or`) since a root that doesn't exist yet is a test/
+        // misconfiguration concern, not something to hide behind a panic.
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         Self {
             mode,
             input: String::new(),
@@ -219,19 +231,33 @@ impl AgentPanel {
     /// `EditFile` gets a real diff via `ide_core::git::diff_text`;
     /// `RunShellCommand` shows the literal program+args; everything else
     /// (including `DebugControl`) shows its one-line description.
+    ///
+    /// `EditFile`'s `path` is validated against `self.root` via
+    /// `validated_edit_target` before it's ever joined/read (same fix as
+    /// `crates/ui/src/agent_panel.rs::pending_approval_preview`'s own doc
+    /// comment describes and flags this exact function as a known,
+    /// separate-follow-up gap for). Without it, a model-supplied `path` --
+    /// steered by indirect prompt injection, T56 §4's own named threat
+    /// model -- could read arbitrary local file content into the UI via a
+    /// `../` escape or a symlink, with zero user action beyond the
+    /// `Approve`-mode popup rendering (this method runs automatically the
+    /// moment it appears, before a human decides anything).
     pub fn pending_approval_preview(&self) -> Vec<String> {
         let Some(tool) = &self.pending_approval else {
             return Vec::new();
         };
         match tool {
-            AgentTool::EditFile { path, new_text } => {
-                let real = self.root.join(path);
-                let old = std::fs::read_to_string(&real).unwrap_or_default();
-                match diff_text(Path::new(path), &old, new_text) {
-                    Some(diff) => diff_to_lines(&diff),
-                    None => vec![format!("EditFile {path} (no textual diff)")],
+            AgentTool::EditFile { path, new_text } => match validated_edit_target(&self.root, path)
+            {
+                Some(real) => {
+                    let old = std::fs::read_to_string(&real).unwrap_or_default();
+                    match diff_text(Path::new(path), &old, new_text) {
+                        Some(diff) => diff_to_lines(&diff),
+                        None => vec![format!("EditFile {path} (no textual diff)")],
+                    }
                 }
-            }
+                None => vec!["path escapes the project root".to_string()],
+            },
             AgentTool::RunShellCommand { program, args } => {
                 vec![format!("Run: {program} {}", args.join(" "))]
             }
@@ -345,6 +371,38 @@ impl AgentPanel {
             }
         }
     }
+}
+
+/// Resolves `path` (model-supplied, relative to `project_root`) to a real
+/// on-disk target, rejecting any escape -- ported from `crates/ui/src/
+/// agent_panel.rs::validated_edit_target` (`docs/features/
+/// gui-local-agent.md`/G10's own hacker findings, `docs/security-findings/
+/// rust-ui-dev-gui-local-agent-2026-09-08.md`), which found and fixed
+/// three ways this can go wrong: an out-of-root symlink, a *dangling*
+/// symlink already sitting at the leaf (whose target doesn't exist, so
+/// `canonicalize` alone can't see it -- `symlink_metadata` can, without
+/// following it), and any existing directory (`EditFile` never
+/// legitimately targets one). `""`/`"."`/`"sub/.."`-shaped paths that
+/// resolve back to the root itself are rejected by the same
+/// `!canonical.is_dir()` check, since the root is itself a directory.
+fn validated_edit_target(project_root: &Path, path: &str) -> Option<PathBuf> {
+    if path.is_empty() {
+        return None;
+    }
+    let target = project_root.join(path);
+    if let Ok(canonical) = std::fs::canonicalize(&target) {
+        return (canonical.starts_with(project_root) && !canonical.is_dir()).then_some(canonical);
+    }
+    if std::fs::symlink_metadata(&target).is_ok() {
+        return None;
+    }
+    let parent = target.parent()?;
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
+    if !canonical_parent.starts_with(project_root) {
+        return None;
+    }
+    let file_name = target.file_name()?;
+    Some(canonical_parent.join(file_name))
 }
 
 fn describe_tool(tool: &AgentTool) -> String {
