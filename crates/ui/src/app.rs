@@ -5200,13 +5200,27 @@ impl IdeApp {
 
     /// The dispatch table: matches `action` to the existing per-action
     /// method. Does not itself check `is_command_enabled` -- every call
-    /// site (`handle_shortcuts`, `command_palette_confirm`) checks first,
-    /// same as each of these methods already no-ops safely on its own
-    /// preconditions. Takes `ctx` only for `ToggleTheme`, which needs it to
-    /// re-apply `egui::Visuals` immediately (`toggle_theme`'s existing
-    /// signature) -- every other action already gets everything it needs
-    /// from `self`.
+    /// site (`handle_shortcuts`, `command_palette_confirm`,
+    /// `SearchEverywhereRow::Action`'s handler) checks first, same as each
+    /// of these methods already no-ops safely on its own preconditions.
+    /// Takes `ctx` only for `ToggleTheme`, which needs it to re-apply
+    /// `egui::Visuals` immediately (`toggle_theme`'s existing signature) --
+    /// every other action already gets everything it needs from `self`.
+    ///
+    /// The one check this method *does* make itself, deliberately, is the
+    /// agent-approval guard below: `handle_shortcuts`'s own early return
+    /// (`docs/features/gui-local-agent.md` §4) only covers dispatch through
+    /// the egui canvas. `crates/ui/src/app/menu.rs`'s native macOS menu bar
+    /// calls `run_command` directly from a `poll_menu_event` callback that
+    /// is entirely outside egui's rendering -- `egui::Modal`'s backdrop
+    /// can't block a click that never goes through egui's input pipeline.
+    /// Putting the guard here, at the one place every dispatch path already
+    /// converges, closes that (and any future call site) in one spot
+    /// instead of relying on each new caller to remember it individually.
     fn run_command(&mut self, action: CommandAction, ctx: &egui::Context) {
+        if self.agent.pending_approval.is_some() {
+            return;
+        }
         match action {
             CommandAction::SaveAll => self.try_save_active(),
             CommandAction::Undo => self.undo_active(),
@@ -8005,6 +8019,31 @@ b
             app.current_agent_approval(),
             crate::agent_panel::AgentApprovalPreview::Text(String::new())
         );
+    }
+
+    #[test]
+    fn run_command_is_a_no_op_while_an_agent_approval_is_pending() {
+        let dir = sample_project_dir();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.agent.pending_approval = Some(ide_agent::AgentTool::RunShellCommand {
+            program: "true".into(),
+            args: vec![],
+        });
+        let zen_before = app.zen_mode;
+
+        // `menu.rs`'s native-macOS-menu-bar path calls `run_command`
+        // directly, bypassing `handle_shortcuts` entirely -- this must be
+        // blocked at the `run_command` choke point itself, not just at the
+        // egui-canvas keyboard dispatch path (`docs/features/
+        // gui-local-agent.md` §4).
+        app.run_command(CommandAction::ToggleZenMode, &egui::Context::default());
+
+        assert_eq!(
+            app.zen_mode, zen_before,
+            "run_command must no-op while an agent tool approval is pending"
+        );
+        assert!(app.agent.pending_approval.is_some());
     }
 
     #[test]
