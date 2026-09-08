@@ -15,7 +15,7 @@ use std::sync::mpsc::Sender;
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::project::{resolve_role_route, AiConfig, RoleRoute, TaskRole};
+pub use crate::project::{resolve_role_route, AiConfig, PermissionMode, RoleRoute, TaskRole};
 
 mod project;
 

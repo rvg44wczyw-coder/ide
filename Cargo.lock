@@ -2303,6 +2303,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ide-agent"
+version = "0.1.0"
+dependencies = [
+ "ide-ai",
+ "ide-core",
+ "ide-dap",
+ "ide-sanitizer",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "ide-ai"
 version = "0.1.0"
 dependencies = [
@@ -2371,6 +2385,7 @@ name = "ide-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "ide-agent",
  "ide-ai",
  "ide-core",
  "ide-dap",

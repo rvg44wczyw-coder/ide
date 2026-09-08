@@ -256,7 +256,11 @@ impl AiPanel {
 /// (tighter) cloud threshold; a local-only chain masks at the local
 /// threshold only when `sanitize_local` is set; local with sanitizing off
 /// sends raw. Returns `None` for the only unmasked case.
-fn decide_threshold(config: &AiConfig, order: &[ProviderId]) -> Option<f64> {
+///
+/// `pub(crate)`, not private: `agent_panel.rs` (`docs/features/
+/// tui-local-agent.md` §3.3) reuses this unchanged rather than
+/// reimplementing it, exactly as that doc requires.
+pub(crate) fn decide_threshold(config: &AiConfig, order: &[ProviderId]) -> Option<f64> {
     let has_cloud = order
         .iter()
         .any(|id| !matches!(id, ProviderId::OllamaLocal));
@@ -272,7 +276,10 @@ fn decide_threshold(config: &AiConfig, order: &[ProviderId]) -> Option<f64> {
 /// The outbound half of the background run: sanitize `payload` when a
 /// threshold applies, keeping the roundtrip map (thread-local) so the
 /// reply can be restored; pass through untouched when unmasked.
-fn mask_outgoing(
+///
+/// `pub(crate)`: reused by `agent_panel.rs` (§3.3, same reasoning as
+/// `decide_threshold` above).
+pub(crate) fn mask_outgoing(
     payload: String,
     threshold: Option<f64>,
 ) -> (String, Option<HashMap<String, String>>) {

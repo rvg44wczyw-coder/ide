@@ -29,6 +29,7 @@
 //! non-supporting terminal is simply ignored, the same as any other
 //! sequence this crate already sends such a terminal.
 
+mod agent_panel;
 mod ai_panel;
 mod app;
 mod blame_gutter;
@@ -309,6 +310,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> std::
         // `Stopped`/`Terminated` event lands even while the Debug tool
         // window is closed.
         app.poll_debug();
+        // Same reasoning, for the local agentic assistant's in-flight
+        // tool-calling loop (`docs/features/tui-local-agent.md` §2.2) --
+        // unconditional so a run keeps stepping through tool calls even
+        // while the AI dock tab shows another view.
+        app.poll_agent();
         if crossterm::event::poll(Duration::from_millis(100))? {
             match crossterm::event::read()? {
                 Event::Key(key) => {

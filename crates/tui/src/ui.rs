@@ -21,6 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::agent_panel::AgentDisplayEntry;
 use crate::ai_panel::AiDisplayMessage;
 use crate::app::{
     ActionFormField, App, AppScreen, BottomDockState, BottomDockTab, ChangesFocus, ClaudeView,
@@ -350,6 +351,9 @@ pub fn render(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if app.debug_panel_open {
         render_debug_panel(frame, app, size);
     }
+    if app.agent.pending_approval.is_some() {
+        render_agent_approval_popup(frame, app, size);
+    }
 }
 
 /// The terminal-grid rows/cols implied by the current terminal
@@ -538,6 +542,7 @@ fn render_bottom_dock(
         &[
             (BottomDockTab::Docker, "Docker"),
             (BottomDockTab::Ai, "AI"),
+            (BottomDockTab::Agent, "Agent"),
             (BottomDockTab::Kubernetes, "Kubernetes"),
             (BottomDockTab::Cargo, "Cargo"),
             (BottomDockTab::CustomActions, "Custom Actions"),
@@ -550,6 +555,7 @@ fn render_bottom_dock(
     match dock.tab {
         BottomDockTab::Docker => render_docker_panel(frame, app, rows[1], hits),
         BottomDockTab::Ai => render_ai_panel(frame, app, rows[1]),
+        BottomDockTab::Agent => render_agent_panel(frame, app, rows[1]),
         BottomDockTab::Kubernetes => render_k8s_panel(frame, app, rows[1], hits),
         BottomDockTab::Cargo => render_cargo_panel(frame, app, rows[1]),
         BottomDockTab::CustomActions => render_custom_actions_panel(frame, app, rows[1], hits),
@@ -2159,6 +2165,131 @@ fn render_ai_panel(frame: &mut Frame, app: &App, area: Rect) {
         "> "
     };
     frame.render_widget(Paragraph::new(format!("{prefix}{}", app.ai.input)), rows[2]);
+}
+
+/// `BottomDockTab::Agent` (`docs/features/tui-local-agent.md` §2) --
+/// mirrors `render_ai_panel`'s exact three-row shape (status/history/
+/// input); the status row additionally shows the current `PermissionMode`
+/// since that's this panel's own extra piece of visible state.
+fn render_agent_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(LayoutDirection::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let theme = app.theme.theme();
+
+    let mode = match app.agent.mode {
+        ide_ai::PermissionMode::Plan => "Plan",
+        ide_ai::PermissionMode::Approve => "Approve",
+        ide_ai::PermissionMode::Auto => "Auto",
+    };
+    let mut status = format!("mode: {mode}");
+    if app.agent.is_in_flight() {
+        status.push_str("  |  running");
+    }
+    let status_style = if app.agent.is_in_flight() {
+        Style::default().fg(theme.chip_fg)
+    } else {
+        Style::default().fg(theme.gutter_fg)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(status, status_style))),
+        rows[0],
+    );
+
+    let lines: Vec<Line> = app
+        .agent
+        .history
+        .iter()
+        .map(|e| agent_entry_line(e, theme))
+        .collect();
+    let visible_rows = rows[1].height as usize;
+    frame.render_widget(
+        Paragraph::new(tail_window(&lines, visible_rows, app.agent.history_scroll).to_vec()),
+        rows[1],
+    );
+
+    let prefix = if app.agent.is_in_flight() {
+        "(running) > "
+    } else {
+        "> "
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{prefix}{}", app.agent.input)),
+        rows[2],
+    );
+}
+
+fn agent_entry_line(entry: &AgentDisplayEntry, theme: &crate::theme::Theme) -> Line<'static> {
+    match entry {
+        AgentDisplayEntry::User(t) => Line::from(format!("> {t}")),
+        AgentDisplayEntry::ModelText(t) => Line::from(t.clone()),
+        AgentDisplayEntry::ToolStarted(t) => Line::from(Span::styled(
+            format!("-- {t} --"),
+            Style::default().fg(theme.gutter_fg),
+        )),
+        AgentDisplayEntry::ToolFinished(t) => Line::from(t.clone()),
+        AgentDisplayEntry::ToolCallParseFailed(t) => Line::from(Span::styled(
+            format!("(unparsed tool call) {t}"),
+            Style::default().fg(theme.gutter_fg),
+        )),
+        AgentDisplayEntry::Error(t) => Line::from(Span::styled(
+            format!("error: {t}"),
+            Style::default().fg(theme.error_text),
+        )),
+    }
+}
+
+/// `AgentPanel::pending_approval` (`docs/features/tui-local-agent.md`
+/// §2.2) -- a blocking modal, same near-fullscreen shape `render_refactor_
+/// preview` uses (a mutating tool's diff/argv preview can run long), no
+/// scroll support: `pending_approval_preview`'s content is already bounded
+/// by `diff_text`'s own truncation, so v1 skips a dedicated scroll field.
+fn render_agent_approval_popup(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(tool) = app.agent.pending_approval.as_ref() else {
+        return;
+    };
+    let width = area.width.saturating_sub(4).max(20);
+    let height = area.height.saturating_sub(4).max(3);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Approve {}?  (y: approve, n/Esc: deny)",
+        agent_tool_label(tool)
+    ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines: Vec<Line> = app
+        .agent
+        .pending_approval_preview()
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn agent_tool_label(tool: &ide_agent::AgentTool) -> &'static str {
+    match tool {
+        ide_agent::AgentTool::ReadFile { .. } => "ReadFile",
+        ide_agent::AgentTool::SearchCode { .. } => "SearchCode",
+        ide_agent::AgentTool::ListDirectory { .. } => "ListDirectory",
+        ide_agent::AgentTool::ReadDockerLogs { .. } => "ReadDockerLogs",
+        ide_agent::AgentTool::EditFile { .. } => "EditFile",
+        ide_agent::AgentTool::RunShellCommand { .. } => "RunShellCommand",
+        ide_agent::AgentTool::DebugControl(_) => "DebugControl",
+    }
 }
 
 fn ai_message_line(message: &AiDisplayMessage, theme: &crate::theme::Theme) -> Line<'static> {

@@ -235,6 +235,8 @@ pub enum Action {
     ToggleClaudePanel,
     ToggleAiPanel,
     TriggerFimAutocomplete,
+    ToggleAgentPanel,
+    CycleAgentMode,
     ToggleDockerPanel,
     ToggleK8sPanel,
     ManageCustomActions,
@@ -922,6 +924,23 @@ pub fn commands() -> &'static [Command] {
             action: Action::TriggerFimAutocomplete,
         },
         Command {
+            id: "AgentPanel",
+            title: "Agent",
+            // Palette-only, same reasoning as `AiPanel`/`ClaudePanel` above
+            // -- no JetBrains-keymap entry covers a tool-calling assistant
+            // dock tab (`docs/features/tui-local-agent.md` §2.2).
+            binding: None,
+            action: Action::ToggleAgentPanel,
+        },
+        Command {
+            id: "CycleAgentMode",
+            title: "Cycle Agent Permission Mode (Plan/Approve/Auto)",
+            // Palette-only, same reasoning as `AgentPanel` above -- this is
+            // a novel permission-level control with no JetBrains analogue.
+            binding: None,
+            action: Action::CycleAgentMode,
+        },
+        Command {
             id: "ToggleDockerPanel",
             title: "Docker",
             // Palette-only, same reasoning as `ToggleCargoPanel`/
@@ -1480,6 +1499,8 @@ pub fn menu_groups() -> &'static [MenuGroup] {
                 Item("ToggleK8sPanel"),
                 Item("ClaudePanel"),
                 Item("AiPanel"),
+                Item("AgentPanel"),
+                Item("CycleAgentMode"),
             ],
         },
         MenuGroup {

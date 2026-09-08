@@ -44,6 +44,28 @@ pub struct RoleRoute {
     pub model_override: Option<String>,
 }
 
+/// The three agentic-mode permission levels the user asked for
+/// (`docs/features/tui-local-agent.md`, T56 §2.1). Defined here, not in
+/// `ide-agent` (which owns the rest of the agent loop's public API and
+/// depends on `ide-ai`), because `AiConfig` -- this crate's persisted
+/// per-project settings struct -- needs to store one as `agent_mode`;
+/// `ide-ai` cannot depend on `ide-agent` without a dependency cycle.
+/// `ide-agent` re-exports this type rather than redefining it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PermissionMode {
+    /// Read-only: mutating tools are refused outright. The default mode:
+    /// the safest mode is the out-of-the-box one.
+    #[default]
+    Plan,
+    /// Every mutating tool call pauses and asks for approval; read-only
+    /// tools always run immediately regardless of mode.
+    Approve,
+    /// Every tool call, mutating or not, runs immediately -- no pause, no
+    /// confirmation, except the fixed `RunShellCommand` allowlist gate
+    /// (§3.4 of the same doc) which this mode does not override.
+    Auto,
+}
+
 /// Persisted AI provider config. All fields default on `serde(default)`,
 /// so a partial file (hand-edited, older version) still loads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +102,11 @@ pub struct AiConfig {
     /// add a second cloud round-trip per turn competing for the same
     /// free-tier rate-limit budget the r7 router fix exists to conserve.
     pub classifier_provider: ProviderId,
+    /// The agentic AI panel's permission level (T56). Default `Plan` --
+    /// the safest mode is the out-of-the-box one, matching every other
+    /// opt-in default this feature set has established (e.g. `auto_route:
+    /// false`).
+    pub agent_mode: PermissionMode,
 }
 
 impl Default for AiConfig {
@@ -97,6 +124,7 @@ impl Default for AiConfig {
             role_routes: HashMap::new(),
             auto_route: false,
             classifier_provider: ProviderId::OllamaLocal,
+            agent_mode: PermissionMode::Plan,
         }
     }
 }

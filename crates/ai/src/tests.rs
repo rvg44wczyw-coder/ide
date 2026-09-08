@@ -21,8 +21,8 @@ use serde_json::json;
 use crate::{
     classify_status, default_model, extract_delta, extract_text, fallback_eligible,
     parse_sse_event, resolve_role_route, truncate, try_in_order, AiConfig, AiError, ChatDelta,
-    ChatMessage, ChatRequest, ChatRole, DefaultRouter, HttpTransport, Provider, ProviderId,
-    RoleRoute, Router, SseParser, TaskRole, WireRequest, OLLAMA_FIM_MODEL,
+    ChatMessage, ChatRequest, ChatRole, DefaultRouter, HttpTransport, PermissionMode, Provider,
+    ProviderId, RoleRoute, Router, SseParser, TaskRole, WireRequest, OLLAMA_FIM_MODEL,
 };
 
 /// Minimal self-cleaning temp project root (creates `.ide/`).
@@ -168,6 +168,26 @@ fn load_partial_file_defaults_missing_fields() {
     assert_eq!(config.provider_order, vec![ProviderId::OllamaLocal]);
     assert_eq!(config.local_sanitize_threshold, 4.0);
     assert_eq!(config.cloud_sanitize_threshold, 3.5);
+    assert_eq!(config.agent_mode, PermissionMode::Plan);
+}
+
+#[test]
+fn agent_mode_defaults_to_plan_the_safest_mode() {
+    assert_eq!(AiConfig::default().agent_mode, PermissionMode::Plan);
+    assert_eq!(PermissionMode::default(), PermissionMode::Plan);
+}
+
+#[test]
+fn permission_mode_round_trips_through_json() {
+    for mode in [
+        PermissionMode::Plan,
+        PermissionMode::Approve,
+        PermissionMode::Auto,
+    ] {
+        let json = serde_json::to_string(&mode).unwrap();
+        let back: PermissionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(mode, back);
+    }
 }
 
 #[test]
@@ -188,6 +208,7 @@ fn serialize_roundtrip_preserves_config() {
         role_routes,
         auto_route: true,
         classifier_provider: ProviderId::Groq,
+        agent_mode: PermissionMode::Approve,
     };
     let json = serde_json::to_string(&config).unwrap();
     assert!(

@@ -21,6 +21,7 @@ use ide_core::{
 };
 use ide_lsp::{Diagnostic, Location, LspRequest, Position, Symbol};
 
+use crate::agent_panel::AgentPanel;
 use crate::ai_panel::{AiContext, AiPanel};
 use crate::cargo_panel::{CargoCommand, CargoPanel};
 use crate::claude_panel::ClaudePanel;
@@ -860,6 +861,7 @@ pub(crate) enum BottomDockTab {
     #[default]
     Docker,
     Ai,
+    Agent,
     Kubernetes,
     Cargo,
     CustomActions,
@@ -871,7 +873,8 @@ impl BottomDockTab {
     pub(crate) fn next(self) -> Self {
         match self {
             BottomDockTab::Docker => BottomDockTab::Ai,
-            BottomDockTab::Ai => BottomDockTab::Kubernetes,
+            BottomDockTab::Ai => BottomDockTab::Agent,
+            BottomDockTab::Agent => BottomDockTab::Kubernetes,
             BottomDockTab::Kubernetes => BottomDockTab::Cargo,
             BottomDockTab::Cargo => BottomDockTab::CustomActions,
             BottomDockTab::CustomActions => BottomDockTab::Problems,
@@ -884,7 +887,8 @@ impl BottomDockTab {
         match self {
             BottomDockTab::Docker => BottomDockTab::GitLog,
             BottomDockTab::Ai => BottomDockTab::Docker,
-            BottomDockTab::Kubernetes => BottomDockTab::Ai,
+            BottomDockTab::Agent => BottomDockTab::Ai,
+            BottomDockTab::Kubernetes => BottomDockTab::Agent,
             BottomDockTab::Cargo => BottomDockTab::Kubernetes,
             BottomDockTab::CustomActions => BottomDockTab::Cargo,
             BottomDockTab::Problems => BottomDockTab::CustomActions,
@@ -1140,6 +1144,11 @@ pub struct App {
     /// the mirror-the-Claude-panel shape that doc requests.
     pub(crate) ai: AiPanel,
     pub(crate) ai_panel_open: bool,
+    /// `docs/features/tui-local-agent.md` §2: the local agentic assistant
+    /// dock tab. `agent_panel_open` mirrors `ai_panel_open`'s derived
+    /// dock-tab-visibility shape.
+    pub(crate) agent: AgentPanel,
+    pub(crate) agent_panel_open: bool,
     /// A FIM autocomplete request currently awaiting its background thread
     /// (`docs/features/tui-ai-hybrid-fallback.md` §3.4): the receiver and
     /// the (path, offset) to insert into once it lands, matched against
@@ -1397,6 +1406,8 @@ impl App {
             new_claude_terminal: None,
             ai: AiPanel::new(project.root().to_path_buf()),
             ai_panel_open: false,
+            agent: AgentPanel::new(project.root().to_path_buf()),
+            agent_panel_open: false,
             fim_rx: None,
             fim_target: None,
             code_actions: None,
@@ -2431,6 +2442,13 @@ impl App {
         self.debug_adapter_config_popup = None;
         self.debug.show_launch_popup = false;
         self.clone_panel_open = false;
+        // A pending approval is a blocking decision the paused `AgentLoop`
+        // is waiting on -- opening some other overlay must not silently
+        // discard it (leaving the loop wedged forever with nothing on
+        // screen still asking), so treat it as a deny, mirroring what
+        // `Esc` already does at the popup-priority chain's own rank
+        // (`docs/features/tui-local-agent.md` §2.2).
+        self.agent.deny_pending();
     }
 
     /// Shared "ensure `left_dock` is open, on `tab`, and focused" mechanics
@@ -2663,6 +2681,126 @@ impl App {
             _ => {}
         }
         LoopSignal::Continue
+    }
+
+    /// `Action::ToggleAgentPanel` (`docs/features/tui-local-agent.md` §2):
+    /// mirrors `toggle_ai_panel` exactly for the `Agent` dock tab.
+    fn toggle_agent_panel(&mut self) {
+        let opening = !matches!(
+            self.bottom_dock.as_ref().map(|dock| dock.tab),
+            Some(BottomDockTab::Agent)
+        );
+        self.agent_panel_open = opening;
+        if opening {
+            self.show_bottom_dock_tab(BottomDockTab::Agent);
+            self.focus = Focus::BottomDock;
+        } else {
+            self.bottom_dock = None;
+            self.focus = Focus::Editor;
+        }
+    }
+
+    /// The Agent dock tab's single-line text field, mirroring
+    /// `handle_ai_panel_key` -- `Esc` closes the dock (cancelling an
+    /// in-flight run first, same wedged-transport backstop), `Enter`
+    /// submits, `Backspace`/chars edit the input, Up/Down/PageUp/PageDown
+    /// scroll history. A pending approval intercepts every key first (see
+    /// the pre-keymap `Esc` block in `handle_key` for why this method is
+    /// only reached once `pending_approval` is `None`).
+    fn handle_agent_panel_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Esc => {
+                if self.agent.is_in_flight() {
+                    self.agent.cancel();
+                }
+                self.toggle_agent_panel();
+            }
+            KeyCode::Backspace => {
+                self.agent.input.pop();
+            }
+            KeyCode::Enter => {
+                if self.agent.is_in_flight() {
+                    self.notify("one agent request at a time");
+                } else {
+                    let prompt = std::mem::take(&mut self.agent.input);
+                    self.agent.submit(prompt);
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.agent.input.push(c);
+            }
+            KeyCode::Up => self.agent.history_scroll = self.agent.history_scroll.saturating_add(1),
+            KeyCode::Down => {
+                self.agent.history_scroll = self.agent.history_scroll.saturating_sub(1)
+            }
+            KeyCode::PageUp => {
+                self.agent.history_scroll = self.agent.history_scroll.saturating_add(10)
+            }
+            KeyCode::PageDown => {
+                self.agent.history_scroll = self.agent.history_scroll.saturating_sub(10)
+            }
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// The pending-approval popup (`docs/features/tui-local-agent.md`
+    /// §2.2): `y`/`Enter` approves, `n`/`Esc` denies -- both resume the
+    /// paused `AgentLoop` via `AgentPanel::approve_pending`/
+    /// `deny_pending`.
+    fn handle_agent_approval_key(&mut self, key: KeyEvent) -> LoopSignal {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.agent.approve_pending()
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.agent.deny_pending(),
+            _ => {}
+        }
+        LoopSignal::Continue
+    }
+
+    /// Drains the agent's event channel once per frame (mirrors
+    /// `poll_ai`/`poll_debug`). The one event `AgentPanel::poll` can't
+    /// resolve itself -- `AwaitingDebugExecution` -- is run here, on the
+    /// main thread, against this struct's own real `DebugPanel` session
+    /// (`docs/features/tui-local-agent.md` §2.2: the agent may only
+    /// control a session a human already started).
+    pub fn poll_agent(&mut self) {
+        if let Some(action) = self.agent.poll() {
+            let result = self.run_debug_action_for_agent(action);
+            self.agent.resolve_debug(result);
+        }
+    }
+
+    /// Maps one `ide_agent::DebugAction` onto the same `DebugPanel`
+    /// methods the human-facing debug keybindings already call.
+    /// `ToggleBreakpoint` works with no active session (mirroring
+    /// `DebugPanel::toggle_breakpoint`'s own doc comment); every other
+    /// variant requires one, surfaced as `ToolError::NoDebugSession`
+    /// rather than silently no-op'ing (§4: never pretend an action
+    /// happened when it didn't).
+    fn run_debug_action_for_agent(
+        &mut self,
+        action: ide_agent::DebugAction,
+    ) -> Result<String, ide_agent::ToolError> {
+        use ide_agent::DebugAction;
+        if let DebugAction::ToggleBreakpoint { path, line } = action {
+            self.debug.toggle_breakpoint(PathBuf::from(path), line);
+            return Ok("breakpoint toggled".to_string());
+        }
+        if !self.debug.is_active() {
+            return Err(ide_agent::ToolError::NoDebugSession);
+        }
+        match action {
+            DebugAction::Resume => self.debug.resume(),
+            DebugAction::StepOver => self.debug.step_over(),
+            DebugAction::StepInto => self.debug.step_into(),
+            DebugAction::StepOut => self.debug.step_out(),
+            DebugAction::Pause => self.debug.pause(),
+            DebugAction::Stop => self.debug.stop(),
+            DebugAction::ToggleBreakpoint { .. } => unreachable!(),
+        }
+        Ok("ok".to_string())
     }
 
     /// The active buffer's selection feeds the AI context (§3.2: copied at
@@ -6653,6 +6791,15 @@ impl App {
         {
             return self.handle_k8s_panel_key(key);
         }
+        // The agent's pending-approval popup (`docs/features/
+        // tui-local-agent.md` §2.2) is a true nested modal, same rank as
+        // Docker's/K8s's own confirm popups two blocks up: it must fully
+        // intercept every key, not just `Esc`, and regardless of which
+        // dock tab currently has focus (a background agent run can pause
+        // on approval while the user is looking at a different tab).
+        if self.agent.pending_approval.is_some() {
+            return self.handle_agent_approval_key(key);
+        }
         // The AI dock tab's own `Esc`-closes rule (`docs/features/
         // tui-ai-hybrid-fallback.md` §2.4) can't be reached through the
         // post-keymap dispatch below: `Esc` is already globally bound to
@@ -6669,6 +6816,18 @@ impl App {
             )
         {
             return self.handle_ai_panel_key(key);
+        }
+        // Same reasoning as the AI block just above, for the Agent dock
+        // tab (`docs/features/tui-local-agent.md` §2).
+        if key.code == KeyCode::Esc
+            && self.agent_panel_open
+            && self.focus == Focus::BottomDock
+            && matches!(
+                self.bottom_dock.as_ref().map(|dock| dock.tab),
+                Some(BottomDockTab::Agent)
+            )
+        {
+            return self.handle_agent_panel_key(key);
         }
         // `docs/features/tui-screen-navigation.md` §3.5, T44 -- must sit
         // *before* the global keymap lookup below: `Esc` is already bound
@@ -6817,6 +6976,7 @@ impl App {
                 && (self.k8s.confirm.is_some()
                     || self.k8s.scale_input.is_some()
                     || self.k8s.picker.is_some()))
+            || self.agent.pending_approval.is_some()
     }
 
     /// Mirrors `handle_key`'s own popup-priority chain above (every branch
@@ -7399,6 +7559,7 @@ impl App {
                 };
             }
             BottomDockTab::Ai
+            | BottomDockTab::Agent
             | BottomDockTab::Cargo
             | BottomDockTab::Problems
             | BottomDockTab::GitLog => {}
@@ -7590,6 +7751,8 @@ impl App {
             Action::ToggleClaudePanel => self.toggle_claude_panel(),
             Action::ToggleAiPanel => self.toggle_ai_panel(),
             Action::TriggerFimAutocomplete => self.trigger_fim_autocomplete(),
+            Action::ToggleAgentPanel => self.toggle_agent_panel(),
+            Action::CycleAgentMode => self.agent.cycle_mode(),
             Action::Debug => self.trigger_debug(),
             Action::ResumeProgram => self.debug.resume(),
             Action::StepOver => self.debug.step_over(),
@@ -7664,6 +7827,9 @@ impl App {
                     }
                     BottomDockTab::Ai => {
                         self.handle_ai_panel_key(key);
+                    }
+                    BottomDockTab::Agent => {
+                        self.handle_agent_panel_key(key);
                     }
                     BottomDockTab::Kubernetes => {
                         self.handle_k8s_panel_key(key);
@@ -21171,7 +21337,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_bottom_dock_key_tab_cycles_through_all_seven_tabs_and_back() {
+    fn handle_bottom_dock_key_tab_cycles_through_all_eight_tabs_and_back() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::ToggleDockerPanel);
@@ -21179,6 +21345,7 @@ mod tests {
 
         let forward = [
             BottomDockTab::Ai,
+            BottomDockTab::Agent,
             BottomDockTab::Kubernetes,
             BottomDockTab::Cargo,
             BottomDockTab::CustomActions,
