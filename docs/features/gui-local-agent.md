@@ -139,11 +139,34 @@ impl AgentPanel {
     /// already merged), which reads the "old" file content via a raw
     /// `self.root.join(path)` + `std::fs::read_to_string` with **no path
     /// validation**, this method's `EditFile` branch MUST validate `path`
-    /// via `ide_dap::path::validate_path(&self.root, path)` -- the same
-    /// check `ToolExecutor::execute` itself already applies -- before
-    /// ever touching disk. A path that fails validation returns
+    /// against the project root the run was submitted with, before ever
+    /// touching disk. A path that fails validation returns
     /// `AgentApprovalPreview::Text("path escapes the project root")`,
     /// never a read.
+    ///
+    /// As shipped, that root is `self.active_root: Option<PathBuf>` -- not
+    /// `self.root` as an earlier draft of this section said (this struct
+    /// has no cached root field at all, per its own `AgentPanel` layout
+    /// above). `active_root` is the canonicalized `project_root` `submit`
+    /// most recently captured for the run currently in flight or paused
+    /// on `pending_approval`, set in `submit` and cleared everywhere
+    /// `rx`/`handle` are -- it exists specifically so this method's read
+    /// validates against the *same* root the run was submitted with, even
+    /// if the user has since switched to a different open project
+    /// mid-run, rather than against `self.project`'s possibly-newer
+    /// current root. The validation itself is `validated_edit_target`
+    /// (`crates/ui/src/agent_panel.rs`), not plain `ide_dap::path::
+    /// validate_path` -- that helper requires the target to already
+    /// exist and would reject every legitimate new-file-creation edit, so
+    /// this method canonicalizes the full target first (closing a
+    /// leaf-symlink gap `validate_path` alone wouldn't need to worry
+    /// about but this fallback shape does) and falls back to
+    /// parent-only canonicalization only for a target that doesn't yet
+    /// exist in any form (`std::fs::symlink_metadata` first rules out a
+    /// dangling symlink already sitting at the leaf -- `docs/
+    /// security-findings/rust-ui-dev-gui-local-agent-2026-09-08.md`,
+    /// findings 1 and 3, both found and closed during this doc's own
+    /// `hacker` pass).
     ///
     /// Why this matters and isn't hypothetical: `AgentTool::EditFile`'s
     /// `path` is model-supplied and can be steered by indirect prompt
@@ -457,6 +480,31 @@ quality finding; all three fixed in place above:
    `render_diff` call site (`std::slice::from_ref(diff: &FileDiff)`,
    unboxed) does. Fixed: dropped the `Box`, cited `std::slice::from_ref`
    explicitly.
+
+**Post-merge correction (2026-09-08, after implementation)**: finding 1's
+fix above (`ide_dap::path::validate_path(&self.root, path)`) described the
+doc's intent, but `AgentPanel` has no `self.root` field at all (per its
+own struct layout in §2.1) — `validate_path` also requires the target to
+already exist, which would reject every legitimate new-file-creation edit.
+The implementing role resolved this by adding `active_root: Option<PathBuf>`
+(the canonicalized root of the run currently in flight or paused on
+`pending_approval`, set in `submit`, cleared alongside `rx`/`handle`) and a
+crate-local `validated_edit_target` helper instead of the literal
+`validate_path` call — §2.1 above now describes the as-shipped design.
+Three real gaps in that helper were found and closed across a three-round
+`hacker` pass after merge review (`docs/security-findings/
+rust-ui-dev-gui-local-agent-2026-09-08.md`): a dangling leaf symlink
+defeating the new-file fallback (High), an empty/`"."` path resolving to
+the project root (Medium), and an existing in-root subdirectory resolving
+the same way (Low) — all closed, live-verified, `hacker` clean as of
+commit `48d9d62`. Separately, three rounds of `rev` closed an
+approval-modal input-bypass chain spanning keyboard shortcuts,
+`command_palette_confirm`'s unconditional local dispatch, and — found only
+on the third pass — the native macOS menu bar's `poll_menu_events`, which
+calls `run_command` directly and is entirely outside egui's canvas, so
+`egui::Modal`'s backdrop can never intercept it; the final fix guards
+`run_command` itself, the one choke point every dispatch path converges
+on, rather than another scattered per-call-site check.
 
 **[controversial, resolved]** Introducing `egui::Modal` for exactly one
 popup is a real, visible interaction inconsistency with every other
