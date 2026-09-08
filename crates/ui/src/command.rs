@@ -227,6 +227,8 @@ pub enum CommandAction {
     ManageCustomActions,
     ToggleCustomActionsToolWindow,
     ToggleAiToolWindow,
+    ToggleAgentToolWindow,
+    CycleAgentMode,
     TriggerFimAutocomplete,
     ToggleTodoToolWindow,
     ShowLogPanel,
@@ -380,6 +382,16 @@ pub fn commands() -> &'static [Command] {
                 action: CommandAction::ToggleTheme,
             },
             Command {
+                id: "CycleAgentMode",
+                title: "Cycle Agent Permission Mode",
+                category: "View",
+                // Cycles `Plan -> Approve -> Auto -> Plan`
+                // (`AgentPanel::cycle_mode`) -- same "cycle a mode" shape
+                // as `ToggleTheme` right above.
+                binding: None,
+                action: CommandAction::CycleAgentMode,
+            },
+            Command {
                 id: "RefreshTree",
                 title: "Refresh",
                 category: "File",
@@ -503,6 +515,13 @@ pub fn commands() -> &'static [Command] {
                 category: "Window",
                 binding: None,
                 action: CommandAction::ToggleAiToolWindow,
+            },
+            Command {
+                id: "ToggleAgentToolWindow",
+                title: "Agent",
+                category: "Window",
+                binding: None,
+                action: CommandAction::ToggleAgentToolWindow,
             },
             Command {
                 id: "ToggleTodoToolWindow",

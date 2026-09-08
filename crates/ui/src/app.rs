@@ -234,6 +234,10 @@ pub enum BottomView {
     /// `claude` CLI and is untouched by this feature. Extends the row
     /// above to nine-way.
     Ai,
+    /// Local agentic assistant: tool-calling chat via `ide-agent`
+    /// (`docs/features/gui-local-agent.md`, G10) -- distinct from `Ai`
+    /// above, which never calls a tool. Extends the row above to ten-way.
+    Agent,
 }
 
 /// The Manage Custom Actions popup's state (`docs/features/
@@ -862,6 +866,11 @@ pub struct IdeApp {
     claude_terminals: ClaudeTerminalPanel,
     claude_view: ClaudeView,
     ai: crate::ai_panel::AiPanel,
+    /// Local agentic assistant dock tab (`docs/features/gui-local-agent.md`,
+    /// G10) -- a third, independent AI surface from `claude`/`ai`: tool-
+    /// calling (`ReadFile`/`EditFile`/`RunShellCommand`/etc.) instead of
+    /// plain chat.
+    agent: crate::agent_panel::AgentPanel,
     /// FIM autocomplete's in-flight request (`docs/features/
     /// gui-ai-orchestration.md` §2.3). `None` when idle.
     fim_rx: Option<std::sync::mpsc::Receiver<Result<String, ide_ai::AiError>>>,
@@ -1255,6 +1264,7 @@ impl IdeApp {
             claude_terminals: ClaudeTerminalPanel::default(),
             claude_view: ClaudeView::Chat,
             ai: crate::ai_panel::AiPanel::default(),
+            agent: crate::agent_panel::AgentPanel::default(),
             fim_rx: None,
             fim_target: None,
             git: GitPanel::default(),
@@ -1525,6 +1535,60 @@ impl IdeApp {
                 text[selection.start()..selection.end()].to_string(),
             )
         }
+    }
+
+    /// Drains `self.agent`'s event channel once per frame, mirroring
+    /// `crates/tui/src/app.rs::poll_agent` exactly. For the one event the
+    /// panel can't resolve itself (`AwaitingDebugExecution`), runs the
+    /// action against this struct's own real `self.debug: DebugPanel`
+    /// session on this (the only) thread `IdeApp` ever runs on, then
+    /// resolves it before the next poll tick (`docs/features/
+    /// gui-local-agent.md` §2.2). Returns whether anything changed, so the
+    /// caller can `ctx.request_repaint()`.
+    fn poll_agent(&mut self) -> bool {
+        let Some(action) = self.agent.poll() else {
+            return false;
+        };
+        let result = self.run_debug_action_for_agent(action);
+        self.agent.resolve_debug(result);
+        true
+    }
+
+    /// Byte-for-byte the same mapping as `ide-tui`'s own
+    /// `run_debug_action_for_agent`: `ToggleBreakpoint` works with no
+    /// active session, every other variant requires one
+    /// (`ToolError::NoDebugSession` otherwise, never a silent no-op).
+    fn run_debug_action_for_agent(
+        &mut self,
+        action: ide_agent::DebugAction,
+    ) -> Result<String, ide_agent::ToolError> {
+        use ide_agent::DebugAction;
+        if let DebugAction::ToggleBreakpoint { path, line } = action {
+            self.debug.toggle_breakpoint(PathBuf::from(path), line);
+            return Ok("breakpoint toggled".to_string());
+        }
+        if !self.debug.is_active() {
+            return Err(ide_agent::ToolError::NoDebugSession);
+        }
+        match action {
+            DebugAction::Resume => self.debug.resume(),
+            DebugAction::StepOver => self.debug.step_over(),
+            DebugAction::StepInto => self.debug.step_into(),
+            DebugAction::StepOut => self.debug.step_out(),
+            DebugAction::Pause => self.debug.pause(),
+            DebugAction::Stop => self.debug.stop(),
+            DebugAction::ToggleBreakpoint { .. } => unreachable!(),
+        }
+        Ok("ok".to_string())
+    }
+
+    /// Mirrors `current_ai_context`'s shape: reads the pending approval's
+    /// preview for `render_agent_approval_popup` to draw. Empty
+    /// (`AgentApprovalPreview::Text(String::new())`) when nothing is
+    /// pending -- callers must gate rendering on
+    /// `self.agent.pending_approval.is_some()` first.
+    fn current_agent_approval(&self) -> crate::agent_panel::AgentApprovalPreview {
+        self.agent.pending_approval_preview()
     }
 
     /// `TriggerFimAutocomplete` (`docs/features/gui-ai-orchestration.md`
@@ -2166,6 +2230,13 @@ impl IdeApp {
         // Not just `editing_index` -- see `CustomActionsPopupState::
         // editing_index`'s doc comment for why the whole popup resets.
         self.custom_actions_popup = CustomActionsPopupState::default();
+        // No popup state to reset here (unlike custom actions above): the
+        // agent panel's own approval popup only ever reflects a *live*
+        // in-flight run, which already keeps the project root it was
+        // submitted with regardless of what `self.project` switches to
+        // (`AgentPanel::active_root`, `agent_panel.rs`) -- only the mode
+        // label itself is project-scoped state to reload here.
+        self.agent.mode = ide_ai::AiConfig::load(root).agent_mode;
 
         let workspace =
             project_settings::read::<WorkspaceState>(root, ProjectSettingsFile::Workspace)
@@ -5075,6 +5146,8 @@ impl IdeApp {
             CommandAction::ManageCustomActions => self.project.is_some(),
             CommandAction::ToggleCustomActionsToolWindow => self.project.is_some(),
             CommandAction::ToggleAiToolWindow => self.project.is_some(),
+            CommandAction::ToggleAgentToolWindow => self.project.is_some(),
+            CommandAction::CycleAgentMode => self.project.is_some(),
             CommandAction::TriggerFimAutocomplete => {
                 self.active_tab.is_some() && self.view_mode == ViewMode::Editor
             }
@@ -5127,13 +5200,27 @@ impl IdeApp {
 
     /// The dispatch table: matches `action` to the existing per-action
     /// method. Does not itself check `is_command_enabled` -- every call
-    /// site (`handle_shortcuts`, `command_palette_confirm`) checks first,
-    /// same as each of these methods already no-ops safely on its own
-    /// preconditions. Takes `ctx` only for `ToggleTheme`, which needs it to
-    /// re-apply `egui::Visuals` immediately (`toggle_theme`'s existing
-    /// signature) -- every other action already gets everything it needs
-    /// from `self`.
+    /// site (`handle_shortcuts`, `command_palette_confirm`,
+    /// `SearchEverywhereRow::Action`'s handler) checks first, same as each
+    /// of these methods already no-ops safely on its own preconditions.
+    /// Takes `ctx` only for `ToggleTheme`, which needs it to re-apply
+    /// `egui::Visuals` immediately (`toggle_theme`'s existing signature) --
+    /// every other action already gets everything it needs from `self`.
+    ///
+    /// The one check this method *does* make itself, deliberately, is the
+    /// agent-approval guard below: `handle_shortcuts`'s own early return
+    /// (`docs/features/gui-local-agent.md` §4) only covers dispatch through
+    /// the egui canvas. `crates/ui/src/app/menu.rs`'s native macOS menu bar
+    /// calls `run_command` directly from a `poll_menu_event` callback that
+    /// is entirely outside egui's rendering -- `egui::Modal`'s backdrop
+    /// can't block a click that never goes through egui's input pipeline.
+    /// Putting the guard here, at the one place every dispatch path already
+    /// converges, closes that (and any future call site) in one spot
+    /// instead of relying on each new caller to remember it individually.
     fn run_command(&mut self, action: CommandAction, ctx: &egui::Context) {
+        if self.agent.pending_approval.is_some() {
+            return;
+        }
         match action {
             CommandAction::SaveAll => self.try_save_active(),
             CommandAction::Undo => self.undo_active(),
@@ -5242,6 +5329,14 @@ impl IdeApp {
                 self.toggle_bottom_tool_window(BottomView::CustomActions)
             }
             CommandAction::ToggleAiToolWindow => self.toggle_bottom_tool_window(BottomView::Ai),
+            CommandAction::ToggleAgentToolWindow => {
+                self.toggle_bottom_tool_window(BottomView::Agent)
+            }
+            CommandAction::CycleAgentMode => {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    self.agent.cycle_mode(&root);
+                }
+            }
             CommandAction::TriggerFimAutocomplete => self.trigger_fim_autocomplete(),
             CommandAction::ToggleTodoToolWindow => self.toggle_bottom_tool_window(BottomView::Todo),
             CommandAction::ShowLogPanel => self.toggle_bottom_tool_window(BottomView::Log),
@@ -5725,6 +5820,7 @@ mod tests {
             claude_terminals: ClaudeTerminalPanel::default(),
             claude_view: ClaudeView::Chat,
             ai: crate::ai_panel::AiPanel::default(),
+            agent: crate::agent_panel::AgentPanel::default(),
             fim_rx: None,
             fim_target: None,
             git: GitPanel::default(),
@@ -7791,6 +7887,163 @@ b
             app.current_ai_context(),
             crate::ai_panel::AiContext::Selection(t) if t == "hello"
         ));
+    }
+
+    #[test]
+    fn is_command_enabled_toggle_agent_tool_window_and_cycle_agent_mode_need_a_project() {
+        let app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::ToggleAgentToolWindow));
+        assert!(!app.is_command_enabled(CommandAction::CycleAgentMode));
+    }
+
+    #[test]
+    fn run_command_toggle_agent_tool_window_switches_the_bottom_view() {
+        let mut app = app_without_gui();
+        app.run_command(
+            CommandAction::ToggleAgentToolWindow,
+            &egui::Context::default(),
+        );
+        assert!(app.show_bottom_tool_window);
+        assert_eq!(app.bottom_view, BottomView::Agent);
+    }
+
+    #[test]
+    fn run_command_cycle_agent_mode_is_a_noop_with_no_project() {
+        let mut app = app_without_gui();
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Plan);
+        app.run_command(CommandAction::CycleAgentMode, &egui::Context::default());
+        assert_eq!(
+            app.agent.mode,
+            ide_ai::PermissionMode::Plan,
+            "cycle_mode needs a root to persist to; no project open must not change it"
+        );
+    }
+
+    #[test]
+    fn run_command_cycle_agent_mode_cycles_and_persists_with_a_project_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.run_command(CommandAction::CycleAgentMode, &egui::Context::default());
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Approve);
+        assert_eq!(
+            ide_ai::AiConfig::load(dir.path()).agent_mode,
+            ide_ai::PermissionMode::Approve
+        );
+    }
+
+    #[test]
+    fn load_project_settings_loads_the_persisted_agent_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ide_ai::AiConfig {
+            agent_mode: ide_ai::PermissionMode::Auto,
+            ..Default::default()
+        };
+        ide_core::project_settings::write(
+            dir.path(),
+            ide_core::project_settings::ProjectSettingsFile::Ai,
+            &config,
+        )
+        .unwrap();
+        let mut app = app_without_gui();
+        app.load_project_settings(dir.path(), &egui::Context::default());
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Auto);
+    }
+
+    fn sample_project_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}").unwrap();
+        dir
+    }
+
+    #[test]
+    fn run_debug_action_for_agent_toggle_breakpoint_works_with_no_session() {
+        let mut app = app_without_gui();
+        assert!(!app.debug.is_active());
+
+        let result = app.run_debug_action_for_agent(ide_agent::DebugAction::ToggleBreakpoint {
+            path: "a.rs".into(),
+            line: 3,
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            app.debug.breakpoints.get(&PathBuf::from("a.rs")),
+            Some(&vec![3])
+        );
+    }
+
+    #[test]
+    fn run_debug_action_for_agent_other_actions_require_an_active_session() {
+        let mut app = app_without_gui();
+        assert!(!app.debug.is_active());
+
+        let result = app.run_debug_action_for_agent(ide_agent::DebugAction::Resume);
+
+        assert_eq!(result, Err(ide_agent::ToolError::NoDebugSession));
+    }
+
+    #[test]
+    fn poll_agent_dispatches_awaiting_debug_execution_to_the_real_debug_panel() {
+        let dir = sample_project_dir();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        let tx = app.agent.test_arm_event_channel(dir.path().to_path_buf());
+        tx.send(ide_agent::AgentEvent::AwaitingDebugExecution {
+            action: ide_agent::DebugAction::ToggleBreakpoint {
+                path: "a.rs".into(),
+                line: 7,
+            },
+        })
+        .unwrap();
+
+        assert!(app.poll_agent());
+
+        assert_eq!(
+            app.debug.breakpoints.get(&PathBuf::from("a.rs")),
+            Some(&vec![7]),
+            "poll_agent must run the action against the real DebugPanel, not a stub"
+        );
+    }
+
+    #[test]
+    fn poll_agent_returns_false_with_nothing_in_flight() {
+        let mut app = app_without_gui();
+        assert!(!app.poll_agent());
+    }
+
+    #[test]
+    fn current_agent_approval_is_empty_with_nothing_pending() {
+        let app = app_without_gui();
+        assert_eq!(
+            app.current_agent_approval(),
+            crate::agent_panel::AgentApprovalPreview::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn run_command_is_a_no_op_while_an_agent_approval_is_pending() {
+        let dir = sample_project_dir();
+        let mut app = app_without_gui();
+        app.project = Some(ide_core::Project::open(dir.path()).unwrap());
+        app.agent.pending_approval = Some(ide_agent::AgentTool::RunShellCommand {
+            program: "true".into(),
+            args: vec![],
+        });
+        let zen_before = app.zen_mode;
+
+        // `menu.rs`'s native-macOS-menu-bar path calls `run_command`
+        // directly, bypassing `handle_shortcuts` entirely -- this must be
+        // blocked at the `run_command` choke point itself, not just at the
+        // egui-canvas keyboard dispatch path (`docs/features/
+        // gui-local-agent.md` §4).
+        app.run_command(CommandAction::ToggleZenMode, &egui::Context::default());
+
+        assert_eq!(
+            app.zen_mode, zen_before,
+            "run_command must no-op while an agent tool approval is pending"
+        );
+        assert!(app.agent.pending_approval.is_some());
     }
 
     #[test]

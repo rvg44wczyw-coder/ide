@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.36.1", features = ["persistence"] }
 egui = "0.36.1"
+ide-agent = { path = "../agent" }
 ide-ai = { path = "../ai" }
 ide-core = { path = "../core" }
 ide-dap = { path = "../dap" }

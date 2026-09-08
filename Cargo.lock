@@ -2407,6 +2407,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "ide-agent",
  "ide-ai",
  "ide-core",
  "ide-dap",

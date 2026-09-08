@@ -156,6 +156,28 @@ fn command_line(command: &str, args: &[String]) -> String {
 
 impl IdeApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // The agent approval popup (`docs/features/gui-local-agent.md` §4)
+        // must outrank *every* other check in this function -- mirrors
+        // `crates/tui/src/app.rs::handle_key`'s own identical precedent and
+        // its own doc comment on why: `egui::Modal`'s backdrop only blocks
+        // *pointer* input, so without this early return a background
+        // keyboard shortcut could still fire via the registry dispatch loop
+        // further down (`rev` fix round 1, `75f5f2d`), and -- what that
+        // narrower fix missed, since it only touched `suppress_dispatch` --
+        // `FindAction` is deliberately exempt from `suppress_dispatch`
+        // (so it can still open/reset the palette while some *other*
+        // overlay is open), which means a user could still open the
+        // command palette while approval is pending and then confirm a
+        // selection via the palette's own local Enter-handling below
+        // (`command_palette_confirm` calls `run_command` unconditionally,
+        // independent of `suppress_dispatch` entirely). Approve/Deny are
+        // deliberately not commands (mouse-only, doc §2.3), so returning
+        // here can't itself resolve the pending decision -- it only stops
+        // every other keyboard-triggered action from executing while that
+        // decision is still pending.
+        if self.agent.pending_approval.is_some() {
+            return;
+        }
         let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
         // Palette-local list navigation: widget-internal, not a
@@ -3877,6 +3899,111 @@ impl IdeApp {
         }
     }
 
+    /// The Agent dock tab (`docs/features/gui-local-agent.md` §2.4): the
+    /// local agentic assistant, tool-calling instead of `render_ai_panel`'s
+    /// plain chat. `self.agent.poll()` is **not** called here: it runs
+    /// unconditionally every frame regardless of whether this tab is
+    /// visible, same reasoning as `self.ai.poll()` (a background run
+    /// shouldn't stall while another tab is focused) -- this function only
+    /// renders the already-current state.
+    fn render_agent_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let tokens = self.theme.tokens();
+        let danger = tokens.color.danger;
+        egui::ScrollArea::vertical()
+            .max_height(ui.available_height() - 60.0)
+            .show(ui, |ui| {
+                for entry in &self.agent.history {
+                    match entry {
+                        crate::agent_panel::AgentDisplayEntry::User(text) => {
+                            ui.label(format!("you: {text}"));
+                        }
+                        crate::agent_panel::AgentDisplayEntry::ModelText(text) => {
+                            ui.label(format!("agent: {text}"));
+                        }
+                        crate::agent_panel::AgentDisplayEntry::ToolStarted(text) => {
+                            ui.weak(format!("-> {text}"));
+                        }
+                        crate::agent_panel::AgentDisplayEntry::ToolFinished(text) => {
+                            ui.weak(format!("<- {text}"));
+                        }
+                        crate::agent_panel::AgentDisplayEntry::ToolCallParseFailed(text) => {
+                            ui.colored_label(danger, format!("could not parse tool call: {text}"));
+                        }
+                        crate::agent_panel::AgentDisplayEntry::Error(text) => {
+                            ui.colored_label(danger, text);
+                        }
+                    }
+                }
+            });
+        ui.horizontal(|ui| {
+            let mode_label = match self.agent.mode {
+                ide_ai::PermissionMode::Plan => "Plan",
+                ide_ai::PermissionMode::Approve => "Approve",
+                ide_ai::PermissionMode::Auto => "Auto",
+            };
+            if ui.button(format!("Mode: {mode_label}")).clicked() {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    self.agent.cycle_mode(&root);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let response = ui.text_edit_singleline(&mut self.agent.input);
+            let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Send").clicked() || submitted) && !self.agent.input.trim().is_empty() {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    let prompt = std::mem::take(&mut self.agent.input);
+                    self.agent.submit(prompt, &root);
+                }
+            }
+            // Manual recovery backstop for a wedged request -- same
+            // contract as `AiPanel::cancel`.
+            if self.agent.is_in_flight() && ui.button("Cancel").clicked() {
+                self.agent.cancel();
+            }
+        });
+        if self.agent.is_in_flight() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Gates on `self.agent.pending_approval.is_some()`, same early-return
+    /// shape as `render_discard_confirm_popup`. Unlike every other popup in
+    /// this crate (all plain, non-modal `egui::Window`), this one uses
+    /// `egui::Modal` deliberately (`docs/features/gui-local-agent.md` §4):
+    /// this is the one popup gating irreversible, model-proposed subprocess
+    /// execution and file mutation, and a plain `Window` does not block
+    /// input to the rest of the UI by default in this crate's egui version
+    /// (0.36.1) -- `Modal`'s own doc comment is explicit that its backdrop
+    /// does.
+    fn render_agent_approval_popup(&mut self, ctx: &egui::Context) {
+        if self.agent.pending_approval.is_none() {
+            return;
+        }
+        let tokens = self.theme.tokens();
+        let preview = self.current_agent_approval();
+        egui::Modal::new(egui::Id::new("agent_approval_modal")).show(ctx, |ui| {
+            ui.heading("Agent wants to run a tool");
+            match &preview {
+                crate::agent_panel::AgentApprovalPreview::Diff(diff) => {
+                    Self::render_diff(ui, tokens, std::slice::from_ref(diff));
+                }
+                crate::agent_panel::AgentApprovalPreview::Text(text)
+                | crate::agent_panel::AgentApprovalPreview::NoDiff(text) => {
+                    ui.label(text);
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Approve").clicked() {
+                    self.agent.approve_pending();
+                }
+                if ui.button("Deny").clicked() {
+                    self.agent.deny_pending();
+                }
+            });
+        });
+    }
+
     /// Char-cell sizing for the terminal grid, mirroring `editor/mod.rs`'s
     /// monospace font-metrics approach (`docs/features/claude-terminal.md`
     /// §3.3's last paragraph).
@@ -4882,6 +5009,16 @@ impl IdeApp {
                     {
                         self.bottom_view = BottomView::Ai;
                     }
+                    if Self::render_boxed_tab(
+                        ui,
+                        tokens,
+                        self.bottom_view == BottomView::Agent,
+                        "Agent",
+                    )
+                    .clicked()
+                    {
+                        self.bottom_view = BottomView::Agent;
+                    }
                 });
                 ui.separator();
                 match self.bottom_view {
@@ -4894,6 +5031,7 @@ impl IdeApp {
                     BottomView::Todo => self.render_todo_panel(ui),
                     BottomView::Log => self.render_log_viewer(ui),
                     BottomView::Ai => self.render_ai_panel(ctx, ui),
+                    BottomView::Agent => self.render_agent_panel(ctx, ui),
                 }
             });
     }
@@ -5041,6 +5179,16 @@ impl eframe::App for IdeApp {
         if self.ai.poll() {
             ctx.request_repaint();
         }
+        // Drained every frame regardless of whether the Agent dock tab is
+        // open, same reasoning as `self.ai.poll()` right above (`docs/
+        // features/gui-local-agent.md` §2.2): a background agent run can
+        // pause on `AwaitingDebugExecution`/`AwaitingApproval` while the
+        // user is looking at a different panel, and the approval popup
+        // itself is drawn unconditionally below regardless of which bottom
+        // tab is selected.
+        if self.poll_agent() {
+            ctx.request_repaint();
+        }
         if self.poll_fim() {
             ctx.request_repaint();
         }
@@ -5148,6 +5296,11 @@ impl eframe::App for IdeApp {
         self.render_debug_launch_popup(&ctx);
         self.render_confirm_modal(&ctx);
         self.render_startup_restore_prompt(&ctx);
+        // Drawn last (and via `egui::Modal`, unlike every popup above) so
+        // it renders on top of literally everything -- input priority has
+        // to match that z-order, or the popup would be visible but
+        // unreachable (`docs/features/gui-local-agent.md` §4).
+        self.render_agent_approval_popup(&ctx);
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {

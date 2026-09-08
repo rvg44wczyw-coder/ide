@@ -66,6 +66,7 @@ const MENU_GROUPS: &[MenuGroup] = &[
         title: "View",
         items: &[
             Some("ToggleTheme"),
+            Some("CycleAgentMode"),
             Some("ToggleZenMode"),
             None,
             Some("ToggleProjectToolWindow"),
@@ -76,6 +77,7 @@ const MENU_GROUPS: &[MenuGroup] = &[
             Some("ToggleClaudeToolWindow"),
             Some("ToggleCustomActionsToolWindow"),
             Some("ToggleAiToolWindow"),
+            Some("ToggleAgentToolWindow"),
             Some("ToggleTodoToolWindow"),
             Some("ShowLogPanel"),
         ],
