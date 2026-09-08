@@ -1859,7 +1859,7 @@ fn render_keymap_popup(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let block = Block::default().borders(Borders::ALL).title(format!(
-        "Keymap: {}  (Enter: rebind, Delete: reset, Esc: close)",
+        "Settings: Keymap: {}  (Enter: rebind, Delete: reset, \u{2190}\u{2192}: Appearance, Esc: close)",
         state.query
     ));
     render_scrollable_list(frame, items, block, popup, state.selected);
@@ -1931,7 +1931,7 @@ fn render_theme_popup(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Theme  (Enter: apply, Esc: close)");
+        .title("Settings: Appearance  (Enter: apply, \u{2190}\u{2192}: Keymap, Esc: close)");
     render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
