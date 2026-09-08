@@ -76,7 +76,16 @@ fn truncate(s: &str, max: usize) -> String {
 /// `/usr/bin/git`"; only a bare name, resolved via `$PATH` the same way a
 /// human typing it at a shell would get, is trustworthy here.
 fn is_allowlisted(program: &str, args: &[String]) -> bool {
-    if std::path::Path::new(program).components().count() != 1 {
+    // A plain `components().count() != 1` check alone lets a *trailing*
+    // separator slip through (`"cargo/"` still parses as one `Normal`
+    // component to `Path`) -- checked directly against the raw string
+    // instead (`rev` round 3, 2026-09-08). Not independently known to be
+    // exploitable (`Command::new("cargo/")` fails outright: POSIX treats a
+    // trailing-slash program name as requiring the target to be a
+    // directory, and a directory can't be exec'd), but this function's own
+    // job is to be the one trustworthy gate here, so it shouldn't accept
+    // anything its own doc comment claims to reject.
+    if program.contains('/') {
         return false;
     }
     let stem = std::path::Path::new(program)
@@ -1065,6 +1074,11 @@ mod tests {
         assert!(!is_allowlisted("/usr/bin/git", &["status".into()]));
         assert!(!is_allowlisted("./git", &["status".into()]));
         assert!(!is_allowlisted("./docker", &["ps".into()]));
+        // Regression for `rev` round 3: a trailing separator on an
+        // otherwise-bare name (`Path::components()` doesn't count it as a
+        // second component) must be rejected too, even though it isn't
+        // independently known to be exploitable.
+        assert!(!is_allowlisted("cargo/", &[]));
         // A bare name -- no separator at all -- is still eligible and
         // still resolves via `$PATH`, same as before.
         assert!(is_allowlisted("cargo", &[]));
