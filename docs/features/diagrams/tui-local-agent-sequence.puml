@@ -1,0 +1,57 @@
+@startuml tui-local-agent-sequence
+title T56: Local Agentic IDE Assistant — one user message
+
+actor User
+participant "ide-tui\nagent_panel.rs\n(main thread)" as Panel
+participant "ide-agent\nAgentLoop\n(background thread)" as Loop
+participant "ide-agent\nToolExecutor" as Exec
+participant "ide-ai\nRouter" as Router
+participant "path validation /\nsubprocess / fs" as Real
+participant "ide-tui\nDebugPanel\n(main thread)" as Debug
+
+User -> Panel: submit prompt
+Panel -> Loop: run(history, order, model_override, sanitized)
+
+loop up to MAX_AGENT_STEPS
+  Loop -> Router: chat(history, order, model_override, sanitized)
+  Router --> Loop: ModelDelta* (streamed)
+  Loop -> Panel: AgentEvent::ModelDelta
+  Router --> Loop: full turn text
+
+  alt turn contains a valid tool_call block
+    Loop -> Loop: parse AgentTool
+
+    alt tool.is_mutating() && (mode == Approve, or\nmode == Auto && RunShellCommand not allowlisted)
+      Loop -> Panel: AgentEvent::AwaitingApproval { tool }
+      Panel -> User: show diff / command preview
+      User -> Panel: Approve or Deny
+      Panel -> Loop: resume_with_decision(approved)
+    end
+
+    alt mode == Plan && tool.is_mutating()
+      Loop -> Loop: ToolError::Denied (never reaches Exec or Debug)
+    else tool == DebugControl(action) (any mode, once approved if applicable)
+      Loop -> Panel: AgentEvent::AwaitingDebugExecution { action }
+      Panel -> Debug: run action against the real,\nalready-running session\n(e.g. toggle_breakpoint/step_over)
+      Debug --> Panel: outcome (or "no session")
+      Panel -> Loop: resume_with_debug_result(result)
+    else approved, or read-only, or Auto-allowlisted RunShellCommand
+      Loop -> Exec: execute(tool)
+      Exec -> Real: validate_path / spawn / fs
+      Real --> Exec: result
+      Exec --> Loop: ToolResult (truncated to MAX_TOOL_RESULT_CHARS)
+    end
+
+    Loop -> Loop: mask_outgoing(tool result)
+    Loop -> Panel: AgentEvent::ToolFinished { result }
+    Loop -> Loop: append masked result to history, loop again
+  else fenced tool_call block present but malformed
+    Loop -> Panel: AgentEvent::ToolCallParseFailed { raw_snippet }
+    Loop -> Panel: AgentEvent::Done { reason: FinalAnswer }
+  else plain text answer, no fence at all
+    Loop -> Panel: AgentEvent::Done { reason: FinalAnswer }
+  end
+end
+
+Loop -> Panel: AgentEvent::Done { reason: StepLimitReached } : if cap hit
+@enduml

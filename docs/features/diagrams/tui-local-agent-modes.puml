@@ -1,0 +1,35 @@
+@startuml tui-local-agent-modes
+title T56: PermissionMode x tool.is_mutating() decision table
+
+start
+if (tool.is_mutating()?) then (no -- read-only)
+  :run immediately;
+  stop
+else (yes -- mutating)
+  if (mode == Plan?) then (yes)
+    :ToolError::Denied\n(fed back to model, never runs);
+    stop
+  elseif (mode == Approve?) then (yes)
+    :AgentEvent::AwaitingApproval;
+    if (user approves?) then (yes)
+      :run;
+    else (no)
+      :ToolError::UserDenied;
+    endif
+    stop
+  else (mode == Auto)
+    if (tool == RunShellCommand AND program/subcommand\nNOT on the fixed allowlist? (§3.4)) then (yes)
+      :AgentEvent::AwaitingApproval\n(same gate as Approve mode,\nnot configurable, applies even in Auto);
+      if (user approves?) then (yes)
+        :run;
+      else (no)
+        :ToolError::UserDenied;
+      endif
+      stop
+    else (no -- allowlisted, or any other mutating tool)
+      :run immediately;
+      stop
+    endif
+  endif
+endif
+@enduml

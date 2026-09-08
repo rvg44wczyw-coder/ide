@@ -1,0 +1,40 @@
+@startuml tui-local-agent-plan
+title T56: Local Agentic IDE Assistant -- implementation plan (dev-chain)
+
+start
+
+:Doc written\n(docs/features/tui-local-agent.md);
+repeat
+  :rev -- DOCUMENTATION REVIEW\n(quality + security checklist + devil's-advocate);
+backward: fix doc per findings;
+repeat while (changes needed?) is (yes) not (no)
+
+partition "rust-tui-dev: crates/agent (new crate) + crates/tui wiring" {
+  :Scaffold ide-agent crate\n(Cargo.toml, workspace member);
+  :AgentTool / DebugAction / PermissionMode\n/ ToolError / ToolResult types;
+  :ToolExecutor\n(path validation, fs, subprocess,\nAuto-mode RunShellCommand allowlist --\nnever touches DapClient, see DebugSessionHandle);
+  :Tool-call protocol parser\n(fenced tool_call block -> AgentTool);
+  :AgentLoop\n(run / resume_with_decision,\nMAX_AGENT_STEPS, masking reuse);
+  :agent_panel.rs\n(AgentEvent draining, history rendering,\nmode selector);
+  :Approval popup\n(diff preview for EditFile,\nargv preview for RunShellCommand);
+  :Wiring into app.rs\n(new command/keybinding,\nAiConfig.agent_mode field);
+  :Unit tests, coverage >=80%,\nfmt/clippy/build/test green;
+  :Commit on branch;
+}
+
+repeat
+  :rev -- CODE REVIEW of ide-agent + ide-tui wiring;
+backward: fix findings;
+repeat while (changes needed?) is (yes) not (no)
+
+repeat
+  :hacker -- adversarial pass\n(subprocess exec, path traversal,\nAuto-mode allowlist bypass attempts,\nPlan/Approve/Auto mode gating,\nDoS via MAX_AGENT_STEPS/MAX_TOOL_RESULT_CHARS);
+backward: fix findings, re-run rev, then hacker again;
+repeat while (findings?) is (yes) not (no, clean)
+
+:merge into base branch;
+:Update docs/roadmap.md section 10 row (T56);
+:Report to user -- not pushed,\nmerge to main still needs a session\nrooted at /Users/ivs/rust/ide;
+
+stop
+@enduml
