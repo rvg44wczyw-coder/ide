@@ -3814,6 +3814,69 @@ impl IdeApp {
         }
     }
 
+    /// The AI Orchestration dock tab (`docs/features/
+    /// gui-ai-orchestration.md` §2.5): a second, independent AI surface
+    /// from `render_claude_chat` above -- talks directly to Ollama/Gemini/
+    /// Groq/GitHub Models via `ide-ai`'s HTTP client rather than shelling
+    /// out to the `claude` CLI. `self.ai.poll()`/`self.poll_fim()` are
+    /// **not** called here: they run unconditionally every frame
+    /// regardless of whether this tab is visible (§2.5's own rationale,
+    /// next to `self.custom_actions.poll()` below) -- this function only
+    /// renders the already-current state and requests a repaint while a
+    /// request is still in flight.
+    fn render_ai_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        let danger = self.theme.tokens().color.danger;
+        egui::ScrollArea::vertical()
+            .max_height(ui.available_height() - 60.0)
+            .show(ui, |ui| {
+                for msg in &self.ai.history {
+                    match msg {
+                        crate::ai_panel::AiDisplayMessage::User(text) => {
+                            ui.label(format!("you: {text}"));
+                        }
+                        crate::ai_panel::AiDisplayMessage::Assistant(text) => {
+                            ui.label(format!("assistant: {text}"));
+                        }
+                        crate::ai_panel::AiDisplayMessage::StreamingDelta(_) => {}
+                        crate::ai_panel::AiDisplayMessage::ProviderServing(_) => {}
+                        crate::ai_panel::AiDisplayMessage::Error(text) => {
+                            ui.colored_label(danger, text);
+                        }
+                    }
+                }
+            });
+        if let Some(provider) = &self.ai.provider {
+            ui.label(format!(
+                "served by: {provider}{}",
+                if self.ai.sanitized {
+                    " (sanitized)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        ui.horizontal(|ui| {
+            let response = ui.text_edit_singleline(&mut self.ai.input);
+            let submitted = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Send").clicked() || submitted) && !self.ai.input.trim().is_empty() {
+                if let Some(root) = self.project.as_ref().map(|p| p.root().to_path_buf()) {
+                    let prompt = std::mem::take(&mut self.ai.input);
+                    let context = self.current_ai_context();
+                    self.ai.submit(prompt, context, &root);
+                }
+            }
+            // Manual recovery backstop for a wedged request -- same
+            // contract as `ide-tui`'s Esc-while-in-flight handling
+            // (`ai_panel.rs::cancel`'s own doc comment).
+            if self.ai.is_in_flight() && ui.button("Cancel").clicked() {
+                self.ai.cancel();
+            }
+        });
+        if self.ai.is_in_flight() {
+            ctx.request_repaint();
+        }
+    }
+
     /// Char-cell sizing for the terminal grid, mirroring `editor/mod.rs`'s
     /// monospace font-metrics approach (`docs/features/claude-terminal.md`
     /// §3.3's last paragraph).
@@ -4723,7 +4786,7 @@ impl IdeApp {
     /// strip above this panel now live at the bottom of the left/right
     /// stripes (`render_project_rail`/`render_claude_rail`) instead, per
     /// real IntelliJ's side-anchored convention.
-    fn render_bottom_panel(&mut self, ui: &mut egui::Ui) {
+    fn render_bottom_panel(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let open = self.is_tool_window_open(ToolWindow::Bottom);
         if !open {
             return;
@@ -4814,6 +4877,11 @@ impl IdeApp {
                     {
                         self.bottom_view = BottomView::Log;
                     }
+                    if Self::render_boxed_tab(ui, tokens, self.bottom_view == BottomView::Ai, "AI")
+                        .clicked()
+                    {
+                        self.bottom_view = BottomView::Ai;
+                    }
                 });
                 ui.separator();
                 match self.bottom_view {
@@ -4825,6 +4893,7 @@ impl IdeApp {
                     BottomView::CustomActions => self.render_custom_actions_panel(ui),
                     BottomView::Todo => self.render_todo_panel(ui),
                     BottomView::Log => self.render_log_viewer(ui),
+                    BottomView::Ai => self.render_ai_panel(ctx, ui),
                 }
             });
     }
@@ -4962,6 +5031,19 @@ impl eframe::App for IdeApp {
         if self.custom_actions.poll() {
             ctx.request_repaint();
         }
+        // Drained every frame regardless of whether the AI dock tab is
+        // open, same reasoning as `claude_terminals.poll()` below:
+        // `AiPanel`'s channel carries many `StreamingDelta`s per reply
+        // (streaming), not one whole-reply message like `ClaudePanel`'s,
+        // so leaving it undrained while the tab is closed would grow
+        // unboundedly for as long as the tab stayed closed (`docs/
+        // features/gui-ai-orchestration.md` §2.5).
+        if self.ai.poll() {
+            ctx.request_repaint();
+        }
+        if self.poll_fim() {
+            ctx.request_repaint();
+        }
         // Drained every frame regardless of whether the Claude rail is
         // open (`docs/security-findings/rust-ui-dev-claude-terminal-
         // 2026-08-25.md` finding 3): a terminal tab's PTY keeps producing
@@ -5025,7 +5107,7 @@ impl eframe::App for IdeApp {
             self.render_status_bar(ui);
             self.render_project_rail(ui);
             self.render_claude_rail(&ctx, ui);
-            self.render_bottom_panel(ui);
+            self.render_bottom_panel(&ctx, ui);
         }
 
         egui::CentralPanel::default().show(ui, |ui| {

@@ -35,7 +35,7 @@ use ide_core::{
     editorconfig, replace_all, replace_one, syntax_for_path, Buffer, Charset, DirEntry,
     EditorConfig, EndOfLine, FileWatcher, IndentStyle, IndentUnit, LanguageConfig,
     PathSearchOptions, Project, ReplaceResult, SearchQuery, Selection, Selections, SyntaxRules,
-    WatchEvent,
+    Transaction, WatchEvent,
 };
 use ide_lsp::{
     position_is_within_interface, Diagnostic, DiagnosticSeverity, GotoKind, InlayHint, Location,
@@ -228,6 +228,12 @@ pub enum BottomView {
     /// Git log viewer (`docs/features/gui-log-viewer.md`, `E3`)
     /// -- extends the row above to eight-way.
     Log,
+    /// AI Orchestration chat: hybrid local/cloud provider chat via
+    /// `ide-ai` (`docs/features/gui-ai-orchestration.md`, G9) -- distinct
+    /// from the `ToolWindow::Claude` overlay, which shells to the external
+    /// `claude` CLI and is untouched by this feature. Extends the row
+    /// above to nine-way.
+    Ai,
 }
 
 /// The Manage Custom Actions popup's state (`docs/features/
@@ -855,6 +861,17 @@ pub struct IdeApp {
     claude: ClaudePanel,
     claude_terminals: ClaudeTerminalPanel,
     claude_view: ClaudeView,
+    ai: crate::ai_panel::AiPanel,
+    /// FIM autocomplete's in-flight request (`docs/features/
+    /// gui-ai-orchestration.md` §2.3). `None` when idle.
+    fim_rx: Option<std::sync::mpsc::Receiver<Result<String, ide_ai::AiError>>>,
+    /// `(path, byte offset)` recorded at request time -- copied, never
+    /// read live, mirroring `AiContext`'s own "copied at submit time"
+    /// invariant. Consumed by `poll_fim` when the result arrives; a path
+    /// mismatch against the now-active tab drops the insertion (mirrors
+    /// `ide-tui`'s own `apply_fim_insert`: "a tab switch mid-request drops
+    /// the stale insertion").
+    fim_target: Option<(PathBuf, usize)>,
     git: GitPanel,
     lsp: LspBridge,
     debug: DebugPanel,
@@ -1237,6 +1254,9 @@ impl IdeApp {
             claude: ClaudePanel::default(),
             claude_terminals: ClaudeTerminalPanel::default(),
             claude_view: ClaudeView::Chat,
+            ai: crate::ai_panel::AiPanel::default(),
+            fim_rx: None,
+            fim_target: None,
             git: GitPanel::default(),
             lsp: LspBridge::default(),
             debug: DebugPanel::default(),
@@ -1484,6 +1504,118 @@ impl IdeApp {
             open: true,
             ..Default::default()
         };
+    }
+
+    /// The active tab's selection feeds the AI context (`docs/features/
+    /// gui-ai-orchestration.md` §2.3, mirrors `ide-tui`'s own
+    /// `current_ai_context`): a non-empty primary selection is sent as a
+    /// selection, otherwise the whole file. Copied at submit time, never
+    /// read live mid-request (§3.3's invariant, carried over unchanged).
+    fn current_ai_context(&self) -> crate::ai_panel::AiContext {
+        let Some(idx) = self.active_tab else {
+            return crate::ai_panel::AiContext::None;
+        };
+        let buf = &self.tabs[idx].buffer;
+        let text = buf.text().to_string();
+        let selection = buf.text_buffer().selections().primary();
+        if selection.is_empty() {
+            crate::ai_panel::AiContext::WholeFile(text)
+        } else {
+            crate::ai_panel::AiContext::Selection(
+                text[selection.start()..selection.end()].to_string(),
+            )
+        }
+    }
+
+    /// `TriggerFimAutocomplete` (`docs/features/gui-ai-orchestration.md`
+    /// §2.3): sends the text before and after the caret to the local
+    /// Ollama FIM endpoint in a background thread, capped at
+    /// `MAX_FIM_CONTEXT_CHARS` per side inside `ide-ai`. One request at a
+    /// time; a non-Ollama local config surfaces the adapter's
+    /// `Unsupported` error through `self.error` (this crate's one-line
+    /// status-bar field -- `ide-tui`'s equivalent uses its own `notify`).
+    fn trigger_fim_autocomplete(&mut self) {
+        if self.fim_rx.is_some() {
+            self.error = Some("FIM autocomplete already in progress".to_string());
+            return;
+        }
+        let Some(idx) = self.active_tab else {
+            self.error = Some("no active file to complete".to_string());
+            return;
+        };
+        let Some(path) = self.tabs[idx].buffer.path().map(Path::to_path_buf) else {
+            self.error = Some("no active file to complete".to_string());
+            return;
+        };
+        let text = self.tabs[idx].buffer.text().to_string();
+        let offset = self.active_cursor_offset.unwrap_or(text.len());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.fim_rx = Some(rx);
+        self.fim_target = Some((path, offset));
+        let prefix = text[..offset].to_string();
+        let suffix = text[offset..].to_string();
+        std::thread::spawn(move || {
+            let provider = ide_ai::Provider::from_id(ide_ai::ProviderId::OllamaLocal);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("current-thread tokio runtime builds");
+            let response = rt.block_on(provider.complete_fim(&prefix, &suffix));
+            let _ = tx.send(response);
+        });
+    }
+
+    /// Call once per frame, unconditionally (§2.5): drains the FIM channel
+    /// and applies the insertion (or records the error) when a result
+    /// arrives. Returns `true` when it consumed a result, so the caller
+    /// can `ctx.request_repaint()`.
+    fn poll_fim(&mut self) -> bool {
+        let Some(rx) = self.fim_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(text)) => {
+                let target = self.fim_target.take();
+                self.fim_rx = None;
+                if let Some((path, offset)) = target {
+                    self.apply_fim_insert(&path, offset, &text);
+                }
+                true
+            }
+            Ok(Err(e)) => {
+                self.fim_target = None;
+                self.fim_rx = None;
+                self.error = Some(format!("FIM autocomplete failed: {e}"));
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.fim_target = None;
+                self.fim_rx = None;
+                self.error = Some("FIM autocomplete thread ended unexpectedly".to_string());
+                true
+            }
+        }
+    }
+
+    /// Finds the tab by `path` -- not `active_tab`'s index, which may have
+    /// changed since the request was sent -- and inserts `text` at
+    /// `offset` as a single undo step; a no-op if that tab was closed in
+    /// the meantime, or `text` is empty (mirrors `ide-tui`'s own
+    /// `apply_fim_insert`). Does not re-validate `offset` against the
+    /// buffer's current length beyond what `Transaction::insert`'s own
+    /// bounds-checking already does -- an accepted, unguarded v1
+    /// simplification carried over unchanged from the TUI (§4).
+    fn apply_fim_insert(&mut self, path: &Path, offset: usize, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(idx) = self.tabs.iter().position(|t| t.buffer.path() == Some(path)) else {
+            return;
+        };
+        let transaction = Transaction::insert(offset, text.to_string());
+        self.tabs[idx].buffer.apply(transaction);
     }
 
     /// No-op if `index` is out of range. `args` are rejoined with single
@@ -4942,6 +5074,10 @@ impl IdeApp {
             CommandAction::GitWorktrees => self.project.is_some(),
             CommandAction::ManageCustomActions => self.project.is_some(),
             CommandAction::ToggleCustomActionsToolWindow => self.project.is_some(),
+            CommandAction::ToggleAiToolWindow => self.project.is_some(),
+            CommandAction::TriggerFimAutocomplete => {
+                self.active_tab.is_some() && self.view_mode == ViewMode::Editor
+            }
             CommandAction::ToggleTodoToolWindow => self.project.is_some(),
             CommandAction::ShowLogPanel => self.project.is_some(),
             // Not a no-op-and-silently-fail: `is_command_enabled` gates the
@@ -5105,6 +5241,8 @@ impl IdeApp {
             CommandAction::ToggleCustomActionsToolWindow => {
                 self.toggle_bottom_tool_window(BottomView::CustomActions)
             }
+            CommandAction::ToggleAiToolWindow => self.toggle_bottom_tool_window(BottomView::Ai),
+            CommandAction::TriggerFimAutocomplete => self.trigger_fim_autocomplete(),
             CommandAction::ToggleTodoToolWindow => self.toggle_bottom_tool_window(BottomView::Todo),
             CommandAction::ShowLogPanel => self.toggle_bottom_tool_window(BottomView::Log),
             CommandAction::ShowFileHistory => self.trigger_show_file_history(),
@@ -5586,6 +5724,9 @@ mod tests {
             claude: ClaudePanel::default(),
             claude_terminals: ClaudeTerminalPanel::default(),
             claude_view: ClaudeView::Chat,
+            ai: crate::ai_panel::AiPanel::default(),
+            fim_rx: None,
+            fim_target: None,
             git: GitPanel::default(),
             lsp: LspBridge::default(),
             debug: DebugPanel::default(),
@@ -7585,6 +7726,217 @@ b
         );
         assert!(app.show_bottom_tool_window);
         assert_eq!(app.bottom_view, BottomView::CustomActions);
+    }
+
+    #[test]
+    fn is_command_enabled_toggle_ai_tool_window_needs_a_project() {
+        let app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::ToggleAiToolWindow));
+    }
+
+    #[test]
+    fn run_command_toggle_ai_tool_window_switches_the_bottom_view() {
+        let mut app = app_without_gui();
+        app.run_command(CommandAction::ToggleAiToolWindow, &egui::Context::default());
+        assert!(app.show_bottom_tool_window);
+        assert_eq!(app.bottom_view, BottomView::Ai);
+    }
+
+    #[test]
+    fn is_command_enabled_trigger_fim_autocomplete_needs_an_active_editor_tab() {
+        let mut app = app_without_gui();
+        assert!(!app.is_command_enabled(CommandAction::TriggerFimAutocomplete));
+        app.tabs.push(Tab::untitled("Untitled".to_string()));
+        app.active_tab = Some(0);
+        assert!(app.is_command_enabled(CommandAction::TriggerFimAutocomplete));
+        app.view_mode = ViewMode::SourceControl;
+        assert!(!app.is_command_enabled(CommandAction::TriggerFimAutocomplete));
+    }
+
+    #[test]
+    fn current_ai_context_is_none_with_no_active_tab() {
+        let app = app_without_gui();
+        assert!(matches!(
+            app.current_ai_context(),
+            crate::ai_panel::AiContext::None
+        ));
+    }
+
+    #[test]
+    fn current_ai_context_is_whole_file_with_an_empty_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        assert!(matches!(
+            app.current_ai_context(),
+            crate::ai_panel::AiContext::WholeFile(t) if t == "hello world"
+        ));
+    }
+
+    #[test]
+    fn current_ai_context_is_selection_with_a_non_empty_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        let idx = app.active_tab.unwrap();
+        app.tabs[idx]
+            .buffer
+            .text_buffer_mut()
+            .set_selections(Selections::single(Selection::new(0, 5)));
+        assert!(matches!(
+            app.current_ai_context(),
+            crate::ai_panel::AiContext::Selection(t) if t == "hello"
+        ));
+    }
+
+    #[test]
+    fn trigger_fim_autocomplete_errors_when_already_in_flight() {
+        let mut app = app_without_gui();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.fim_rx = Some(rx);
+        app.trigger_fim_autocomplete();
+        assert_eq!(
+            app.error.as_deref(),
+            Some("FIM autocomplete already in progress")
+        );
+    }
+
+    #[test]
+    fn trigger_fim_autocomplete_errors_with_no_active_tab() {
+        let mut app = app_without_gui();
+        app.trigger_fim_autocomplete();
+        assert_eq!(app.error.as_deref(), Some("no active file to complete"));
+    }
+
+    #[test]
+    fn trigger_fim_autocomplete_errors_on_an_untitled_tab() {
+        let mut app = app_without_gui();
+        app.tabs.push(Tab::untitled("Untitled".to_string()));
+        app.active_tab = Some(0);
+        app.trigger_fim_autocomplete();
+        assert_eq!(app.error.as_deref(), Some("no active file to complete"));
+    }
+
+    #[test]
+    fn trigger_fim_autocomplete_records_the_path_and_offset_and_spawns_a_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        app.active_cursor_offset = Some(5);
+        app.trigger_fim_autocomplete();
+        assert!(app.fim_rx.is_some());
+        let (path, offset) = app.fim_target.clone().unwrap();
+        assert_eq!(path, file.canonicalize().unwrap());
+        assert_eq!(offset, 5);
+    }
+
+    #[test]
+    fn poll_fim_applies_insertion_into_the_recorded_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        let canonical = file.canonicalize().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok("_suffix".to_string())).unwrap();
+        app.fim_rx = Some(rx);
+        app.fim_target = Some((canonical, 0));
+
+        assert!(app.poll_fim());
+
+        assert!(app.fim_rx.is_none());
+        let idx = app.active_tab.unwrap();
+        assert!(app.tabs[idx].buffer.text().starts_with("_suffixhello"));
+    }
+
+    #[test]
+    fn poll_fim_drops_a_stale_insertion_when_the_tab_was_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok("_suffix".to_string())).unwrap();
+        app.fim_rx = Some(rx);
+        // A path that doesn't match any open tab -- the tab was closed
+        // (or never matched) since the request was sent.
+        app.fim_target = Some((dir.path().join("gone.txt"), 0));
+
+        assert!(app.poll_fim());
+
+        assert!(app.fim_rx.is_none());
+        let idx = app.active_tab.unwrap();
+        assert_eq!(app.tabs[idx].buffer.text(), "hello world");
+    }
+
+    #[test]
+    fn poll_fim_error_records_it_in_self_error() {
+        let mut app = app_without_gui();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err(ide_ai::AiError::Unsupported)).unwrap();
+        app.fim_rx = Some(rx);
+
+        assert!(app.poll_fim());
+
+        assert!(app.fim_rx.is_none());
+        assert!(app
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("FIM autocomplete failed"));
+    }
+
+    #[test]
+    fn poll_fim_with_nothing_in_flight_returns_false() {
+        let mut app = app_without_gui();
+        assert!(!app.poll_fim());
+    }
+
+    #[test]
+    fn poll_fim_with_an_open_but_empty_channel_returns_false() {
+        let mut app = app_without_gui();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.fim_rx = Some(rx);
+
+        assert!(!app.poll_fim());
+        assert!(app.fim_rx.is_some(), "still waiting, not settled");
+    }
+
+    #[test]
+    fn poll_fim_disconnected_channel_records_an_error() {
+        let mut app = app_without_gui();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.fim_rx = Some(rx);
+        drop(tx); // the background thread ended without ever sending
+
+        assert!(app.poll_fim());
+
+        assert!(app.fim_rx.is_none());
+        assert_eq!(
+            app.error.as_deref(),
+            Some("FIM autocomplete thread ended unexpectedly")
+        );
+    }
+
+    #[test]
+    fn apply_fim_insert_is_a_noop_on_empty_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let mut app = app_without_gui();
+        app.open_file(&file);
+        let canonical = file.canonicalize().unwrap();
+        app.apply_fim_insert(&canonical, 0, "");
+        let idx = app.active_tab.unwrap();
+        assert_eq!(app.tabs[idx].buffer.text(), "hello world");
     }
 
     #[test]

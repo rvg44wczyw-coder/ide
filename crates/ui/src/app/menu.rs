@@ -59,6 +59,7 @@ const MENU_GROUPS: &[MenuGroup] = &[
             Some("OverrideMethods"),
             Some("CreateTest"),
             Some("OptimizeImports"),
+            Some("TriggerFimAutocomplete"),
         ],
     },
     MenuGroup {
@@ -74,6 +75,7 @@ const MENU_GROUPS: &[MenuGroup] = &[
             Some("ToggleVcsToolWindow"),
             Some("ToggleClaudeToolWindow"),
             Some("ToggleCustomActionsToolWindow"),
+            Some("ToggleAiToolWindow"),
             Some("ToggleTodoToolWindow"),
             Some("ShowLogPanel"),
         ],

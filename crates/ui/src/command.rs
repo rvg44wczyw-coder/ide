@@ -226,6 +226,8 @@ pub enum CommandAction {
     GitWorktrees,
     ManageCustomActions,
     ToggleCustomActionsToolWindow,
+    ToggleAiToolWindow,
+    TriggerFimAutocomplete,
     ToggleTodoToolWindow,
     ShowLogPanel,
     ShowFileHistory,
@@ -494,6 +496,13 @@ pub fn commands() -> &'static [Command] {
                 category: "Window",
                 binding: None,
                 action: CommandAction::ToggleCustomActionsToolWindow,
+            },
+            Command {
+                id: "ToggleAiToolWindow",
+                title: "AI Orchestration",
+                category: "Window",
+                binding: None,
+                action: CommandAction::ToggleAiToolWindow,
             },
             Command {
                 id: "ToggleTodoToolWindow",
@@ -932,6 +941,16 @@ pub fn commands() -> &'static [Command] {
                 action: CommandAction::OptimizeImports,
             },
             Command {
+                id: "TriggerFimAutocomplete",
+                title: "AI: Complete at Cursor",
+                category: "Refactor",
+                // No JetBrains-IDE precedent to copy a binding from --
+                // per root CLAUDE.md's "never invent a binding" rule
+                // (`docs/features/gui-ai-orchestration.md` §2.4).
+                binding: None,
+                action: CommandAction::TriggerFimAutocomplete,
+            },
+            Command {
                 id: "Debug",
                 title: "Debug",
                 category: "Run",
@@ -1207,6 +1226,8 @@ mod tests {
             "ToggleFormatOnSave",
             "ManageCustomActions",
             "ToggleCustomActionsToolWindow",
+            "ToggleAiToolWindow",
+            "TriggerFimAutocomplete",
         ] {
             let cmd = commands().iter().find(|c| c.id == id).unwrap();
             assert!(cmd.binding.is_none(), "{id} should have no default binding");
