@@ -27,6 +27,22 @@ pub const MAX_AGENT_STEPS: usize = 15;
 /// per-message budget reasoning.
 pub const MAX_TOOL_RESULT_CHARS: usize = 8_000;
 
+/// Wall-clock cap on one `RunShellCommand`/`ReadDockerLogs` subprocess.
+/// Neither has any other bound on how long it can run -- `Command::output`
+/// blocks until the child exits, and an unconditionally-allowlisted
+/// command like `cat /dev/zero` never does (`hacker` finding 2,
+/// 2026-09-08: live-tested, confirmed still running after 3s with nothing
+/// in the codebase to stop it). 30s comfortably covers a `cargo build`/
+/// `cargo test`-shaped command while still bounding a hang to a
+/// human-noticeable, not-infinite wait. `run_one_tool` races the tool
+/// execution against this timeout (and, separately, against the loop's
+/// own resume channel closing/firing, which is what actually detects a
+/// user cancellation) via `tokio::select!`; the losing future is dropped,
+/// and `Command::kill_on_drop(true)` (set on every subprocess this crate
+/// spawns) kills the child at that point instead of leaving it to run
+/// detached.
+pub const TOOL_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Small, char-boundary-safe duplicate of `ide_ai`'s crate-private
 /// `truncate` -- that one has no `pub` modifier, so `ide-agent` cannot
 /// depend on it.
@@ -43,10 +59,26 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// §3.4: even in `Auto` mode, `RunShellCommand` only runs unattended when
-/// it matches this fixed, non-configurable allowlist. `program` is matched
-/// by file-stem so a full or relative path to one of these doesn't evade
-/// the check.
+/// it matches this fixed, non-configurable allowlist. `program` must be a
+/// single bare-name path component -- any directory separator at all
+/// (`./cargo`, `../x`, `sub/cargo`, `/usr/bin/git`) is rejected outright,
+/// *before* the file-stem comparison below. A path-qualified `program`
+/// bypasses `$PATH` resolution entirely and runs whatever file sits at
+/// that literal location instead of the trusted system binary -- and
+/// `file_stem()` alone can't tell `"./cargo"` apart from `"cargo"`, since
+/// both stem to `"cargo"` (`hacker` finding 1, 2026-09-08: live-tested
+/// planting an executable file literally named `cargo` in the project
+/// root and running it, unattended, via `program: "./cargo"`). Rejecting
+/// every path-qualified form -- including a full path to what really is
+/// the legitimate system binary -- is a deliberate, stricter tradeoff:
+/// there is no way from a string alone to distinguish "the user's real
+/// `/usr/bin/git`" from "an attacker's file that happens to live at
+/// `/usr/bin/git`"; only a bare name, resolved via `$PATH` the same way a
+/// human typing it at a shell would get, is trustworthy here.
 fn is_allowlisted(program: &str, args: &[String]) -> bool {
+    if std::path::Path::new(program).components().count() != 1 {
+        return false;
+    }
     let stem = std::path::Path::new(program)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -149,6 +181,10 @@ pub struct AgentLoop {
     executor: ToolExecutor,
     events: Sender<AgentEvent>,
     resume_rx: tokio::sync::mpsc::UnboundedReceiver<AgentResume>,
+    /// `TOOL_EXECUTION_TIMEOUT` in normal operation; shortened by
+    /// `#[cfg(test)] with_tool_timeout` so timeout-handling tests don't
+    /// need to wait 30 real seconds.
+    tool_timeout: Duration,
 }
 
 /// The only way the caller interacts with a running `AgentLoop` after
@@ -194,9 +230,18 @@ impl AgentLoop {
                 executor,
                 events,
                 resume_rx,
+                tool_timeout: TOOL_EXECUTION_TIMEOUT,
             },
             AgentHandle { resume_tx },
         )
+    }
+
+    /// Test-only seam: shortens `tool_timeout` so a timeout-handling test
+    /// doesn't need to wait `TOOL_EXECUTION_TIMEOUT` (30s) of real time.
+    #[cfg(test)]
+    pub(crate) fn with_tool_timeout(mut self, timeout: Duration) -> Self {
+        self.tool_timeout = timeout;
+        self
     }
 
     /// Runs until `AgentEvent::Done` or the `events` channel closes.
@@ -413,7 +458,31 @@ impl AgentLoop {
             return self.finish(ToolResult { tool, outcome }, threshold);
         }
 
-        let result = self.executor.execute(tool).await;
+        // Races real execution against `tool_timeout` and against this
+        // loop's own resume channel closing (dropping `AgentHandle`, which
+        // `AgentPanel::cancel` already does) or firing unexpectedly --
+        // either is treated as "stop this tool now". Whichever future
+        // loses is dropped; for `RunShellCommand`/`ReadDockerLogs` that
+        // drops the in-flight `tokio::process::Child` too, and
+        // `Command::kill_on_drop(true)` (set on every subprocess this
+        // crate spawns) kills it instead of leaving it running detached
+        // (`hacker` finding 2, 2026-09-08). The other tool variants have
+        // no internal `.await` point, so this timeout/cancel race can't
+        // actually interrupt them mid-flight -- harmless, since they're
+        // bounded by local disk speed rather than an external process
+        // that can hang forever, which is what this race exists to bound.
+        let fallback_tool = tool.clone();
+        let result = tokio::select! {
+            r = self.executor.execute(tool) => r,
+            _ = tokio::time::sleep(self.tool_timeout) => ToolResult {
+                tool: fallback_tool.clone(),
+                outcome: Err(ToolError::Timeout),
+            },
+            _ = self.resume_rx.recv() => ToolResult {
+                tool: fallback_tool,
+                outcome: Err(ToolError::Cancelled),
+            },
+        };
         self.finish(result, threshold)
     }
 
@@ -486,7 +555,7 @@ mod tests {
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
-            .enable_time()
+            .enable_all()
             .build()
             .unwrap()
             .block_on(fut)
@@ -965,7 +1034,6 @@ mod tests {
         assert!(is_allowlisted("ls", &[]));
         assert!(is_allowlisted("cat", &["a.rs".into()]));
         assert!(is_allowlisted("grep", &["x".into()]));
-        assert!(is_allowlisted("/usr/bin/git", &["status".into()]));
         assert!(is_allowlisted("git", &["diff".into()]));
         assert!(!is_allowlisted("git", &["reset".into(), "--hard".into()]));
         assert!(!is_allowlisted("git", &[]));
@@ -975,6 +1043,31 @@ mod tests {
         assert!(!is_allowlisted("bash", &[]));
         assert!(!is_allowlisted("python", &[]));
         assert!(!is_allowlisted("definitely-not-safe", &[]));
+    }
+
+    /// Regression for `hacker` finding 1 (2026-09-08,
+    /// `docs/security-findings/tui-local-agent-2026-09-08.md`): a
+    /// path-qualified `program` must never be allowlisted, even when its
+    /// file stem matches a trusted name -- live-tested against the real
+    /// `ToolExecutor` that `program: "./cargo"` runs an attacker-planted
+    /// file instead of the real `cargo`. This also covers what used to be
+    /// an *intentionally accepted* case (`/usr/bin/git`, a full path to
+    /// the presumably-real binary) -- accepting any path-qualified form at
+    /// all is exactly the hole the finding exploited, since a string alone
+    /// can't distinguish a real system path from an attacker's file that
+    /// happens to sit at that same path.
+    #[test]
+    fn is_allowlisted_rejects_every_path_qualified_program() {
+        assert!(!is_allowlisted("./cargo", &[]));
+        assert!(!is_allowlisted("../cargo", &[]));
+        assert!(!is_allowlisted("sub/cargo", &[]));
+        assert!(!is_allowlisted("/tmp/evil/cargo", &[]));
+        assert!(!is_allowlisted("/usr/bin/git", &["status".into()]));
+        assert!(!is_allowlisted("./git", &["status".into()]));
+        assert!(!is_allowlisted("./docker", &["ps".into()]));
+        // A bare name -- no separator at all -- is still eligible and
+        // still resolves via `$PATH`, same as before.
+        assert!(is_allowlisted("cargo", &[]));
     }
 
     #[test]
@@ -993,5 +1086,88 @@ mod tests {
     #[test]
     fn mask_passes_through_unmasked_with_no_threshold() {
         assert_eq!(mask("hello", None), "hello");
+    }
+
+    /// Regression for `hacker` finding 2 (2026-09-08,
+    /// `docs/security-findings/tui-local-agent-2026-09-08.md`): a
+    /// `RunShellCommand` that outlives `tool_timeout` is killed, not left
+    /// to hang forever, and reported back as `ToolError::Timeout`.
+    #[test]
+    fn run_shell_command_exceeding_the_timeout_is_killed_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path()).unwrap();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let (loop_, handle) = AgentLoop::new(PermissionMode::Approve, executor, events_tx);
+        let loop_ = loop_.with_tool_timeout(Duration::from_millis(200));
+        // A `sleep` far longer than the 200ms override -- if the timeout
+        // didn't actually kill it, this test would hang for 5 real
+        // seconds instead of failing fast.
+        handle.resume_with_decision(true);
+        let router = FakeRouter::new(vec![
+            &tool_call("RunShellCommand", r#"{"program": "sleep", "args": ["5"]}"#),
+            "done",
+        ]);
+        block_on(loop_.run_with_router(router, Vec::new(), &[ProviderId::OllamaLocal], None, None));
+        let events: Vec<AgentEvent> = events_rx.try_iter().collect();
+        let finished = events.iter().find_map(|e| match e {
+            AgentEvent::ToolFinished { result } => Some(result),
+            _ => None,
+        });
+        assert!(
+            matches!(
+                finished,
+                Some(ToolResult {
+                    outcome: Err(ToolError::Timeout),
+                    ..
+                })
+            ),
+            "{finished:?}"
+        );
+    }
+
+    /// Regression for `hacker` finding 2: cancelling mid-run (modeled the
+    /// same way `AgentPanel::cancel` does it -- dropping the `AgentHandle`,
+    /// which closes `resume_rx`) kills a running `RunShellCommand` rather
+    /// than leaving it detached in the background. Asserted by wall-clock
+    /// time: a 5s `sleep` that isn't actually interrupted would make this
+    /// test take ~5s; a correctly-cancelled one returns almost instantly.
+    #[test]
+    fn cancelling_while_a_shell_command_is_running_kills_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path()).unwrap();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let (loop_, handle) = AgentLoop::new(PermissionMode::Approve, executor, events_tx);
+        let loop_ = loop_.with_tool_timeout(Duration::from_secs(30));
+        handle.resume_with_decision(true);
+        // Mirrors `AgentPanel::cancel`'s `self.handle = None` -- the only
+        // `AgentHandle`/`resume_tx` this loop's `resume_rx` will ever see
+        // is gone from here on.
+        drop(handle);
+        let router = FakeRouter::new(vec![
+            &tool_call("RunShellCommand", r#"{"program": "sleep", "args": ["5"]}"#),
+            "done",
+        ]);
+        let start = std::time::Instant::now();
+        block_on(loop_.run_with_router(router, Vec::new(), &[ProviderId::OllamaLocal], None, None));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "cancellation should interrupt the 5s sleep almost immediately, took {elapsed:?}"
+        );
+        let events: Vec<AgentEvent> = events_rx.try_iter().collect();
+        let finished = events.iter().find_map(|e| match e {
+            AgentEvent::ToolFinished { result } => Some(result),
+            _ => None,
+        });
+        assert!(
+            matches!(
+                finished,
+                Some(ToolResult {
+                    outcome: Err(ToolError::Cancelled),
+                    ..
+                })
+            ),
+            "{finished:?}"
+        );
     }
 }

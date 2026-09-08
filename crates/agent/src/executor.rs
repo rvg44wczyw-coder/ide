@@ -4,7 +4,8 @@
 //! doc's "Why `DebugControl` can't be just another `ToolExecutor` case").
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use tokio::process::Command;
 
 use ide_core::buffer_search::SearchOptions;
 use ide_core::project::Project;
@@ -34,9 +35,11 @@ impl ToolExecutor {
             AgentTool::ReadFile { path } => self.read_file(path),
             AgentTool::ListDirectory { path } => self.list_directory(path),
             AgentTool::SearchCode { query } => self.search_code(query),
-            AgentTool::ReadDockerLogs { container_id } => self.read_docker_logs(container_id),
+            AgentTool::ReadDockerLogs { container_id } => self.read_docker_logs(container_id).await,
             AgentTool::EditFile { path, new_text } => self.edit_file(path, new_text),
-            AgentTool::RunShellCommand { program, args } => self.run_shell_command(program, args),
+            AgentTool::RunShellCommand { program, args } => {
+                self.run_shell_command(program, args).await
+            }
             AgentTool::DebugControl(_) => Err(ToolError::Io(
                 "DebugControl must be executed by the caller, not ToolExecutor".to_string(),
             )),
@@ -98,11 +101,18 @@ impl ToolExecutor {
         Ok(lines.join("\n"))
     }
 
-    fn read_docker_logs(&self, container_id: &str) -> Result<String, ToolError> {
+    async fn read_docker_logs(&self, container_id: &str) -> Result<String, ToolError> {
+        // `kill_on_drop(true)`: if the caller (`AgentLoop::run_one_tool`)
+        // drops this future because it lost a `tokio::select!` race
+        // against its timeout or a cancellation signal, the spawned
+        // `docker` process is killed rather than left running detached
+        // (`hacker` finding 2, 2026-09-08).
         let output = Command::new("docker")
             .args(["logs", container_id])
             .current_dir(&self.project_root)
+            .kill_on_drop(true)
             .output()
+            .await
             .map_err(|e| ToolError::Io(format!("docker not found or failed to run: {e}")))?;
         Ok(format!(
             "{}{}",
@@ -134,11 +144,14 @@ impl ToolExecutor {
         Ok(format!("wrote {} bytes to {path}", new_text.len()))
     }
 
-    fn run_shell_command(&self, program: &str, args: &[String]) -> Result<String, ToolError> {
+    async fn run_shell_command(&self, program: &str, args: &[String]) -> Result<String, ToolError> {
+        // See `read_docker_logs`'s comment on `kill_on_drop(true)`.
         let output = Command::new(program)
             .args(args)
             .current_dir(&self.project_root)
+            .kill_on_drop(true)
             .output()
+            .await
             .map_err(|e| ToolError::Io(format!("{program} not found or failed to run: {e}")))?;
         Ok(format!(
             "exit status: {}\n{}{}",
@@ -160,6 +173,7 @@ mod tests {
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap()
             .block_on(fut)
@@ -284,6 +298,37 @@ mod tests {
         let text = result.outcome.unwrap();
         assert!(text.contains("a; rm -rf /"));
         assert!(!dir.path().join("rm").exists());
+    }
+
+    /// `ToolExecutor` itself is deliberately unopinionated about which
+    /// programs `RunShellCommand` may name -- that gate is
+    /// `agent_loop::is_allowlisted`'s job, consulted only for *unattended*
+    /// `Auto`-mode execution. In `Approve`/`Plan` mode a human explicitly
+    /// approves the exact `program`/`args` shown, including a path-
+    /// qualified one pointing at a project-local script -- a legitimate
+    /// use `is_allowlisted`'s post-`hacker`-finding-1 path-separator
+    /// rejection must not also block here. Confirms the executor runs a
+    /// same-named-as-a-trusted-tool, path-qualified, non-`$PATH` binary
+    /// exactly as instructed, with no path check of its own.
+    #[test]
+    fn run_shell_command_runs_whatever_program_it_is_given_no_matter_the_path() {
+        let dir = temp_project();
+        let planted = dir.path().join("cargo");
+        std::fs::write(&planted, "#!/bin/sh\necho not-the-real-cargo\n").unwrap();
+        let mut perms = std::fs::metadata(&planted).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(&planted, perms).unwrap();
+
+        let mut exec = ToolExecutor::new(dir.path()).unwrap();
+        let result = block_on(exec.execute(AgentTool::RunShellCommand {
+            program: "./cargo".into(),
+            args: vec![],
+        }));
+        assert!(result.outcome.unwrap().contains("not-the-real-cargo"));
     }
 
     #[test]

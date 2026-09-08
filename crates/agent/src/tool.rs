@@ -84,6 +84,17 @@ pub enum ToolError {
     Io(String),
     #[error("no active debug session")]
     NoDebugSession,
+    /// The subprocess exceeded `AgentLoop::TOOL_EXECUTION_TIMEOUT` and was
+    /// killed (`hacker` finding 2, 2026-09-08 -- previously an
+    /// unconditionally-allowlisted command like `cat /dev/zero` could hang
+    /// the executing thread forever with no recovery).
+    #[error("command timed out and was killed")]
+    Timeout,
+    /// The user cancelled the agent request while this tool was running;
+    /// the subprocess (if any) was killed rather than left to run
+    /// detached in the background.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 #[cfg(test)]
