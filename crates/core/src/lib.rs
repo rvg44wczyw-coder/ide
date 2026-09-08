@@ -14,6 +14,7 @@ pub mod search;
 pub mod search_in_path;
 pub mod syntax;
 pub mod text;
+pub mod user_settings;
 pub mod workspace_edit;
 
 pub use buffer::{Buffer, BufferError};
