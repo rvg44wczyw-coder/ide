@@ -9449,6 +9449,10 @@ impl App {
             }
             KeyCode::Enter => self.start_keymap_capture(),
             KeyCode::Delete => self.reset_selected_keymap_binding(),
+            KeyCode::Left | KeyCode::Right => {
+                self.keymap_popup = None;
+                self.toggle_theme_popup();
+            }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 state.query.push(c);
                 state.selected = 0;
@@ -9507,6 +9511,10 @@ impl App {
                 self.theme = kind;
                 self.persist_theme();
                 self.theme_popup = None;
+            }
+            KeyCode::Left | KeyCode::Right => {
+                self.theme_popup = None;
+                self.toggle_keymap_popup();
             }
             _ => {}
         }
@@ -19619,6 +19627,63 @@ mod tests {
     }
 
     #[test]
+    fn right_from_theme_popup_opens_keymap_popup() {
+        let dir = sample_project();
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_state_path(
+            dir.path().to_path_buf(),
+            Some(state_dir.path().join("state.json")),
+        )
+        .unwrap();
+        app.run_action(Action::ToggleThemeSettings);
+        assert!(app.theme_popup.is_some());
+
+        app.handle_key(plain_key(KeyCode::Right));
+
+        assert!(app.theme_popup.is_none());
+        assert!(app.keymap_popup.is_some());
+    }
+
+    #[test]
+    fn left_from_keymap_popup_opens_theme_popup() {
+        let dir = sample_project();
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_state_path(
+            dir.path().to_path_buf(),
+            Some(state_dir.path().join("state.json")),
+        )
+        .unwrap();
+        app.run_action(Action::ToggleKeymapSettings);
+        assert!(app.keymap_popup.is_some());
+
+        app.handle_key(plain_key(KeyCode::Left));
+
+        assert!(app.keymap_popup.is_none());
+        assert!(app.theme_popup.is_some());
+    }
+
+    #[test]
+    fn switching_away_from_theme_popup_discards_an_uncommitted_highlight_move() {
+        let dir = sample_project();
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_state_path(
+            dir.path().to_path_buf(),
+            Some(state_dir.path().join("state.json")),
+        )
+        .unwrap();
+        assert_eq!(app.theme, crate::theme::ThemeKind::Classic);
+        app.run_action(Action::ToggleThemeSettings);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.theme_popup.as_ref().unwrap().selected, 1);
+
+        app.handle_key(plain_key(KeyCode::Right)); // -> Keymap, discards the move
+        app.handle_key(plain_key(KeyCode::Left)); // -> Appearance again
+
+        assert_eq!(app.theme, crate::theme::ThemeKind::Classic);
+        assert_eq!(app.theme_popup.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
     fn persist_theme_preserves_last_project_and_format_on_save() {
         let dir = sample_project();
         let state_dir = tempfile::tempdir().unwrap();
@@ -20028,6 +20093,50 @@ mod tests {
 
         app.handle_key(plain_key(KeyCode::Backspace));
         assert_eq!(app.keymap_popup.as_ref().unwrap().query, "sa");
+    }
+
+    #[test]
+    fn switching_away_and_back_to_keymap_popup_resets_query_and_selection() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleKeymapSettings);
+        app.handle_key(plain_key(KeyCode::Down));
+        app.handle_key(plain_key(KeyCode::Char('s')));
+        assert_eq!(app.keymap_popup.as_ref().unwrap().query, "s");
+        assert_eq!(app.keymap_popup.as_ref().unwrap().selected, 0);
+
+        app.handle_key(plain_key(KeyCode::Left)); // -> Appearance, discards "s"
+        app.handle_key(plain_key(KeyCode::Right)); // -> Keymap again
+
+        let state = app.keymap_popup.as_ref().unwrap();
+        assert_eq!(state.query, "");
+        assert_eq!(state.selected, 0);
+        assert!(state.capturing.is_none());
+    }
+
+    #[test]
+    fn left_right_during_keymap_capture_are_captured_as_a_chord_not_a_page_switch() {
+        let dir = sample_project();
+        let keymap_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap_path_override = Some(keymap_dir.path().join("keymap.json"));
+        app.run_action(Action::ToggleKeymapSettings);
+        let id = app.keymap_popup_rows()[0].id;
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.keymap_popup.as_ref().unwrap().capturing, Some(id));
+
+        app.handle_key(plain_key(KeyCode::Right));
+
+        assert!(
+            app.keymap_popup.is_some(),
+            "capture must not close the popup as a page switch"
+        );
+        assert!(app.keymap_popup.as_ref().unwrap().capturing.is_none());
+        assert!(app.keymap.is_customized(id));
+        assert_eq!(
+            app.keymap.effective_binding(id),
+            Some((KeyModifiers::NONE, KeyCode::Right))
+        );
     }
 
     #[test]
