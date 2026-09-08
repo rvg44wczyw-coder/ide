@@ -462,14 +462,42 @@ impl AgentPanel {
 /// test) and only falls back to parent-only canonicalization when the full
 /// path doesn't resolve at all -- which also covers the legitimate
 /// new-file-creation case (`ToolExecutor::edit_file`'s target may not exist
-/// yet) and a dangling symlink (which can't disclose anything, since
-/// nothing readable is behind it). `None` on any failure -- a missing
-/// parent, a permission error, or an actual escape -- the caller must never
-/// read from a `None` result.
+/// yet). `None` on any failure -- a missing parent, a permission error, or
+/// an actual escape -- the caller must never read from a `None` result.
+///
+/// **Security-critical, hacker-pass-verified** (`docs/security-findings/
+/// rust-ui-dev-gui-local-agent-2026-09-08.md`, findings 1-2): two cases the
+/// original version of this function got wrong, both live-verified via a
+/// standalone symlink harness:
+/// - A *dangling* leaf symlink (its target doesn't exist yet, so full
+///   canonicalization fails and this falls into the new-file branch) used
+///   to be treated as an ordinary new filename, since only `target`'s
+///   *parent* was re-checked. That's wrong: a dangling symlink is not "a
+///   name that doesn't exist yet", it's an existing filesystem entry that
+///   already points somewhere -- `symlink_metadata` (never `metadata`,
+///   which follows the link) below rejects it before the parent-only
+///   fallback ever runs.
+/// - An empty (or `"."`) `path` resolves to `project_root` itself, which
+///   trivially passes `starts_with(project_root)` -- rejected explicitly
+///   up front, since `EditFile` can never legitimately target the project
+///   root directory.
 fn validated_edit_target(project_root: &Path, path: &str) -> Option<PathBuf> {
+    if path.is_empty() {
+        return None;
+    }
     let target = project_root.join(path);
     if let Ok(canonical) = std::fs::canonicalize(&target) {
-        return canonical.starts_with(project_root).then_some(canonical);
+        // Rejects `path` values like `"."` or `"sub/.."` that fully
+        // resolve back to the project root itself, not just an escape --
+        // `EditFile` can never legitimately target the root directory.
+        return (canonical != project_root && canonical.starts_with(project_root))
+            .then_some(canonical);
+    }
+    // A dangling symlink already sitting at the leaf: `canonicalize` above
+    // failed (its target doesn't exist), but it is *not* a fresh filename
+    // -- `symlink_metadata` sees it without following it.
+    if std::fs::symlink_metadata(&target).is_ok() {
+        return None;
     }
     let parent = target.parent()?;
     let canonical_parent = std::fs::canonicalize(parent).ok()?;
@@ -1040,5 +1068,47 @@ mod tests {
             std::os::unix::fs::symlink(&outside_file, &link).unwrap();
             assert_eq!(validated_edit_target(&root, "link.rs"), None);
         }
+    }
+
+    /// `docs/security-findings/rust-ui-dev-gui-local-agent-2026-09-08.md`
+    /// finding 1: a dangling symlink (its target doesn't exist yet, so
+    /// full canonicalization fails) used to fall through to the new-file
+    /// fallback, which only re-checked `target`'s *parent* -- treating an
+    /// existing, root-escaping symlink as an ordinary not-yet-created
+    /// filename.
+    #[test]
+    fn validated_edit_target_rejects_a_dangling_symlink_escaping_the_root() {
+        #[cfg(unix)]
+        {
+            let root = std::fs::canonicalize(temp_root()).unwrap();
+            let outside = temp_root();
+            // Deliberately never created: `outside/never_created.rs`.
+            let link = root.join("dangling.rs");
+            std::os::unix::fs::symlink(outside.join("never_created.rs"), &link).unwrap();
+            assert_eq!(validated_edit_target(&root, "dangling.rs"), None);
+        }
+    }
+
+    /// Finding 2: an empty or `"."` path resolves to the project root
+    /// directory itself, which trivially passes `starts_with`.
+    #[test]
+    fn validated_edit_target_rejects_empty_and_dot_paths() {
+        // Canonical, so this actually exercises the `canonical ==
+        // project_root` rejection rather than an incidental `/var` vs.
+        // `/private/var` mismatch that would also produce `None`.
+        let root = std::fs::canonicalize(temp_root()).unwrap();
+        assert_eq!(validated_edit_target(&root, ""), None);
+        assert_eq!(validated_edit_target(&root, "."), None);
+    }
+
+    #[test]
+    fn validated_edit_target_still_allows_a_legitimate_new_file() {
+        // Callers (`submit`) always pass an already-canonicalized root; a
+        // raw `temp_root()` isn't canonical on macOS (`/var` -> `/private/
+        // var`), which would make `starts_with` spuriously fail below.
+        let root = std::fs::canonicalize(temp_root()).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let result = validated_edit_target(&root, "sub/brand_new.rs");
+        assert_eq!(result, Some(root.join("sub/brand_new.rs")));
     }
 }
