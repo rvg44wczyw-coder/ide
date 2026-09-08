@@ -314,10 +314,24 @@ impl IdeApp {
         let terminal_tab_focused = self.claude_terminals.tabs().iter().any(|tab| {
             ctx.memory(|m| m.has_focus(crate::claude_terminal::terminal_tab_egui_id(tab.id)))
         });
+        // `agent.pending_approval.is_some()` (`docs/features/
+        // gui-local-agent.md` §4, `rev` fix round 1): `egui::Modal`'s own
+        // 0.36.1 implementation only intercepts *pointer* input via its
+        // backdrop -- it never touches `ctx.input()`, so without this
+        // condition a background keyboard shortcut (Cargo Run, Save All,
+        // Push, ...) could still fire through this very dispatch loop while
+        // the approval popup is open and visually blocking everything else,
+        // contradicting §4's stated "blocks input to the rest of the UI"
+        // invariant for the one input path `Modal` doesn't cover on its
+        // own. Approve/Deny are deliberately not commands (mouse-only), so
+        // this can't itself resolve the pending decision -- it only stops
+        // an unrelated action from executing silently while that decision
+        // is still pending.
         let suppress_dispatch = self.command_palette_open
             || self.search_everywhere_open
             || self.show_go_to_line
             || self.file_structure_open
+            || self.agent.pending_approval.is_some()
             || self.recent_files_open
             || self.recent_locations_open
             || terminal_tab_focused;
