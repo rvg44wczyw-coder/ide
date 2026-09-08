@@ -15969,7 +15969,9 @@ mod tests {
     #[test]
     fn esc_during_keys_screen_capture_cancels_without_leaving_the_screen() {
         let dir = sample_project();
+        let keymap_dir = tempfile::tempdir().unwrap();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap_path_override = Some(keymap_dir.path().join("keymap.json"));
         app.run_action(Action::GoToKeysScreen);
         app.handle_key(plain_key(KeyCode::Enter));
         assert_eq!(app.keys_screen_capturing, Some("SaveAll"));
