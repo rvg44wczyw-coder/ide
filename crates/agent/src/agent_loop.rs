@@ -417,12 +417,27 @@ impl AgentLoop {
         self.finish(result, threshold)
     }
 
+    /// Truncates *before* masking, not after: `mask` runs a regex-based
+    /// scan (`Sanitizer::mask_with_threshold`) whose cost scales with input
+    /// size, and a `RunShellCommand`/`ReadDockerLogs`/`ReadFile` result can
+    /// be arbitrarily large (a big file, a verbose build log) -- scanning
+    /// the whole thing before capping it would let a single large tool
+    /// result cost far more than the `MAX_TOOL_RESULT_CHARS` budget this
+    /// truncation exists to enforce implies. Content past the cutoff is
+    /// discarded either way (it never reaches the model in either
+    /// ordering), so this doesn't weaken masking for anything that
+    /// actually gets sent -- a secret straddling the cutoff exactly is no
+    /// worse off than before, since it was never going to be transmitted
+    /// past that point regardless of order (`rev` fix round 1). Masking a
+    /// pre-truncated slice can grow the final feedback slightly past
+    /// `MAX_TOOL_RESULT_CHARS` (a short match replaced by the fixed-length
+    /// `__IDE_SAN_<n>__` placeholder) -- an acceptable, tightly bounded
+    /// trade against no longer scanning unbounded input.
     fn finish(&mut self, result: ToolResult, threshold: Option<f64>) -> String {
         let feedback = match &result.outcome {
-            Ok(text) => mask(text, threshold),
+            Ok(text) => mask(&truncate(text, MAX_TOOL_RESULT_CHARS), threshold),
             Err(e) => e.to_string(),
         };
-        let feedback = truncate(&feedback, MAX_TOOL_RESULT_CHARS);
         let _ = self.events.send(AgentEvent::ToolFinished { result });
         feedback
     }
@@ -912,6 +927,35 @@ mod tests {
         .collect();
         let calls = router.calls();
         assert_ne!(calls[1].last().unwrap().text, secret);
+    }
+
+    #[test]
+    fn tool_result_is_truncated_before_masking_not_after() {
+        // Regression for `rev` fix round 1: `finish` used to mask the full
+        // result then truncate -- a secret placed *after*
+        // `MAX_TOOL_RESULT_CHARS` would still get scanned (wasting the
+        // work truncation exists to bound) but, more importantly, this is
+        // the only way to observe the ordering from outside `finish`: with
+        // truncate-first, a secret past the cutoff is sliced away before
+        // `mask` ever sees it, so it can't appear (masked or not) in the
+        // fed-back text at all.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "AKIAABCDEFGHIJKLMNOP1234567890";
+        let padding = "x".repeat(MAX_TOOL_RESULT_CHARS + 100);
+        let content = format!("{padding}{secret}");
+        std::fs::write(dir.path().join("a.rs"), &content).unwrap();
+        let (_events, router) = run(
+            dir.path(),
+            PermissionMode::Plan,
+            vec![&tool_call("ReadFile", r#"{"path": "a.rs"}"#), "done"],
+            vec![],
+            Some(0.0),
+        )
+        .collect();
+        let calls = router.calls();
+        let fed_back = &calls[1].last().unwrap().text;
+        assert!(!fed_back.contains(secret));
+        assert!(fed_back.chars().count() <= MAX_TOOL_RESULT_CHARS + 32);
     }
 
     #[test]

@@ -27,6 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
+#[cfg(test)]
+use std::sync::mpsc::Sender;
+
 use ide_agent::{
     AgentEvent, AgentHandle, AgentLoop, AgentTool, DebugAction, DoneReason, ToolError,
     ToolExecutor, ToolResult,
@@ -265,6 +268,21 @@ impl AgentPanel {
         }
     }
 
+    /// Test-only seam: arms an injectable event channel exactly like
+    /// `submit` would (minus the real background thread), so `app.rs`'s
+    /// own tests -- a different module, unable to reach the private `rx`
+    /// field directly -- can drive `poll`/`App::poll_agent`'s dispatch
+    /// with a hand-crafted `AgentEvent` (in particular `AwaitingDebug
+    /// Execution`, the one event `poll` can't resolve on its own).
+    /// Mirrors this module's own `events_sender_and_panel` test helper
+    /// below, exposed at `pub(crate)` instead of kept test-local.
+    #[cfg(test)]
+    pub(crate) fn test_arm_event_channel(&mut self) -> Sender<AgentEvent> {
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        tx
+    }
+
     fn ingest(&mut self, event: AgentEvent) -> Option<DebugAction> {
         match event {
             AgentEvent::ModelDelta { text } => {
@@ -425,7 +443,6 @@ fn run_agent(prepared: AgentPreparedRequest) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::Sender;
 
     fn temp_root() -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);

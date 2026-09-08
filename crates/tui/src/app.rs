@@ -6622,6 +6622,27 @@ impl App {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return LoopSignal::Continue;
         }
+        // The agent's pending-approval popup (`docs/features/
+        // tui-local-agent.md` §2.2) must outrank *every* other check in
+        // this function, including `menu_bar.open` right below (which is
+        // otherwise the single highest-priority check here) -- `poll_agent`
+        // runs unconditionally every frame with no gating on what other
+        // overlay is open, so a background agent run can pause on approval
+        // while the menu bar, palette, or any other overlay already has
+        // input focus. `render_agent_approval_popup` (`ui.rs`) draws this
+        // popup on top of literally everything for the same reason: input
+        // priority has to match that z-order, or the popup is visible but
+        // unreachable by keyboard (`rev` fix round 1 -- the previous
+        // placement, just above the `Ai`/`Agent` Esc-intercept blocks
+        // further down, was reachable in the common case but lost to
+        // `menu_bar`/`palette`/every other earlier check in this chain
+        // whenever one of those was already open when the pause arrived;
+        // `close_all_overlays`'s own `agent.deny_pending()` call only
+        // guards the reverse direction, opening a *new* overlay while a
+        // decision is already pending).
+        if self.agent.pending_approval.is_some() {
+            return self.handle_agent_approval_key(key);
+        }
         // `⇧⇧` Search Everywhere (`docs/features/tui-unified-finder.md`
         // §3.3, T46). A pure side effect, checked before the popup-
         // priority chain below reads any state -- it never itself returns,
@@ -6790,15 +6811,6 @@ impl App {
                 || self.k8s.picker.is_some())
         {
             return self.handle_k8s_panel_key(key);
-        }
-        // The agent's pending-approval popup (`docs/features/
-        // tui-local-agent.md` §2.2) is a true nested modal, same rank as
-        // Docker's/K8s's own confirm popups two blocks up: it must fully
-        // intercept every key, not just `Esc`, and regardless of which
-        // dock tab currently has focus (a background agent run can pause
-        // on approval while the user is looking at a different tab).
-        if self.agent.pending_approval.is_some() {
-            return self.handle_agent_approval_key(key);
         }
         // The AI dock tab's own `Esc`-closes rule (`docs/features/
         // tui-ai-hybrid-fallback.md` §2.4) can't be reached through the
@@ -10336,6 +10348,7 @@ fn workspace_text_edits_to_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_panel::AgentPreparedRequest;
     use crate::ai_panel::{AiDisplayMessage, PreparedRequest};
     use crate::commands::binding_for;
     use crate::ui;
@@ -20491,6 +20504,254 @@ mod tests {
 
         assert!(!app.ai.is_in_flight(), "Esc must cancel a wedged request");
         assert!(!app.ai_panel_open);
+    }
+
+    fn agent_noop(_prepared: AgentPreparedRequest) {}
+
+    #[test]
+    fn toggle_agent_panel_opens_and_closes_the_dock_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.agent_panel_open);
+
+        app.run_action(Action::ToggleAgentPanel);
+        assert!(app.agent_panel_open);
+        assert_eq!(app.bottom_dock.as_ref().unwrap().tab, BottomDockTab::Agent);
+        assert_eq!(app.focus, Focus::BottomDock);
+
+        app.run_action(Action::ToggleAgentPanel);
+        assert!(!app.agent_panel_open);
+        assert!(app.bottom_dock.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn agent_panel_esc_closes_the_dock_from_any_tab() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAgentPanel);
+        assert!(app.agent_panel_open);
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(!app.agent_panel_open);
+        assert!(app.bottom_dock.is_none());
+        assert_eq!(app.focus, Focus::Editor);
+    }
+
+    #[test]
+    fn agent_panel_up_down_page_scroll_the_history_and_never_panic_at_zero() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::ToggleAgentPanel);
+
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.agent.history_scroll, 0);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.agent.history_scroll, 1);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.agent.history_scroll, 11);
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.agent.history_scroll, 1);
+    }
+
+    #[test]
+    fn agent_panel_typing_edits_input_and_enter_submits() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent = AgentPanel::with_runner(dir.path().to_path_buf(), agent_noop);
+        app.run_action(Action::ToggleAgentPanel);
+
+        for c in "read a.txt".chars() {
+            app.handle_key(plain_key(KeyCode::Char(c)));
+        }
+        app.handle_key(plain_key(KeyCode::Backspace));
+        assert_eq!(app.agent.input, "read a.tx");
+
+        app.handle_key(plain_key(KeyCode::Char('t')));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.agent.input, "", "input clears after submit");
+        assert!(app.agent.is_in_flight());
+        assert_eq!(app.agent.history.len(), 1);
+    }
+
+    #[test]
+    fn agent_panel_enter_while_in_flight_is_rejected() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent = AgentPanel::with_runner(dir.path().to_path_buf(), agent_noop);
+        app.run_action(Action::ToggleAgentPanel);
+
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(app.agent.is_in_flight());
+
+        app.handle_key(plain_key(KeyCode::Char('y')));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.agent.history.len(), 1, "second submit is refused");
+        assert!(app
+            .notifications
+            .last()
+            .unwrap()
+            .message
+            .contains("one agent request at a time"));
+    }
+
+    #[test]
+    fn agent_panel_esc_while_in_flight_cancels_before_closing() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent = AgentPanel::with_runner(dir.path().to_path_buf(), agent_noop);
+        app.run_action(Action::ToggleAgentPanel);
+
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert!(app.agent.is_in_flight());
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(
+            !app.agent.is_in_flight(),
+            "Esc must cancel a wedged request"
+        );
+        assert!(!app.agent_panel_open);
+    }
+
+    #[test]
+    fn cycle_agent_mode_action_cycles_plan_approve_auto() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Plan);
+
+        app.run_action(Action::CycleAgentMode);
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Approve);
+
+        app.run_action(Action::CycleAgentMode);
+        assert_eq!(app.agent.mode, ide_ai::PermissionMode::Auto);
+    }
+
+    #[test]
+    fn handle_agent_approval_key_y_approves_and_n_denies() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+
+        app.handle_key(plain_key(KeyCode::Char('n')));
+        assert!(app.agent.pending_approval.is_none());
+
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+        app.handle_key(plain_key(KeyCode::Char('y')));
+        assert!(app.agent.pending_approval.is_none());
+    }
+
+    #[test]
+    fn close_all_overlays_denies_a_pending_approval() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+
+        app.close_all_overlays();
+
+        assert!(app.agent.pending_approval.is_none());
+    }
+
+    #[test]
+    fn any_popup_open_includes_a_pending_agent_approval() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.any_popup_open());
+
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+        assert!(app.any_popup_open());
+    }
+
+    /// Regression for `rev` fix round 1 (`docs/features/tui-local-agent.md`
+    /// §2.2): a pending approval must win keyboard priority over *every*
+    /// other overlay, including the menu bar -- otherwise the popup (drawn
+    /// on top of everything, `ui::render`) is visible but unreachable,
+    /// since `menu_bar.open` used to be checked first in `handle_key`.
+    #[test]
+    fn pending_approval_intercepts_keys_even_with_the_menu_bar_open() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.open_menu_bar(0);
+        assert!(app.menu_bar.open.is_some());
+
+        app.agent.pending_approval = Some(ide_agent::AgentTool::ReadFile {
+            path: "a.rs".into(),
+        });
+
+        app.handle_key(plain_key(KeyCode::Char('y')));
+
+        assert!(
+            app.agent.pending_approval.is_none(),
+            "the approval key must reach handle_agent_approval_key, not the still-open menu bar"
+        );
+        assert!(
+            app.menu_bar.open.is_some(),
+            "handling the approval key must not itself touch the menu bar's own state"
+        );
+    }
+
+    #[test]
+    fn run_debug_action_for_agent_toggle_breakpoint_works_with_no_session() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.debug.is_active());
+
+        let result = app.run_debug_action_for_agent(ide_agent::DebugAction::ToggleBreakpoint {
+            path: "a.rs".into(),
+            line: 3,
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(
+            app.debug.breakpoints.get(&PathBuf::from("a.rs")),
+            Some(&vec![3])
+        );
+    }
+
+    #[test]
+    fn run_debug_action_for_agent_other_actions_require_an_active_session() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        assert!(!app.debug.is_active());
+
+        let result = app.run_debug_action_for_agent(ide_agent::DebugAction::Resume);
+
+        assert_eq!(result, Err(ide_agent::ToolError::NoDebugSession));
+    }
+
+    #[test]
+    fn poll_agent_dispatches_awaiting_debug_execution_to_the_real_debug_panel() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let tx = app.agent.test_arm_event_channel();
+        tx.send(ide_agent::AgentEvent::AwaitingDebugExecution {
+            action: ide_agent::DebugAction::ToggleBreakpoint {
+                path: "a.rs".into(),
+                line: 7,
+            },
+        })
+        .unwrap();
+
+        app.poll_agent();
+
+        assert_eq!(
+            app.debug.breakpoints.get(&PathBuf::from("a.rs")),
+            Some(&vec![7]),
+            "poll_agent must run the action against the real DebugPanel, not a stub"
+        );
     }
 
     #[test]
