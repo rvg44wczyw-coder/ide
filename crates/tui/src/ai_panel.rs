@@ -47,6 +47,32 @@ pub(crate) enum AiContext {
     None,
 }
 
+/// Cap on selection/whole-file context chars folded into one outgoing
+/// payload (`compose`, below) -- ported from `crates/ui/src/
+/// ai_panel.rs::MAX_CONTEXT_CHARS`, added there by G9's own `hacker`
+/// finding #1 (`docs/security-findings/
+/// rust-ui-dev-gui-ai-orchestration-2026-09-08.md`) after this exact gap
+/// was found unported here (`docs/roadmap.md`'s G9 row: "тот же size-cap
+/// пробел существует непорченным в `crates/tui/src/ai_panel.rs`'s
+/// одноимённом `compose`"). Same order of magnitude as `ide_ai::
+/// MAX_REPLY_CHARS`, the closest existing precedent for "how much text is
+/// a reasonable single AI turn" on the inbound side.
+const MAX_CONTEXT_CHARS: usize = 100_000;
+
+/// Truncates `text` to at most `MAX_CONTEXT_CHARS` chars (never splitting
+/// a multi-byte char), returning the possibly-shortened text and a marker
+/// string to append (empty when nothing was cut).
+fn truncate_context(text: &str) -> (String, &'static str) {
+    if text.chars().count() <= MAX_CONTEXT_CHARS {
+        (text.to_string(), "")
+    } else {
+        (
+            text.chars().take(MAX_CONTEXT_CHARS).collect(),
+            "\n...(truncated)",
+        )
+    }
+}
+
 /// Everything a background request run needs, produced by
 /// `AiPanel::prepare` and consumed (spawned) by `submit`. `tx` lets tests
 /// feed the panel's channel directly without spawning a thread.
@@ -138,15 +164,26 @@ impl AiPanel {
 
     /// Compose the single line that actually leaves for the provider:
     /// prompt + any selection/whole-file context folded in. `None` for a
-    /// blank/whitespace-only prompt (no request).
+    /// blank/whitespace-only prompt (no request). Selection/whole-file text
+    /// is capped at `MAX_CONTEXT_CHARS` -- `ide-ai` bounds the FIM/
+    /// classifier/reply paths but has no equivalent cap for an ordinary
+    /// chat body, so an unbounded whole-file send (e.g. a large file in an
+    /// untrusted cloned repo) is a memory/bandwidth/cost-DoS surface if
+    /// left uncapped here.
     fn compose(&self, prompt: String, context: AiContext) -> Option<String> {
         if prompt.trim().is_empty() {
             return None;
         }
         Some(match context {
             AiContext::None => prompt,
-            AiContext::Selection(sel) => format!("{prompt}\n\nSelected code:\n```\n{sel}\n```"),
-            AiContext::WholeFile(file) => format!("{prompt}\n\nFull file:\n```\n{file}\n```"),
+            AiContext::Selection(sel) => {
+                let (sel, marker) = truncate_context(&sel);
+                format!("{prompt}\n\nSelected code:\n```\n{sel}{marker}\n```")
+            }
+            AiContext::WholeFile(file) => {
+                let (file, marker) = truncate_context(&file);
+                format!("{prompt}\n\nFull file:\n```\n{file}{marker}\n```")
+            }
         })
     }
 
@@ -428,6 +465,59 @@ mod tests {
         let panel = AiPanel::new(temp_root());
         assert_eq!(panel.compose("   ".into(), AiContext::None), None);
         assert_eq!(panel.compose(String::new(), AiContext::None), None);
+    }
+
+    #[test]
+    fn compose_truncates_an_oversized_whole_file_context() {
+        let panel = AiPanel::new(temp_root());
+        let huge = "x".repeat(MAX_CONTEXT_CHARS + 10);
+        let composed = panel
+            .compose("review".into(), AiContext::WholeFile(huge))
+            .unwrap();
+        assert!(composed.contains("...(truncated)"));
+        // prompt + fences + marker overhead, but the embedded file body
+        // itself must not exceed the cap.
+        let body_len = composed
+            .split("```\n")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches("\n```")
+            .trim_end_matches("\n...(truncated)")
+            .chars()
+            .count();
+        assert_eq!(body_len, MAX_CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn compose_truncates_an_oversized_selection_context() {
+        let panel = AiPanel::new(temp_root());
+        let huge = "y".repeat(MAX_CONTEXT_CHARS + 1);
+        let composed = panel
+            .compose("explain".into(), AiContext::Selection(huge))
+            .unwrap();
+        assert!(composed.contains("...(truncated)"));
+    }
+
+    #[test]
+    fn compose_does_not_truncate_context_at_or_under_the_cap() {
+        let panel = AiPanel::new(temp_root());
+        let exactly_at_cap = "z".repeat(MAX_CONTEXT_CHARS);
+        let composed = panel
+            .compose("review".into(), AiContext::WholeFile(exactly_at_cap))
+            .unwrap();
+        assert!(!composed.contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_context_never_splits_a_multi_byte_char() {
+        let text = "é".repeat(MAX_CONTEXT_CHARS + 5);
+        let (truncated, marker) = truncate_context(&text);
+        assert_eq!(truncated.chars().count(), MAX_CONTEXT_CHARS);
+        assert_eq!(marker, "\n...(truncated)");
+        // Every char in the result must still be valid UTF-8 -- this would
+        // already be guaranteed by `String`'s own invariants, but the
+        // assertion documents the intent explicitly.
+        assert!(truncated.chars().all(|c| c == 'é'));
     }
 
     #[test]

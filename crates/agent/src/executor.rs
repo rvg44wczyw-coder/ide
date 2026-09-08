@@ -123,15 +123,49 @@ impl ToolExecutor {
 
     /// `EditFile` cannot use `validate` unmodified: its target may not
     /// exist yet (creating a new file), and `validate_path` canonicalizes
-    /// the path itself, which requires the target to already exist. So the
-    /// *parent* directory is canonicalized and checked instead, then the
-    /// file's own name is joined back on. A parent that fails to
-    /// canonicalize at all (doesn't exist, permission denied) is
-    /// `ToolError::Io`, not `PathEscape` -- that variant is reserved for an
-    /// actual escape. There is no directory-creation tool in v1, so a
-    /// missing parent is a real, narrow scope cut, not a silent gap.
-    fn edit_file(&self, path: &str, new_text: &str) -> Result<String, ToolError> {
+    /// the path itself, which requires the target to already exist.
+    ///
+    /// This used to canonicalize only the *parent* directory and join the
+    /// file name back on unchecked -- which meant an existing symlink
+    /// already sitting at the leaf position (dangling or not) was never
+    /// itself resolved or rejected, and `std::fs::write` follows symlinks:
+    /// a project-tree symlink pointing outside `project_root` let `path`
+    /// resolve inside the check but write anywhere on disk the symlink's
+    /// target could reach. Exactly the class of bug `crates/ui/src/
+    /// agent_panel.rs::validated_edit_target` was written to fix for the
+    /// read-only preview path (G10's own `hacker` findings,
+    /// `docs/security-findings/rust-ui-dev-gui-local-agent-2026-09-08.md`)
+    /// -- flagged there as a known, unported gap in this exact function
+    /// (`docs/roadmap.md`'s G10 row) since this one is the actual write
+    /// path, not just a preview. Ported the identical fix: canonicalize
+    /// the full target first; an existing leaf must resolve inside
+    /// `project_root` and must not be a directory (`!canonical.is_dir()`
+    /// also subsumes the case where `path` resolves back to the root
+    /// itself, e.g. `""`/`"."`); a *dangling* symlink at the leaf (whose
+    /// target doesn't exist, so `canonicalize` can't see it --
+    /// `symlink_metadata` can, without following it) is rejected too. Only
+    /// once neither the leaf nor anything symlink-shaped exists there does
+    /// this fall back to the original parent-only canonicalization, for a
+    /// genuinely new file. A parent that fails to canonicalize at all
+    /// (doesn't exist, permission denied) is `ToolError::Io`, not
+    /// `PathEscape` -- that variant is reserved for an actual escape.
+    /// There is no directory-creation tool in v1, so a missing parent is a
+    /// real, narrow scope cut, not a silent gap.
+    fn validated_edit_target(&self, path: &str) -> Result<PathBuf, ToolError> {
+        if path.is_empty() {
+            return Err(ToolError::PathEscape);
+        }
         let target = self.project_root.join(path);
+        if let Ok(canonical) = std::fs::canonicalize(&target) {
+            return if canonical.starts_with(&self.project_root) && !canonical.is_dir() {
+                Ok(canonical)
+            } else {
+                Err(ToolError::PathEscape)
+            };
+        }
+        if std::fs::symlink_metadata(&target).is_ok() {
+            return Err(ToolError::PathEscape);
+        }
         let parent = target.parent().ok_or(ToolError::PathEscape)?;
         let canonical_parent =
             std::fs::canonicalize(parent).map_err(|e| ToolError::Io(e.to_string()))?;
@@ -139,7 +173,11 @@ impl ToolExecutor {
             return Err(ToolError::PathEscape);
         }
         let file_name = target.file_name().ok_or(ToolError::PathEscape)?;
-        let real_target = canonical_parent.join(file_name);
+        Ok(canonical_parent.join(file_name))
+    }
+
+    fn edit_file(&self, path: &str, new_text: &str) -> Result<String, ToolError> {
+        let real_target = self.validated_edit_target(path)?;
         std::fs::write(&real_target, new_text).map_err(|e| ToolError::Io(e.to_string()))?;
         Ok(format!("wrote {} bytes to {path}", new_text.len()))
     }
@@ -279,6 +317,76 @@ mod tests {
         let mut exec = ToolExecutor::new(dir.path()).unwrap();
         let result = block_on(exec.execute(AgentTool::EditFile {
             path: "../new_file.rs".into(),
+            new_text: "x".into(),
+        }));
+        assert_eq!(result.outcome.unwrap_err(), ToolError::PathEscape);
+    }
+
+    #[test]
+    fn edit_file_rejects_a_symlink_at_the_leaf_that_escapes_the_root() {
+        // The bug this guards against: a project-tree symlink pointing
+        // outside `project_root`, with the join-then-canonicalize-parent-
+        // only approach never resolving/rejecting the leaf itself --
+        // `std::fs::write` follows symlinks, so the old code would have
+        // written straight through it to `outside_file`.
+        #[cfg(unix)]
+        {
+            let dir = temp_project();
+            let outside = temp_project();
+            let outside_file = outside.path().join("secret.rs");
+            std::fs::write(&outside_file, "secret").unwrap();
+            let link = dir.path().join("link.rs");
+            std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+            let mut exec = ToolExecutor::new(dir.path()).unwrap();
+            let result = block_on(exec.execute(AgentTool::EditFile {
+                path: "link.rs".into(),
+                new_text: "pwned".into(),
+            }));
+            assert_eq!(result.outcome.unwrap_err(), ToolError::PathEscape);
+            assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "secret");
+        }
+    }
+
+    #[test]
+    fn edit_file_rejects_a_dangling_symlink_at_the_leaf() {
+        // `canonicalize` can't see this (the symlink's target doesn't
+        // exist), but it must not be treated as a fresh filename either --
+        // `symlink_metadata` sees the symlink itself without following it.
+        #[cfg(unix)]
+        {
+            let dir = temp_project();
+            let outside = temp_project();
+            let nonexistent_target = outside.path().join("does_not_exist.rs");
+            let link = dir.path().join("dangling.rs");
+            std::os::unix::fs::symlink(&nonexistent_target, &link).unwrap();
+            let mut exec = ToolExecutor::new(dir.path()).unwrap();
+            let result = block_on(exec.execute(AgentTool::EditFile {
+                path: "dangling.rs".into(),
+                new_text: "pwned".into(),
+            }));
+            assert_eq!(result.outcome.unwrap_err(), ToolError::PathEscape);
+            assert!(!nonexistent_target.exists());
+        }
+    }
+
+    #[test]
+    fn edit_file_rejects_an_existing_directory() {
+        let dir = temp_project();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let mut exec = ToolExecutor::new(dir.path()).unwrap();
+        let result = block_on(exec.execute(AgentTool::EditFile {
+            path: "sub".into(),
+            new_text: "x".into(),
+        }));
+        assert_eq!(result.outcome.unwrap_err(), ToolError::PathEscape);
+    }
+
+    #[test]
+    fn edit_file_rejects_an_empty_path() {
+        let dir = temp_project();
+        let mut exec = ToolExecutor::new(dir.path()).unwrap();
+        let result = block_on(exec.execute(AgentTool::EditFile {
+            path: String::new(),
             new_text: "x".into(),
         }));
         assert_eq!(result.outcome.unwrap_err(), ToolError::PathEscape);
