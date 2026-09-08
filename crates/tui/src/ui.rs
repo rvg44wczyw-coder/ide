@@ -1865,31 +1865,48 @@ fn render_keymap_popup(frame: &mut Frame, app: &App, area: Rect) {
     render_scrollable_list(frame, items, block, popup, state.selected);
 }
 
-/// Keys screen (`docs/features/tui-screen-navigation.md` §2.3, T44) --
-/// full-screen, read-only reference reusing `keymap_popup_rows`'s content
+/// Keys screen (`docs/features/tui-keys-screen-rebind.md` §2.4, T59) --
+/// full-screen, rebindable reference reusing `keymap_popup_rows`'s content
 /// (which tolerates `app.keymap_popup` being `None`, returning every
-/// command unfiltered). No selection/rebind UI here -- that's the existing
-/// Keymap Settings popup's job (`render_keymap_popup` above); this screen
-/// is a plain reference list, editing arrives in a later T-run (T47).
+/// command unfiltered, since this screen has no `query` of its own).
+/// Mirrors `render_keymap_popup`'s row-building exactly (selection
+/// highlight, customized marker, capturing-row text) but reads
+/// `app.keys_screen_selected`/`app.keys_screen_capturing` instead of the
+/// popup's own state.
 fn render_keys_screen(frame: &mut Frame, app: &App, area: Rect) {
     let rows = app.keymap_popup_rows();
-    let start = (app.keys_screen_scroll as usize).min(rows.len());
-    let items: Vec<ListItem> = rows[start..]
+    let items: Vec<ListItem> = rows
         .iter()
-        .map(|cmd| {
+        .enumerate()
+        .map(|(i, cmd)| {
+            let style = if i == app.keys_screen_selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
             let binding = app
                 .keymap
                 .effective_binding(cmd.id)
                 .map(crate::keymap::label)
                 .unwrap_or_else(|| "\u{2014}".to_string());
-            ListItem::new(Line::from(format!("{}  {binding}", cmd.title)))
+            let customized = if app.keymap.is_customized(cmd.id) {
+                "*"
+            } else {
+                ""
+            };
+            let text = if Some(cmd.id) == app.keys_screen_capturing {
+                format!("{}  [Press a key... Esc to cancel]", cmd.title)
+            } else {
+                format!("{}{customized}  {binding}", cmd.title)
+            };
+            ListItem::new(Line::from(Span::styled(text, style)))
         })
         .collect();
 
     let block = Block::default().borders(Borders::ALL).title(
-        "Keys  (reference only -- use the Keymap command to rebind; Up/Down/PgUp/PgDn: scroll)",
+        "Keys  (Enter: rebind, Delete: reset, Up/Down/PgUp/PgDn: navigate, Esc: back to editor)",
     );
-    frame.render_widget(List::new(items).block(block), area);
+    render_scrollable_list(frame, items, block, area, app.keys_screen_selected);
 }
 
 /// Theme Settings popup (`docs/features/tui-theme.md` §2.3/`T41`) --

@@ -1015,12 +1015,17 @@ pub struct App {
     pub(crate) tree_state: TreeState,
     pub(crate) focus: Focus,
     pub(crate) active_screen: AppScreen,
-    /// Plain scroll offset for the Keys screen (mouse-support revision
-    /// note 3, §2.3) -- this content has no
-    /// selectable rows (T44 kept it read-only-reference), so there's
-    /// nothing for a `ListState` to keep in view; mirrors `GitPanelState::
-    /// diff_scroll`'s plain-offset shape instead.
-    pub(crate) keys_screen_scroll: u16,
+    /// Highlighted row index into `keymap_popup_rows()` (unfiltered on
+    /// this screen -- no `query`, `docs/features/tui-keys-screen-rebind.md`
+    /// §1). Row order is `commands()`'s own registry order, the same
+    /// order `keymap_popup_rows()` already returns it in when its `query`
+    /// is empty.
+    pub(crate) keys_screen_selected: usize,
+    /// `Some(id)` while the *next* raw key event is captured as `id`'s new
+    /// binding, mirroring `KeymapPopupState::capturing`'s exact contract
+    /// (`docs/features/tui-keymap.md` §2.4) but scoped to this screen
+    /// instead of the popup.
+    pub(crate) keys_screen_capturing: Option<&'static str>,
     pub(crate) tabs: Vec<OpenBuffer>,
     pub(crate) active_tab: Option<usize>,
     pub(crate) palette: Option<PaletteState>,
@@ -1369,7 +1374,8 @@ impl App {
             tree_state: TreeState::new(),
             focus: Focus::LeftDock,
             active_screen: AppScreen::default(),
-            keys_screen_scroll: 0,
+            keys_screen_selected: 0,
+            keys_screen_capturing: None,
             tabs: Vec::new(),
             active_tab: None,
             palette: None,
@@ -6865,6 +6871,15 @@ impl App {
         {
             return self.handle_agent_panel_key(key);
         }
+        // `docs/features/tui-keys-screen-rebind.md` §2.3, T59 -- must sit
+        // before T44's generic Esc-returns-to-Editor rule immediately
+        // below: while capturing a new binding on the Keys screen, Esc
+        // must cancel the capture and stay on this screen, not kick the
+        // user back to Editor mid-capture the way an unrelated bare Esc
+        // on this screen otherwise would.
+        if self.active_screen == AppScreen::Keys && self.keys_screen_capturing.is_some() {
+            return self.handle_keys_screen_capture_key(key);
+        }
         // `docs/features/tui-screen-navigation.md` §3.5, T44 -- must sit
         // *before* the global keymap lookup below: `Esc` is already bound
         // there (`CollapseSelections`, `commands.rs`), which would
@@ -6933,25 +6948,33 @@ impl App {
         if self.active_screen == AppScreen::Run {
             return self.handle_cargo_panel_key(key);
         }
-        // `docs/features/tui-screen-navigation.md` §3.4, T44 -- read-only
-        // reference screen; without this guard an unmatched key would
-        // fall through to `Focus::Editor`'s `handle_editor_key` below and
-        // silently edit whatever buffer was open before the user switched
-        // here (`Focus` is never touched by a screen switch, see §4).
+        // `docs/features/tui-keys-screen-rebind.md` §2.3, T59 -- browse
+        // mode only; capture mode is handled by the pre-empting check
+        // above, which always returns before reaching here while
+        // `keys_screen_capturing` is `Some`. Without this guard an
+        // unmatched key would fall through to `Focus::Editor`'s
+        // `handle_editor_key` below and silently edit whatever buffer was
+        // open before the user switched here (`Focus` is never touched by
+        // a screen switch, `tui-screen-navigation.md` §4).
         if self.active_screen == AppScreen::Keys {
+            let len = self.keymap_popup_rows().len();
             match key.code {
                 KeyCode::Up => {
-                    self.keys_screen_scroll = self.keys_screen_scroll.saturating_sub(1);
+                    self.keys_screen_selected = self.keys_screen_selected.saturating_sub(1);
                 }
                 KeyCode::Down => {
-                    self.keys_screen_scroll = self.keys_screen_scroll.saturating_add(1);
+                    self.keys_screen_selected =
+                        (self.keys_screen_selected + 1).min(len.saturating_sub(1));
                 }
                 KeyCode::PageUp => {
-                    self.keys_screen_scroll = self.keys_screen_scroll.saturating_sub(10);
+                    self.keys_screen_selected = self.keys_screen_selected.saturating_sub(10);
                 }
                 KeyCode::PageDown => {
-                    self.keys_screen_scroll = self.keys_screen_scroll.saturating_add(10);
+                    self.keys_screen_selected =
+                        (self.keys_screen_selected + 10).min(len.saturating_sub(1));
                 }
+                KeyCode::Enter => self.start_keys_screen_capture(),
+                KeyCode::Delete => self.reset_selected_keys_screen_binding(),
                 _ => {}
             }
             return LoopSignal::Continue;
@@ -7000,6 +7023,7 @@ impl App {
             || self.clone_panel_open
             || self.keymap_popup.is_some()
             || self.theme_popup.is_some()
+            || (self.active_screen == AppScreen::Keys && self.keys_screen_capturing.is_some())
             || self.manage_actions_popup.is_some()
             || self.new_scratch_file.is_some()
             || self.scratch_files.is_some()
@@ -7398,7 +7422,8 @@ impl App {
         // and no editor text area, so the position-based branches below
         // would drop the wheel event; route the synthetic key into
         // `handle_key`, whose `AppScreen::Keys` guard moves
-        // `keys_screen_scroll` for exactly these Up/Down codes.
+        // `keys_screen_selected` for exactly these Up/Down codes
+        // (`docs/features/tui-keys-screen-rebind.md` §2.3, T59).
         if self.active_screen == AppScreen::Keys {
             self.handle_key(synthetic);
             return;
@@ -9888,6 +9913,70 @@ impl App {
         if let Some(state) = self.keymap_popup.as_mut() {
             state.capturing = None;
         }
+        if conflicts.is_empty() {
+            self.notify(format!(
+                "\"{id}\" is now bound to {}.",
+                keymap::label(chord)
+            ));
+        } else {
+            self.notify(format!(
+                "\"{id}\" is now bound to {} (shared with {}).",
+                keymap::label(chord),
+                conflicts.join(", ")
+            ));
+        }
+        LoopSignal::Continue
+    }
+
+    /// `Enter` on the Keys screen (`docs/features/tui-keys-screen-rebind.md`
+    /// §2.2, T59): starts capture on the highlighted row, mirroring
+    /// `start_keymap_capture`'s exact contract but for this screen's own
+    /// `keys_screen_*` fields instead of `keymap_popup`. Deliberately not
+    /// shared with the popup's method -- see that doc's §2.2 for why.
+    fn start_keys_screen_capture(&mut self) {
+        let id = self
+            .keymap_popup_rows()
+            .get(self.keys_screen_selected)
+            .map(|c| c.id);
+        if let Some(id) = id {
+            self.keys_screen_capturing = Some(id);
+        }
+    }
+
+    /// `Delete` on a row: identical contract to `reset_selected_keymap_
+    /// binding` (`docs/features/tui-keymap.md` §2.5/§3.4).
+    fn reset_selected_keys_screen_binding(&mut self) {
+        let id = self
+            .keymap_popup_rows()
+            .get(self.keys_screen_selected)
+            .map(|c| c.id);
+        if let Some(id) = id {
+            self.keymap.reset(id);
+            self.persist_keymap();
+            self.notify(format!("Reset \"{id}\" to its default binding."));
+        }
+    }
+
+    /// The next raw key event while `keys_screen_capturing` is `Some(id)`.
+    /// `Esc` cancels without assigning anything and without leaving the
+    /// Keys screen (`docs/features/tui-keys-screen-rebind.md` §2.3 -- the
+    /// pre-empting check in `handle_key` is what routes here before T44's
+    /// generic Esc-returns-to-Editor rule can fire); any other key becomes
+    /// `id`'s new binding immediately, no confirm step (same contract as
+    /// `handle_keymap_capture_key`).
+    fn handle_keys_screen_capture_key(&mut self, key: KeyEvent) -> LoopSignal {
+        let Some(id) = self.keys_screen_capturing else {
+            return LoopSignal::Continue;
+        };
+        if key.code == KeyCode::Esc {
+            self.keys_screen_capturing = None;
+            return LoopSignal::Continue;
+        }
+        let chord = (key.modifiers, key.code);
+        let conflicts = self.keymap.conflicts(id, chord);
+        self.keymap.set_override(id, Some(chord));
+        self.persist_keymap();
+        self.keys_screen_capturing = None;
         if conflicts.is_empty() {
             self.notify(format!(
                 "\"{id}\" is now bound to {}.",
@@ -15801,26 +15890,160 @@ mod tests {
     }
 
     #[test]
-    fn keys_screen_scrolls_via_up_down_page_keys() {
+    fn keys_screen_selection_moves_via_up_down_page_keys() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+        let ceiling = app.keymap_popup_rows().len() - 1;
+
+        app.handle_key(plain_key(KeyCode::PageDown));
+        assert_eq!(app.keys_screen_selected, 10);
+        app.handle_key(plain_key(KeyCode::Down));
+        assert_eq!(app.keys_screen_selected, 11);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(app.keys_screen_selected, 10);
+        app.handle_key(plain_key(KeyCode::PageUp));
+        assert_eq!(app.keys_screen_selected, 0);
+        app.handle_key(plain_key(KeyCode::Up));
+        assert_eq!(
+            app.keys_screen_selected, 0,
+            "selection saturates, never underflows below zero"
+        );
+        app.handle_key(plain_key(KeyCode::Char('x')));
+        assert_eq!(app.keys_screen_selected, 0);
+
+        for _ in 0..(ceiling + 5) {
+            app.handle_key(plain_key(KeyCode::Down));
+        }
+        assert_eq!(
+            app.keys_screen_selected, ceiling,
+            "selection clamps at the real row-count ceiling, not an arbitrary bound"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_keys_screen_starts_capture_on_the_highlighted_row() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::GoToKeysScreen);
 
-        app.handle_key(plain_key(KeyCode::PageDown));
-        assert_eq!(app.keys_screen_scroll, 10);
-        app.handle_key(plain_key(KeyCode::Down));
-        assert_eq!(app.keys_screen_scroll, 11);
-        app.handle_key(plain_key(KeyCode::Up));
-        assert_eq!(app.keys_screen_scroll, 10);
-        app.handle_key(plain_key(KeyCode::PageUp));
-        assert_eq!(app.keys_screen_scroll, 0);
-        app.handle_key(plain_key(KeyCode::Up));
+        app.handle_key(plain_key(KeyCode::Enter));
+
+        assert_eq!(app.keys_screen_capturing, Some("SaveAll"));
+    }
+
+    #[test]
+    fn capturing_a_chord_on_the_keys_screen_rebinds_and_persists() {
+        let dir = sample_project();
+        let keymap_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap_path_override = Some(keymap_dir.path().join("keymap.json"));
+        app.run_action(Action::GoToKeysScreen);
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.keys_screen_capturing, Some("SaveAll"));
+
+        app.handle_key(ctrl('x'));
+
+        assert!(app.keys_screen_capturing.is_none());
+        assert!(app.keymap.is_customized("SaveAll"));
         assert_eq!(
-            app.keys_screen_scroll, 0,
-            "scroll offset saturates, never underflows below zero"
+            app.keymap.effective_binding("SaveAll"),
+            Some((KeyModifiers::CONTROL, KeyCode::Char('x')))
         );
-        app.handle_key(plain_key(KeyCode::Char('x')));
-        assert_eq!(app.keys_screen_scroll, 0);
+        let persisted = std::fs::read_to_string(app.keymap_path_override.as_ref().unwrap())
+            .expect("persist_keymap must have written the override file");
+        assert!(
+            persisted.contains("SaveAll") && persisted.contains("ctrl+char:x"),
+            "the rebind must be persisted to disk, not just in-memory: {persisted}"
+        );
+
+        // A binding changed on the Keys screen is visible from the popup's
+        // own view too -- one shared `self.keymap`, not two copies.
+        app.run_action(Action::ToggleKeymapSettings);
+        assert_eq!(
+            app.keymap.effective_binding("SaveAll"),
+            Some((KeyModifiers::CONTROL, KeyCode::Char('x')))
+        );
+    }
+
+    #[test]
+    fn esc_during_keys_screen_capture_cancels_without_leaving_the_screen() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.keys_screen_capturing, Some("SaveAll"));
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert!(app.keys_screen_capturing.is_none());
+        assert!(!app.keymap.is_customized("SaveAll"));
+        assert_eq!(
+            app.active_screen,
+            AppScreen::Keys,
+            "Esc must cancel the capture, not kick the user back to Editor"
+        );
+    }
+
+    #[test]
+    fn esc_with_no_capture_in_progress_still_returns_to_editor() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+        assert!(app.keys_screen_capturing.is_none());
+
+        app.handle_key(plain_key(KeyCode::Esc));
+
+        assert_eq!(app.active_screen, AppScreen::Editor);
+    }
+
+    #[test]
+    fn delete_on_the_keys_screen_resets_the_highlighted_row_and_notifies() {
+        let dir = sample_project();
+        let keymap_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.keymap_path_override = Some(keymap_dir.path().join("keymap.json"));
+        app.keymap
+            .set_override("SaveAll", Some((KeyModifiers::CONTROL, KeyCode::Char('x'))));
+        app.run_action(Action::GoToKeysScreen);
+        assert!(app.keymap.is_customized("SaveAll"));
+
+        app.handle_key(plain_key(KeyCode::Delete));
+
+        assert!(!app.keymap.is_customized("SaveAll"));
+        assert!(app
+            .notifications
+            .iter()
+            .any(|n| n.message.contains("SaveAll")));
+    }
+
+    #[test]
+    fn mouse_click_on_a_screen_tab_is_ignored_during_keys_screen_capture() {
+        let dir = sample_project();
+        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        app.run_action(Action::GoToKeysScreen);
+        app.handle_key(plain_key(KeyCode::Enter));
+        assert_eq!(app.keys_screen_capturing, Some("SaveAll"));
+        let hits = ui::HitMap {
+            screen_tabs: vec![(
+                Rect {
+                    x: 10,
+                    y: 0,
+                    width: 3,
+                    height: 1,
+                },
+                AppScreen::Editor,
+            )],
+            ..Default::default()
+        };
+
+        app.handle_mouse(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 11, 0),
+            &hits,
+        );
+
+        assert_eq!(app.active_screen, AppScreen::Keys);
+        assert_eq!(app.keys_screen_capturing, Some("SaveAll"));
     }
 
     #[test]
@@ -23641,22 +23864,22 @@ mod tests {
     }
 
     #[test]
-    fn wheel_scroll_over_the_keys_screen_moves_keys_screen_scroll() {
+    fn wheel_scroll_over_the_keys_screen_moves_keys_screen_selected() {
         let dir = sample_project();
         let mut app = App::new(dir.path().to_path_buf()).unwrap();
         app.run_action(Action::GoToKeysScreen);
         let hits = ui::HitMap::default();
 
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
-        assert_eq!(app.keys_screen_scroll, 1);
+        assert_eq!(app.keys_screen_selected, 1);
         app.handle_mouse(mouse_event(MouseEventKind::ScrollDown, 5, 5), &hits);
-        assert_eq!(app.keys_screen_scroll, 2);
+        assert_eq!(app.keys_screen_selected, 2);
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
-        assert_eq!(app.keys_screen_scroll, 1);
+        assert_eq!(app.keys_screen_selected, 1);
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
-        assert_eq!(app.keys_screen_scroll, 0);
+        assert_eq!(app.keys_screen_selected, 0);
         app.handle_mouse(mouse_event(MouseEventKind::ScrollUp, 5, 5), &hits);
-        assert_eq!(app.keys_screen_scroll, 0);
+        assert_eq!(app.keys_screen_selected, 0);
     }
 
     #[test]
