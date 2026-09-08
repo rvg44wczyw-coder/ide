@@ -848,6 +848,49 @@ pub fn fallback_eligible(e: &AiError) -> bool {
     ) || matches!(e, AiError::Http(c) if *c >= 500)
 }
 
+/// §3.3's masking rule: any cloud provider in the enabled chain forces the
+/// (tighter) cloud threshold; a local-only chain masks at the local
+/// threshold only when `sanitize_local` is set; local with sanitizing off
+/// sends raw. Returns `None` for the only unmasked case.
+///
+/// Shared by both frontends (`docs/features/gui-ai-orchestration.md` §2.1)
+/// -- moved here from `ide-tui`'s `ai_panel.rs` rather than duplicated into
+/// `ide-ui`'s, since a future change to the masking-threshold rule must
+/// apply identically everywhere it's called.
+#[cfg(feature = "sanitizer")]
+pub fn decide_threshold(config: &AiConfig, order: &[ProviderId]) -> Option<f64> {
+    let has_cloud = order
+        .iter()
+        .any(|id| !matches!(id, ProviderId::OllamaLocal));
+    if has_cloud {
+        Some(config.cloud_sanitize_threshold)
+    } else if config.sanitize_local {
+        Some(config.local_sanitize_threshold)
+    } else {
+        None
+    }
+}
+
+/// The outbound half of a request: sanitize `payload` when a threshold
+/// applies, keeping the roundtrip map so the reply can be restored later;
+/// pass through untouched when unmasked.
+///
+/// Shared by both frontends, same reasoning as [`decide_threshold`] above.
+#[cfg(feature = "sanitizer")]
+pub fn mask_outgoing(
+    payload: String,
+    threshold: Option<f64>,
+) -> (String, Option<std::collections::HashMap<String, String>>) {
+    let mut sanitizer = ide_sanitizer::Sanitizer::new();
+    match threshold {
+        Some(t) => {
+            let out = sanitizer.mask_with_threshold(&payload, t);
+            (out.masked, Some(ide_sanitizer::as_map(&sanitizer)))
+        }
+        None => (payload, None),
+    }
+}
+
 /// Bounded timeout for [`classify_task_role`]'s single completion call --
 /// deliberately much shorter than [`STREAM_CHUNK_TIMEOUT`] since a slow
 /// classifier must not meaningfully delay ordinary chat latency (T55 §2.1).

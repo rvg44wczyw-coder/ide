@@ -6,7 +6,7 @@
 //! `ui.rs` renders it.
 //!
 //! Reuses T49/T55's masking and role-routing unchanged (§3.3): `submit`
-//! masks the outgoing prompt via `ai_panel::mask_outgoing`/
+//! masks the outgoing prompt via `ide_ai::mask_outgoing`/
 //! `decide_threshold` exactly like the plain chat path, and the background
 //! run resolves a `TaskRole`/`RoleRoute` exactly like `ai_panel::
 //! run_request` does before calling into `AgentLoop`.
@@ -35,12 +35,10 @@ use ide_agent::{
     ToolExecutor, ToolResult,
 };
 use ide_ai::{
-    classify_task_role, resolve_role_route, AiConfig, ChatMessage, ChatRole, PermissionMode,
-    TaskRole,
+    classify_task_role, decide_threshold, mask_outgoing, resolve_role_route, AiConfig, ChatMessage,
+    ChatRole, PermissionMode, TaskRole,
 };
 use ide_core::git::diff_text;
-
-use crate::ai_panel::{decide_threshold, mask_outgoing};
 
 /// One rendered line of agent history. Kept separate from `ide_agent::
 /// AgentEvent` so `ui.rs` never depends on `ide-agent` types directly.

@@ -17,10 +17,10 @@ use std::thread;
 use std::time::Duration;
 
 use ide_ai::{
-    classify_task_role, resolve_role_route, AiConfig, AiError, ChatMessage, DefaultRouter,
-    ProviderId, Router, TaskRole,
+    classify_task_role, decide_threshold, mask_outgoing, resolve_role_route, AiConfig, AiError,
+    ChatMessage, DefaultRouter, ProviderId, Router, TaskRole,
 };
-use ide_sanitizer::{as_map, restore_originals, Sanitizer};
+use ide_sanitizer::restore_originals;
 
 /// Provider answer, one message per reply. Walls the panel (and anything
 /// reading `history`) from `AiError`/delta machinery.
@@ -249,47 +249,6 @@ impl AiPanel {
                 true
             }
         }
-    }
-}
-
-/// §3.3's masking rule: any cloud provider in the enabled chain forces the
-/// (tighter) cloud threshold; a local-only chain masks at the local
-/// threshold only when `sanitize_local` is set; local with sanitizing off
-/// sends raw. Returns `None` for the only unmasked case.
-///
-/// `pub(crate)`, not private: `agent_panel.rs` (`docs/features/
-/// tui-local-agent.md` §3.3) reuses this unchanged rather than
-/// reimplementing it, exactly as that doc requires.
-pub(crate) fn decide_threshold(config: &AiConfig, order: &[ProviderId]) -> Option<f64> {
-    let has_cloud = order
-        .iter()
-        .any(|id| !matches!(id, ProviderId::OllamaLocal));
-    if has_cloud {
-        Some(config.cloud_sanitize_threshold)
-    } else if config.sanitize_local {
-        Some(config.local_sanitize_threshold)
-    } else {
-        None
-    }
-}
-
-/// The outbound half of the background run: sanitize `payload` when a
-/// threshold applies, keeping the roundtrip map (thread-local) so the
-/// reply can be restored; pass through untouched when unmasked.
-///
-/// `pub(crate)`: reused by `agent_panel.rs` (§3.3, same reasoning as
-/// `decide_threshold` above).
-pub(crate) fn mask_outgoing(
-    payload: String,
-    threshold: Option<f64>,
-) -> (String, Option<HashMap<String, String>>) {
-    let mut sanitizer = Sanitizer::new();
-    match threshold {
-        Some(t) => {
-            let out = sanitizer.mask_with_threshold(&payload, t);
-            (out.masked, Some(as_map(&sanitizer)))
-        }
-        None => (payload, None),
     }
 }
 
@@ -629,36 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn decide_threshold_follows_route() {
-        let default_cloud = AiConfig {
-            provider_order: vec![ProviderId::OllamaLocal, ProviderId::Groq],
-            ..AiConfig::default()
-        };
-        assert_eq!(
-            decide_threshold(&default_cloud, &default_cloud.provider_order),
-            Some(3.5)
-        );
-        let local_on = AiConfig {
-            provider_order: vec![ProviderId::OllamaLocal],
-            sanitize_local: true,
-            ..AiConfig::default()
-        };
-        assert_eq!(
-            decide_threshold(&local_on, &local_on.provider_order),
-            Some(4.0)
-        );
-        let local_off = AiConfig {
-            provider_order: vec![ProviderId::OllamaLocal],
-            sanitize_local: false,
-            ..AiConfig::default()
-        };
-        assert_eq!(
-            decide_threshold(&local_off, &local_off.provider_order),
-            None
-        );
-    }
-
-    #[test]
     fn run_request_with_no_provider_pushes_error() {
         let (tx, rx) = mpsc::channel();
         run_request(PreparedRequest {
@@ -677,22 +606,6 @@ mod tests {
 
     fn secret_token() -> String {
         "cRx7kL9pQw2vN4mBxZdF6gHj8sT1uYw0eDrTaCb".to_string()
-    }
-
-    #[test]
-    fn mask_outgoing_blanks_secrets_and_passes_through_unmasked() {
-        let payload = format!("password is {}", secret_token());
-        let (masked, map) = mask_outgoing(payload, Some(4.0));
-        assert!(
-            !masked.contains(&secret_token()),
-            "high-entropy token is masked"
-        );
-        assert!(map.is_some());
-        assert!(masked.contains("password is"));
-
-        let (passed, map2) = mask_outgoing("hi".to_string(), None);
-        assert_eq!(passed, "hi");
-        assert!(map2.is_none());
     }
 
     #[test]

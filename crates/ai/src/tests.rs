@@ -24,6 +24,8 @@ use crate::{
     ChatMessage, ChatRequest, ChatRole, DefaultRouter, HttpTransport, PermissionMode, Provider,
     ProviderId, RoleRoute, Router, SseParser, TaskRole, WireRequest, OLLAMA_FIM_MODEL,
 };
+#[cfg(feature = "sanitizer")]
+use crate::{decide_threshold, mask_outgoing};
 
 /// Minimal self-cleaning temp project root (creates `.ide/`).
 struct TempRoot(PathBuf);
@@ -1222,4 +1224,57 @@ fn dispatch_fim_branch_pushes_whole_body_text() {
     let got: Vec<ChatDelta> = rx.iter().map(|r| r.unwrap()).collect();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].text, "complete");
+}
+
+#[cfg(feature = "sanitizer")]
+#[test]
+fn decide_threshold_follows_route() {
+    let default_cloud = AiConfig {
+        provider_order: vec![ProviderId::OllamaLocal, ProviderId::Groq],
+        ..AiConfig::default()
+    };
+    assert_eq!(
+        decide_threshold(&default_cloud, &default_cloud.provider_order),
+        Some(3.5)
+    );
+    let local_on = AiConfig {
+        provider_order: vec![ProviderId::OllamaLocal],
+        sanitize_local: true,
+        ..AiConfig::default()
+    };
+    assert_eq!(
+        decide_threshold(&local_on, &local_on.provider_order),
+        Some(4.0)
+    );
+    let local_off = AiConfig {
+        provider_order: vec![ProviderId::OllamaLocal],
+        sanitize_local: false,
+        ..AiConfig::default()
+    };
+    assert_eq!(
+        decide_threshold(&local_off, &local_off.provider_order),
+        None
+    );
+}
+
+#[cfg(feature = "sanitizer")]
+fn secret_token() -> String {
+    "cRx7kL9pQw2vN4mBxZdF6gHj8sT1uYw0eDrTaCb".to_string()
+}
+
+#[cfg(feature = "sanitizer")]
+#[test]
+fn mask_outgoing_blanks_secrets_and_passes_through_unmasked() {
+    let payload = format!("password is {}", secret_token());
+    let (masked, map) = mask_outgoing(payload, Some(4.0));
+    assert!(
+        !masked.contains(&secret_token()),
+        "high-entropy token is masked"
+    );
+    assert!(map.is_some());
+    assert!(masked.contains("password is"));
+
+    let (passed, map2) = mask_outgoing("hi".to_string(), None);
+    assert_eq!(passed, "hi");
+    assert!(map2.is_none());
 }
