@@ -1169,6 +1169,26 @@ fn filter_commands_by_title(query: &str) -> Vec<&'static Command> {
 
 impl App {
     pub fn new(root: PathBuf) -> Result<Self, ProjectError> {
+        Self::new_with_state_path(root, None)
+    }
+
+    /// Split out from [`Self::new`] so a test can point the *initial*
+    /// theme/format-on-save load at an isolated path, not just later
+    /// saves/loads (`state_path_override` alone only takes effect for I/O
+    /// that happens *after* construction, at `toggle_format_on_save`/
+    /// `apply_theme`'s own call sites -- it was never consulted by the two
+    /// `crate::state::load()` calls below, which always read the real
+    /// per-user config file regardless of what a test set `override` to
+    /// afterward. That meant any test not explicitly re-setting `theme`/
+    /// `format_on_save` by hand after construction was silently reading
+    /// whatever the developer running the suite had actually persisted on
+    /// their own machine -- confirmed as the real cause of three
+    /// `theme_popup_*` tests intermittently failing, previously misfiled as
+    /// unrelated environmental flakiness).
+    fn new_with_state_path(
+        root: PathBuf,
+        state_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, ProjectError> {
         let project = Project::open(&root)?;
         let tree = project.scan_tree();
         let mut git = GitPanel::default();
@@ -1208,6 +1228,10 @@ impl App {
             }
             lang
         });
+        let initial_state = match &state_path {
+            Some(path) => crate::state::load_from(path),
+            None => crate::state::load(),
+        };
         Ok(Self {
             project_root: project.root().to_path_buf(),
             tree,
@@ -1252,9 +1276,9 @@ impl App {
             watcher,
             keymap: crate::keymap::load(),
             keymap_path_override: None,
-            state_path_override: None,
+            state_path_override: state_path,
             keymap_popup: None,
-            theme: crate::state::load().theme,
+            theme: initial_state.theme,
             theme_popup: None,
             custom_actions: crate::custom_actions::CustomActionsPanel {
                 actions: crate::custom_actions::load(project.root()),
@@ -1313,7 +1337,7 @@ impl App {
             // this crate's pre-scroll-follow behavior exactly rather than
             // guessing a real viewport height no test fixture needs.
             editor_viewport_rows: u16::MAX,
-            format_on_save: crate::state::load().format_on_save,
+            format_on_save: initial_state.format_on_save,
             format_on_save_target: None,
         })
     }
@@ -17265,7 +17289,12 @@ mod tests {
     #[test]
     fn theme_popup_up_down_clamp_without_wraparound() {
         let dir = sample_project();
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_state_path(
+            dir.path().to_path_buf(),
+            Some(state_dir.path().join("state.json")),
+        )
+        .unwrap();
         app.run_action(Action::ToggleThemeSettings);
         assert_eq!(app.theme_popup.as_ref().unwrap().selected, 0);
 
@@ -17292,8 +17321,8 @@ mod tests {
         let dir = sample_project();
         let state_dir = tempfile::tempdir().unwrap();
         let state_path = state_dir.path().join("state.json");
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
-        app.state_path_override = Some(state_path.clone());
+        let mut app =
+            App::new_with_state_path(dir.path().to_path_buf(), Some(state_path.clone())).unwrap();
         assert_eq!(app.theme, crate::theme::ThemeKind::Classic);
 
         app.run_action(Action::ToggleThemeSettings);
@@ -17311,7 +17340,12 @@ mod tests {
     #[test]
     fn theme_popup_esc_closes_without_changing_the_theme() {
         let dir = sample_project();
-        let mut app = App::new(dir.path().to_path_buf()).unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut app = App::new_with_state_path(
+            dir.path().to_path_buf(),
+            Some(state_dir.path().join("state.json")),
+        )
+        .unwrap();
         app.run_action(Action::ToggleThemeSettings);
         app.handle_key(plain_key(KeyCode::Down));
 
