@@ -389,13 +389,16 @@ convention for every other `bool`-flag popup in this crate) sets it back
 to `false`. Switching pages via the left-hand list never closes the
 window. `show_language_settings`/`show_keymap_settings` (the two
 existing flags) stay `true` for the lifetime of `show_settings_window`
-being open once either has been set — they gate whether the corresponding
-page's *content* renders when selected, not whether the window itself is
-open; nothing currently reads them to decide window visibility once this
-lands, so their `true` value while unrelated pages are showing is inert,
-matching the "defensive, never-should-observably-matter" posture already
-used elsewhere in this crate rather than threading a redundant
-`settings_page == Languages` check through their own render bodies too.
+being open once either has been set, but — corrected during
+implementation, see `render_language_settings_page`/
+`render_keymap_settings_page`'s own doc comments — they do **not** gate
+rendering of anything: keeping a `if !self.show_language_settings {
+return; }`-shaped guard on the relocated page bodies would blank the
+Languages/Keymap page when reached via the left-hand tab list instead of
+the specific `ShowLanguageSettings`/`ShowKeymapSettings` commands, since
+dispatch is already fully driven by `self.settings_page`. Both flags are
+therefore pure write-only state once this lands (set by their commands,
+read by nothing) — inert, not load-bearing.
 
 ### 3.4 Project switch and the moved fields
 
