@@ -1,0 +1,38 @@
+@startuml gui-local-agent-plan
+title G10: Local Agentic IDE Assistant (GUI) -- implementation plan (dev-chain)
+
+start
+
+:Doc written\n(docs/features/gui-local-agent.md);
+repeat
+  :rev -- DOCUMENTATION REVIEW\n(quality + security checklist + devil's-advocate);
+backward: fix doc per findings;
+repeat while (changes needed?) is (yes) not (no)
+
+partition "rust-ui-dev: crates/ui wiring only (ide-agent unchanged)" {
+  :New crates/ui/src/agent_panel.rs\n(AgentPanel/AgentDisplayEntry/AgentApprovalPreview,\nported from crates/tui/src/agent_panel.rs,\nproject_root-per-call convention);
+  :app.rs: BottomView::Agent, IdeApp.agent field,\npoll_agent/run_debug_action_for_agent,\nload_project_settings gains agent_mode reload;
+  :command.rs: ToggleAgentToolWindow / CycleAgentMode;
+  :app/render.rs: render_agent_panel,\nrender_agent_approval_popup (reuses render_diff),\nunconditional per-frame poll_agent();
+  :app/menu.rs: both commands added to View group;
+  :Cargo.toml: ide-agent path dependency;
+  :Unit tests, coverage >=80%,\nfmt/clippy/build/test green;
+  :Commit on branch;
+}
+
+repeat
+  :rev -- CODE REVIEW of crates/ui wiring;
+backward: fix findings;
+repeat while (changes needed?) is (yes) not (no)
+
+repeat
+  :hacker -- adversarial pass\n(subprocess exec via ide-agent's ToolExecutor,\npath traversal, Auto-mode allowlist bypass attempts,\nPlan/Approve/Auto mode gating,\napproval-popup focus/priority,\nproject-switch-mid-run root safety);
+backward: fix findings, re-run rev, then hacker again;
+repeat while (findings?) is (yes) not (no, clean)
+
+:merge into base branch;
+:Update docs/roadmap.md section 10 row (G10);
+:Report to user -- not pushed;
+
+stop
+@enduml
