@@ -2407,9 +2407,11 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "ide-ai",
  "ide-core",
  "ide-dap",
  "ide-lsp",
+ "ide-sanitizer",
  "ide-tui",
  "muda",
  "portable-pty",
@@ -2418,6 +2420,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
