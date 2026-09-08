@@ -702,14 +702,11 @@ where
     deserializer.deserialize_seq(BoundedVisitor)
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct ProjectPreferences {
-    theme: Theme,
     #[serde(deserialize_with = "deserialize_bounded_custom_languages")]
     custom_languages: Vec<LanguageConfig>,
-    keymap: KeymapOverlay,
-    format_on_save: bool,
     /// `LanguageSuggestion::marker_file` values the user has dismissed for
     /// this project (`docs/features/language-auto-detect.md` §3.3).
     /// `#[serde(default)]` at the container level means an older
@@ -719,14 +716,60 @@ struct ProjectPreferences {
     dismissed_language_suggestions: Vec<String>,
 }
 
-impl Default for ProjectPreferences {
+/// `~/.config/ide/settings.json`'s shape (`docs/features/
+/// settings-window.md` §2.2), via `ide_core::user_settings`. The three
+/// fields `ProjectPreferences` lost above -- these are properties of
+/// *this user*, not *this project*, so they follow the user across every
+/// project instead of resetting per switch (§3.1).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct UserPreferences {
+    theme: Theme,
+    keymap: KeymapOverlay,
+    format_on_save: bool,
+}
+
+impl Default for UserPreferences {
     fn default() -> Self {
         Self {
             theme: Theme::Dark,
-            custom_languages: Vec::new(),
             keymap: KeymapOverlay::default(),
             format_on_save: false,
-            dismissed_language_suggestions: Vec::new(),
+        }
+    }
+}
+
+/// Which page of the consolidated Settings window (§2.3) is showing.
+/// `docs/roadmap.md`'s G1 line lists seven pages; this ships the five
+/// with actual configurable behavior today (§1.1 of the doc) --
+/// `VersionControl`/`Tools` are a one-variant addition later, not a
+/// redesign, once either frontend grows a preference to put there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SettingsPage {
+    #[default]
+    Appearance,
+    Editor,
+    CodeStyle,
+    Languages,
+    Keymap,
+}
+
+impl SettingsPage {
+    const ALL: [SettingsPage; 5] = [
+        SettingsPage::Appearance,
+        SettingsPage::Editor,
+        SettingsPage::CodeStyle,
+        SettingsPage::Languages,
+        SettingsPage::Keymap,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsPage::Appearance => "Appearance",
+            SettingsPage::Editor => "Editor",
+            SettingsPage::CodeStyle => "Code Style",
+            SettingsPage::Languages => "Languages",
+            SettingsPage::Keymap => "Keymap",
         }
     }
 }
@@ -1096,6 +1139,30 @@ pub struct IdeApp {
     new_language_right_margin_column: String,
     language_settings_error: Option<String>,
     show_language_settings: bool,
+    /// Whether the consolidated Settings window (`docs/features/
+    /// settings-window.md`, G1) is open. `ShowSettings`/
+    /// `ShowLanguageSettings`/`ShowKeymapSettings` all set this `true`.
+    /// `show_language_settings`/`show_keymap_settings` are still set by
+    /// the latter two (§2.5), but no longer gate rendering of anything --
+    /// doing so would blank the Languages/Keymap pages when reached via
+    /// the left-hand tab list instead of those two specific commands (a
+    /// bug discovered while porting `render_language_settings_page`/
+    /// `render_keymap_settings_page`, see those methods' own doc
+    /// comments); dispatch is by `settings_page` alone now.
+    show_settings_window: bool,
+    /// Which page of the Settings window is showing. Not persisted
+    /// (`SettingsPage` has no `Serialize`/`Deserialize`) -- `ShowSettings`
+    /// always opens on `Appearance` (§4).
+    settings_page: SettingsPage,
+    /// Resolved once, in `IdeApp::new`, from
+    /// `ide_core::user_settings::settings_path()` -- addressed via this
+    /// field (mirroring `open_projects_registry_path`'s own doc comment
+    /// just above, and `crates/tui/src/app.rs`'s `keymap_path_override`)
+    /// so tests can point `load_user_settings`/`flush_user_settings` at a
+    /// tempdir instead of this OS's real, shared `~/.config/ide/`.
+    /// `None` in `app_without_gui()` makes both a no-op -- used by every
+    /// test that doesn't specifically exercise user-settings persistence.
+    user_settings_path: Option<PathBuf>,
     /// Mirrors `ProjectPreferences::dismissed_language_suggestions`,
     /// synced in `load_project_settings`/`flush_project_settings` exactly
     /// like `custom_languages` above
@@ -1227,11 +1294,15 @@ impl IdeApp {
     /// ordinary `load_project` call, which unconditionally registers
     /// whatever it opens (`register_open_project`'s own doc comment).
     pub fn new(cc: &eframe::CreationContext<'_>, initial_project: Option<PathBuf>) -> Self {
-        // Theme/custom_languages/keymap/format_on_save are no longer read
-        // from global `eframe::Storage` (`project-settings.md` §4): they
-        // start at the same hardcoded defaults the welcome screen (no
-        // project open) always shows, and `load_project_settings` below
-        // overwrites them with the restored project's own values, if any.
+        // custom_languages is no longer read from global `eframe::Storage`
+        // (`project-settings.md` §4): it starts at the same hardcoded
+        // default the welcome screen (no project open) always shows, and
+        // `load_project_settings` below overwrites it with the restored
+        // project's own value, if any. theme/keymap/format_on_save start
+        // the same placeholder way, but are then overwritten once, by
+        // `load_user_settings` right after construction below (§3.1 of
+        // `docs/features/settings-window.md`) -- not by
+        // `load_project_settings`, which no longer touches them.
         let theme = Theme::Dark;
         crate::theme::install_fonts(&cc.egui_ctx);
         crate::theme::apply(&cc.egui_ctx, theme);
@@ -1330,6 +1401,9 @@ impl IdeApp {
             new_language_right_margin_column: String::new(),
             language_settings_error: None,
             show_language_settings: false,
+            show_settings_window: false,
+            settings_page: SettingsPage::default(),
+            user_settings_path: ide_core::user_settings::settings_path(),
             dismissed_language_suggestions: Vec::new(),
             pending_language_suggestions: Vec::new(),
             command_palette_open: false,
@@ -1374,6 +1448,7 @@ impl IdeApp {
             pending_rename_focus: false,
             pending_rename_preview: None,
         };
+        app.load_user_settings(&cc.egui_ctx);
         if let Some(path) = initial_project {
             app.restore_last_project(Some(path), &cc.egui_ctx);
         } else {
@@ -1398,6 +1473,7 @@ impl IdeApp {
     fn toggle_theme(&mut self, ctx: &egui::Context) {
         self.theme = self.theme.next();
         crate::theme::apply(ctx, self.theme);
+        self.flush_user_settings();
     }
 
     fn toggle_view_mode(&mut self) {
@@ -1822,9 +1898,13 @@ impl IdeApp {
     /// doc fixes was specifically the recursive directory walk, not any
     /// of this. Also flushes the *previous* project's own settings before
     /// switching, clears `self.tabs`, and restores the new project's
-    /// settings/workspace (`project-settings.md` §3.1) -- `ctx` is needed
-    /// to re-apply a restored theme immediately.
-    fn load_project(&mut self, project: Project, ctx: &egui::Context) {
+    /// settings/workspace (`project-settings.md` §3.1). `ctx` is no longer
+    /// used here -- theme is user-level now (`docs/features/
+    /// settings-window.md` §3.1) and never reset by a project switch -- but
+    /// stays in the signature so every caller in this project-lifecycle
+    /// chain (`open_project`/`create_project`/`restore_last_project`) keeps
+    /// a uniform shape rather than each threading it conditionally.
+    fn load_project(&mut self, project: Project, _ctx: &egui::Context) {
         // Captured in an outer-scoped binding (not just inside the `if
         // let` below) so it's still available for `register_open_project`
         // further down, after `self.project` has already been reassigned
@@ -1865,7 +1945,7 @@ impl IdeApp {
         self.error = watcher_error;
         self.tabs = Vec::new();
         self.active_tab = None;
-        self.load_project_settings(&root, ctx);
+        self.load_project_settings(&root);
         self.pending_create_parent = None;
         self.create_project_name.clear();
         // Discards any search or replace-preview still in flight against
@@ -2165,10 +2245,7 @@ impl IdeApp {
     /// and the next successful write catches up.
     fn flush_project_settings(&mut self, root: &Path) {
         let preferences = ProjectPreferences {
-            theme: self.theme,
             custom_languages: self.custom_languages.clone(),
-            keymap: self.keymap.clone(),
-            format_on_save: self.format_on_save,
             dismissed_language_suggestions: self.dismissed_language_suggestions.clone(),
         };
         let _ = project_settings::write(root, ProjectSettingsFile::Preferences, &preferences);
@@ -2207,24 +2284,24 @@ impl IdeApp {
     }
 
     /// Reads `root`'s `.ide/preferences.json` (or
-    /// `ProjectPreferences::default()` if absent/malformed) into `self`,
-    /// re-applying the theme to `ctx` immediately. Then reads
-    /// `.ide/workspace.json` and restores up to `MAX_RESTORED_TABS` tabs
-    /// (§3.3) -- capped since `workspace.json` is untrusted (see
-    /// `MAX_RESTORED_TABS`'s doc comment). Takes `root: &Path` rather than
-    /// `&Project` for the same reason as `flush_project_settings` -- see
-    /// its doc comment.
-    fn load_project_settings(&mut self, root: &Path, ctx: &egui::Context) {
+    /// `ProjectPreferences::default()` if absent/malformed) into `self`.
+    /// Then reads `.ide/workspace.json` and restores up to
+    /// `MAX_RESTORED_TABS` tabs (§3.3) -- capped since `workspace.json` is
+    /// untrusted (see `MAX_RESTORED_TABS`'s doc comment). Takes
+    /// `root: &Path` rather than `&Project` for the same reason as
+    /// `flush_project_settings` -- see its doc comment. Deliberately does
+    /// **not** touch `theme`/`keymap`/`format_on_save` (§3.1/§3.4 of
+    /// `docs/features/settings-window.md`) -- those are `load_user_settings`'s
+    /// job now, loaded once at startup and never reset by a project switch.
+    /// No longer takes `ctx`: the only thing it used to need it for
+    /// (re-applying the theme) moved with `theme` itself.
+    fn load_project_settings(&mut self, root: &Path) {
         let preferences =
             project_settings::read::<ProjectPreferences>(root, ProjectSettingsFile::Preferences)
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-        self.theme = preferences.theme;
-        crate::theme::apply(ctx, self.theme);
         self.custom_languages = preferences.custom_languages;
-        self.keymap = preferences.keymap;
-        self.format_on_save = preferences.format_on_save;
         self.dismissed_language_suggestions = preferences.dismissed_language_suggestions;
         self.custom_actions.actions = crate::custom_actions::load(root);
         // Not just `editing_index` -- see `CustomActionsPopupState::
@@ -2284,6 +2361,46 @@ impl IdeApp {
                     .position(|t| t.buffer.path() == Some(canonical.as_path()))
             })
             .or(if self.tabs.is_empty() { None } else { Some(0) });
+    }
+
+    /// Reads `self.user_settings_path` (or `UserPreferences::default()` if
+    /// unset/absent/malformed) into `self`, re-applying the theme to `ctx`
+    /// immediately. Called exactly once, from `IdeApp::new`, before any
+    /// project is opened (`docs/features/settings-window.md` §3.1) --
+    /// `load_project_settings` never touches these three fields again
+    /// after this, so a project switch leaves them untouched. Routes
+    /// through `user_settings_path` rather than calling
+    /// `ide_core::user_settings::read` directly so tests never touch the
+    /// real `$HOME` (`user_settings_path`'s own doc comment).
+    fn load_user_settings(&mut self, ctx: &egui::Context) {
+        let preferences = self
+            .user_settings_path
+            .as_deref()
+            .and_then(ide_core::user_settings::read_from::<UserPreferences>)
+            .unwrap_or_default();
+        self.theme = preferences.theme;
+        self.keymap = preferences.keymap;
+        self.format_on_save = preferences.format_on_save;
+        crate::theme::apply(ctx, self.theme);
+    }
+
+    /// Writes `theme`/`keymap`/`format_on_save` to `self.user_settings_path`
+    /// (a no-op if unset, e.g. in tests -- see that field's doc comment).
+    /// Called immediately after any of the three changes -- through the
+    /// Settings window or an existing quick-toggle command (§2.4a of the
+    /// doc) -- never batched behind a project switch the way
+    /// `flush_project_settings` is. A write failure is swallowed, matching
+    /// `flush_project_settings`'s own posture.
+    fn flush_user_settings(&self) {
+        let Some(path) = &self.user_settings_path else {
+            return;
+        };
+        let preferences = UserPreferences {
+            theme: self.theme,
+            keymap: self.keymap.clone(),
+            format_on_save: self.format_on_save,
+        };
+        let _ = ide_core::user_settings::write_to(path, &preferences);
     }
 
     /// The path-safety check for a workspace-restore path (doc §2.1's
@@ -5095,6 +5212,7 @@ impl IdeApp {
             | CommandAction::ToggleProblemsToolWindow
             | CommandAction::ToggleClaudeToolWindow
             | CommandAction::ToggleZenMode
+            | CommandAction::ShowSettings
             | CommandAction::ShowLanguageSettings
             | CommandAction::ShowKeymapSettings
             | CommandAction::RecentFiles
@@ -5252,8 +5370,20 @@ impl IdeApp {
             CommandAction::ToggleVcsToolWindow => self.toggle_view_mode(),
             CommandAction::ToggleClaudeToolWindow => self.toggle_tool_window(ToolWindow::Claude),
             CommandAction::ToggleZenMode => self.toggle_zen_mode(),
-            CommandAction::ShowLanguageSettings => self.show_language_settings = true,
-            CommandAction::ShowKeymapSettings => self.show_keymap_settings = true,
+            CommandAction::ShowSettings => {
+                self.show_settings_window = true;
+                self.settings_page = SettingsPage::Appearance;
+            }
+            CommandAction::ShowLanguageSettings => {
+                self.show_language_settings = true;
+                self.show_settings_window = true;
+                self.settings_page = SettingsPage::Languages;
+            }
+            CommandAction::ShowKeymapSettings => {
+                self.show_keymap_settings = true;
+                self.show_settings_window = true;
+                self.settings_page = SettingsPage::Keymap;
+            }
             CommandAction::CollapseFold => self.collapse_fold_at_caret(),
             CommandAction::ExpandFold => self.expand_fold_at_caret(),
             CommandAction::CollapseAllFolds => self.collapse_all_folds(),
@@ -5279,7 +5409,10 @@ impl IdeApp {
             CommandAction::RecentFiles => self.trigger_recent_files(),
             CommandAction::RecentLocations => self.trigger_recent_locations(),
             CommandAction::ReformatCode => self.trigger_reformat_code(),
-            CommandAction::ToggleFormatOnSave => self.format_on_save = !self.format_on_save,
+            CommandAction::ToggleFormatOnSave => {
+                self.format_on_save = !self.format_on_save;
+                self.flush_user_settings();
+            }
             CommandAction::Rename => self.trigger_rename(),
             CommandAction::RefactorThis => self.trigger_refactor_this(),
             CommandAction::ExtractVariable => {
@@ -5584,6 +5717,7 @@ impl IdeApp {
         };
         self.keymap.set_override(target, Some(Binding::same(chord)));
         self.keymap_capture_target = None;
+        self.flush_user_settings();
     }
 
     /// Clears both capture fields without committing anything.
@@ -5594,6 +5728,7 @@ impl IdeApp {
 
     fn reset_keymap_binding(&mut self, id: &str) {
         self.keymap.reset(id);
+        self.flush_user_settings();
     }
 
     /// `keymap.md` §2.6's `export_keymap`/`import_keymap` are split here
@@ -5886,6 +6021,9 @@ mod tests {
             new_language_right_margin_column: String::new(),
             language_settings_error: None,
             show_language_settings: false,
+            show_settings_window: false,
+            settings_page: SettingsPage::default(),
+            user_settings_path: None,
             dismissed_language_suggestions: Vec::new(),
             pending_language_suggestions: Vec::new(),
             command_palette_open: false,
@@ -7455,23 +7593,180 @@ b
     fn flush_then_load_project_settings_round_trips_preferences() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_without_gui();
-        app.theme = Theme::Light;
         app.custom_languages = vec![go_config()];
-        app.format_on_save = true;
         app.dismissed_language_suggestions = vec!["go.mod".to_string()];
 
         app.flush_project_settings(dir.path());
 
         let mut reloaded = app_without_gui();
-        reloaded.load_project_settings(dir.path(), &egui::Context::default());
+        reloaded.load_project_settings(dir.path());
 
-        assert_eq!(reloaded.theme, Theme::Light);
         assert_eq!(reloaded.custom_languages, vec![go_config()]);
-        assert!(reloaded.format_on_save);
         assert_eq!(
             reloaded.dismissed_language_suggestions,
             vec!["go.mod".to_string()]
         );
+    }
+
+    // ---- settings-window.md: user-level preferences (G1) ----
+
+    #[test]
+    fn settings_page_default_is_appearance() {
+        assert_eq!(SettingsPage::default(), SettingsPage::Appearance);
+    }
+
+    #[test]
+    fn settings_page_label_names_every_variant() {
+        assert_eq!(SettingsPage::Appearance.label(), "Appearance");
+        assert_eq!(SettingsPage::Editor.label(), "Editor");
+        assert_eq!(SettingsPage::CodeStyle.label(), "Code Style");
+        assert_eq!(SettingsPage::Languages.label(), "Languages");
+        assert_eq!(SettingsPage::Keymap.label(), "Keymap");
+    }
+
+    #[test]
+    fn settings_page_all_has_all_five_variants_in_order() {
+        assert_eq!(
+            SettingsPage::ALL,
+            [
+                SettingsPage::Appearance,
+                SettingsPage::Editor,
+                SettingsPage::CodeStyle,
+                SettingsPage::Languages,
+                SettingsPage::Keymap,
+            ]
+        );
+    }
+
+    #[test]
+    fn flush_then_load_user_settings_round_trips_theme_keymap_and_format_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = app_without_gui();
+        app.user_settings_path = Some(path.clone());
+        app.theme = Theme::Light;
+        app.format_on_save = true;
+        app.keymap.scheme = crate::keymap::KeymapScheme::Fleet;
+
+        app.flush_user_settings();
+
+        let mut reloaded = app_without_gui();
+        reloaded.user_settings_path = Some(path);
+        reloaded.load_user_settings(&egui::Context::default());
+
+        assert_eq!(reloaded.theme, Theme::Light);
+        assert!(reloaded.format_on_save);
+        assert_eq!(reloaded.keymap.scheme, crate::keymap::KeymapScheme::Fleet);
+    }
+
+    #[test]
+    fn load_user_settings_defaults_when_path_is_unset() {
+        let mut app = app_without_gui();
+        app.theme = Theme::Light;
+
+        app.load_user_settings(&egui::Context::default());
+
+        // `user_settings_path` is `None` in `app_without_gui()` -- must
+        // fall back to `UserPreferences::default()`, never panic.
+        assert_eq!(app.theme, Theme::Dark);
+    }
+
+    #[test]
+    fn flush_user_settings_is_a_noop_without_a_path() {
+        // `app_without_gui()` leaves `user_settings_path` unset -- every
+        // other test that mutates theme/keymap/format_on_save must not
+        // accidentally write to this OS's real `~/.config/ide/settings.json`.
+        let mut app = app_without_gui();
+        app.theme = Theme::Light;
+        app.flush_user_settings();
+        assert!(app.user_settings_path.is_none());
+    }
+
+    #[test]
+    fn toggle_theme_flushes_user_settings_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = app_without_gui();
+        app.user_settings_path = Some(path.clone());
+        app.theme = Theme::Light;
+
+        app.toggle_theme(&egui::Context::default());
+
+        let persisted: UserPreferences = ide_core::user_settings::read_from(&path).unwrap();
+        assert_eq!(persisted.theme, app.theme);
+    }
+
+    #[test]
+    fn toggle_format_on_save_command_flushes_user_settings_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = app_without_gui();
+        app.user_settings_path = Some(path.clone());
+        let ctx = egui::Context::default();
+
+        app.run_command(CommandAction::ToggleFormatOnSave, &ctx);
+
+        let persisted: UserPreferences = ide_core::user_settings::read_from(&path).unwrap();
+        assert_eq!(persisted.format_on_save, app.format_on_save);
+    }
+
+    #[test]
+    fn confirm_keymap_capture_flushes_user_settings_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = app_without_gui();
+        app.user_settings_path = Some(path.clone());
+        app.start_keymap_capture("Undo");
+        app.keymap_capture_pending = Some((KeyChord::new(egui::Key::F9).command(), vec![]));
+
+        app.confirm_keymap_capture();
+
+        let persisted: UserPreferences = ide_core::user_settings::read_from(&path).unwrap();
+        assert!(persisted.keymap.is_customized("Undo"));
+    }
+
+    #[test]
+    fn reset_keymap_binding_flushes_user_settings_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut app = app_without_gui();
+        app.user_settings_path = Some(path.clone());
+        app.keymap.set_override("Undo", None);
+
+        app.reset_keymap_binding("Undo");
+
+        let persisted: UserPreferences = ide_core::user_settings::read_from(&path).unwrap();
+        assert!(!persisted.keymap.is_customized("Undo"));
+    }
+
+    #[test]
+    fn show_settings_command_opens_on_the_appearance_page() {
+        let mut app = app_without_gui();
+        app.settings_page = SettingsPage::Keymap;
+        app.run_command(CommandAction::ShowSettings, &egui::Context::default());
+        assert!(app.show_settings_window);
+        assert_eq!(app.settings_page, SettingsPage::Appearance);
+    }
+
+    #[test]
+    fn show_language_settings_command_also_opens_the_settings_window_on_languages() {
+        let mut app = app_without_gui();
+        app.run_command(
+            CommandAction::ShowLanguageSettings,
+            &egui::Context::default(),
+        );
+        assert!(app.show_language_settings);
+        assert!(app.show_settings_window);
+        assert_eq!(app.settings_page, SettingsPage::Languages);
+    }
+
+    #[test]
+    fn show_keymap_settings_command_also_opens_the_settings_window_on_keymap() {
+        let mut app = app_without_gui();
+        app.run_command(CommandAction::ShowKeymapSettings, &egui::Context::default());
+        assert!(app.show_keymap_settings);
+        assert!(app.show_settings_window);
+        assert_eq!(app.settings_page, SettingsPage::Keymap);
     }
 
     #[test]
@@ -7490,7 +7785,7 @@ b
         std::fs::write(ide_dir.join("preferences.json"), json).unwrap();
 
         let mut app = app_without_gui();
-        app.load_project_settings(dir.path(), &egui::Context::default());
+        app.load_project_settings(dir.path());
 
         assert_eq!(app.custom_languages.len(), MAX_CUSTOM_LANGUAGES);
         // Truncation keeps the first N entries, not an arbitrary subset.
@@ -7512,7 +7807,7 @@ b
         std::fs::write(ide_dir.join("preferences.json"), json).unwrap();
 
         let mut app = app_without_gui();
-        app.load_project_settings(dir.path(), &egui::Context::default());
+        app.load_project_settings(dir.path());
 
         assert_eq!(
             app.dismissed_language_suggestions.len(),
@@ -7527,11 +7822,13 @@ b
         let mut app = app_without_gui();
         app.theme = Theme::Light;
 
-        app.load_project_settings(dir.path(), &egui::Context::default());
+        app.load_project_settings(dir.path());
 
-        assert_eq!(app.theme, Theme::Dark);
         assert!(app.custom_languages.is_empty());
-        assert!(!app.format_on_save);
+        // theme is user-level now (§3.1/§3.4 of `settings-window.md`) --
+        // `load_project_settings` must leave it untouched even when no
+        // `.ide/` directory exists to read from.
+        assert_eq!(app.theme, Theme::Light);
     }
 
     #[test]
@@ -7547,7 +7844,7 @@ b
         );
         let mut app = app_without_gui();
 
-        app.load_project_settings(dir.path(), &egui::Context::default());
+        app.load_project_settings(dir.path());
 
         assert_eq!(app.custom_actions.actions.len(), 1);
         assert_eq!(app.custom_actions.actions[0].name, "Run tests");
@@ -7562,7 +7859,7 @@ b
         app.custom_actions_popup.new_name = "stale draft".to_string();
         app.custom_actions_popup.open = true;
 
-        app.load_project_settings(dir.path(), &egui::Context::default());
+        app.load_project_settings(dir.path());
 
         // `open` is deliberately *not* asserted false here -- resetting the
         // whole struct to `Default` closes it as a side effect, which is
@@ -7946,7 +8243,7 @@ b
         )
         .unwrap();
         let mut app = app_without_gui();
-        app.load_project_settings(dir.path(), &egui::Context::default());
+        app.load_project_settings(dir.path());
         assert_eq!(app.agent.mode, ide_ai::PermissionMode::Auto);
     }
 
@@ -8193,27 +8490,31 @@ b
     }
 
     #[test]
-    fn project_switch_preserves_each_projects_own_theme() {
+    fn project_switch_never_touches_the_user_level_theme() {
+        // Theme moved to `~/.config/ide/settings.json` (`docs/features/
+        // settings-window.md` §3.1/§3.4): a project switch must leave it
+        // exactly as the user last set it, in either direction, unlike the
+        // pre-G1 behavior where each project's own `.ide/preferences.json`
+        // used to reset it.
         let project_a = tempfile::tempdir().unwrap();
         let project_b = tempfile::tempdir().unwrap();
         let mut app = app_without_gui();
 
         app.open_project(project_a.path(), &egui::Context::default());
-        assert_eq!(app.theme, Theme::Dark);
         app.theme = Theme::Light;
 
         app.open_project(project_b.path(), &egui::Context::default());
         assert_eq!(
             app.theme,
-            Theme::Dark,
-            "project B has no .ide/ yet, must not inherit A's in-memory theme"
+            Theme::Light,
+            "project switch must not reset theme"
         );
 
         app.open_project(project_a.path(), &egui::Context::default());
         assert_eq!(
             app.theme,
             Theme::Light,
-            "switching back to A must restore A's own flushed theme"
+            "switching back must not touch theme either"
         );
     }
 
@@ -14197,7 +14498,7 @@ b
         std::fs::write(ide_dir.join("workspace.json"), json).unwrap();
 
         let mut app = app_without_gui();
-        app.load_project_settings(&root, &egui::Context::default());
+        app.load_project_settings(&root);
 
         assert_eq!(app.recent_files.len(), MAX_RECENT_FILES);
     }
@@ -14220,7 +14521,7 @@ b
         assert!(!raw.contains(root.display().to_string().as_str()));
 
         let mut reloaded = app_without_gui();
-        reloaded.load_project_settings(&root, &egui::Context::default());
+        reloaded.load_project_settings(&root);
         assert_eq!(
             reloaded.recent_files,
             vec![root.join("b.rs"), root.join("a.rs")]

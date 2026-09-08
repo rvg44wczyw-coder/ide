@@ -42,6 +42,16 @@ impl Theme {
         matches!(self, Theme::Dark | Theme::Ember)
     }
 
+    /// Settings-window label (`docs/features/settings-window.md` §2.4),
+    /// mirroring `KeymapScheme::label`'s shape.
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+            Theme::Ember => "Ember",
+        }
+    }
+
     /// The palette backing this theme. `&'static` -- tokens are compile-time
     /// constants, so resolving one is a field read, never an allocation.
     pub fn tokens(self) -> &'static Tokens {
@@ -382,6 +392,13 @@ mod tests {
         assert_eq!(Theme::Light.next(), Theme::Dark);
         assert_eq!(Theme::Dark.next(), Theme::Ember);
         assert_eq!(Theme::Ember.next(), Theme::Light);
+    }
+
+    #[test]
+    fn label_names_every_variant() {
+        assert_eq!(Theme::Light.label(), "Light");
+        assert_eq!(Theme::Dark.label(), "Dark");
+        assert_eq!(Theme::Ember.label(), "Ember");
     }
 
     #[test]

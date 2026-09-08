@@ -146,9 +146,10 @@ const MENU_GROUPS: &[MenuGroup] = &[
     },
 ];
 
-/// The app-name menu's non-predefined items (Languages…/Keymap…),
-/// inserted before the predefined Services/Hide/Quit block (§3.2).
-const APP_MENU_ITEMS: &[&str] = &["ShowLanguageSettings", "ShowKeymapSettings"];
+/// The app-name menu's non-predefined items (Settings…/Languages…/
+/// Keymap…), inserted before the predefined Services/Hide/Quit block
+/// (§3.2).
+const APP_MENU_ITEMS: &[&str] = &["ShowSettings", "ShowLanguageSettings", "ShowKeymapSettings"];
 
 pub(super) fn menu_groups() -> &'static [MenuGroup] {
     MENU_GROUPS
