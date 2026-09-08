@@ -184,6 +184,7 @@ pub enum CommandAction {
     ToggleVcsToolWindow,
     ToggleClaudeToolWindow,
     ToggleZenMode,
+    ShowSettings,
     ShowLanguageSettings,
     ShowKeymapSettings,
     CollapseFold,
@@ -643,6 +644,16 @@ pub fn commands() -> &'static [Command] {
                 category: "View",
                 binding: None,
                 action: CommandAction::ToggleZenMode,
+            },
+            Command {
+                id: "ShowSettings",
+                title: "Settings…",
+                category: "Settings",
+                // Pure Cmd->Ctrl substitution (`KeyChord::command` already
+                // abstracts it) -- `docs/roadmap.md` §5.2 reserves this
+                // exact binding for `Settings`/`G1`.
+                binding: Some(Binding::same(KeyChord::new(Key::Comma).command())),
+                action: CommandAction::ShowSettings,
             },
             Command {
                 id: "ShowLanguageSettings",

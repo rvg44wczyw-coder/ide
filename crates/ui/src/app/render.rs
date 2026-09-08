@@ -6,7 +6,8 @@
 
 use super::{
     BottomView, ClaudeMessage, ClaudeView, ExternalChange, IdeApp, RestoreChoice,
-    SearchEverywhereRow, SearchEverywhereTab, SmartModeState, ToolWindow, ViewMode,
+    SearchEverywhereRow, SearchEverywhereTab, SettingsPage, SmartModeState, Theme, ToolWindow,
+    ViewMode,
 };
 use crate::command::{self, CommandAction};
 use crate::editor::blame_gutter::relative_time;
@@ -3245,225 +3246,371 @@ impl IdeApp {
             });
     }
 
-    /// "Languages…" settings window (doc §3): a fixed, non-interactive row
-    /// for the built-in Rust config, each `custom_languages` entry with a
-    /// "Remove" button, a three-field add-form, and any
-    /// `language_settings_error` in red.
-    fn render_language_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_language_settings {
-            return;
-        }
-        let danger = self.theme.tokens().color.danger;
-        let mut open = true;
-        egui::Window::new("Languages…")
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("Rust (.rs) — rust-analyzer (built-in)");
-                ui.separator();
-
-                let mut remove = None;
-                for (idx, lang) in self.custom_languages.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{} (.{}) — {} [{}]",
-                            lang.name,
-                            lang.extension,
-                            command_line(&lang.command, &lang.args),
-                            if self.lsp.is_running_for_extension(&lang.extension) {
-                                "running"
-                            } else {
-                                "stopped"
-                            }
-                        ));
-                        if ui.button("Remove").clicked() {
-                            remove = Some(idx);
-                        }
-                    });
-                }
-                if let Some(idx) = remove {
-                    self.remove_custom_language(idx);
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_language_name);
-                    ui.text_edit_singleline(&mut self.new_language_extension);
-                    ui.text_edit_singleline(&mut self.new_language_command);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_language_args)
-                            .hint_text("Arguments")
-                            .desired_width(160.0),
-                    )
-                    .on_hover_text("Not for secrets — visible to other local processes (ps).");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_language_debug_adapter_command)
-                            .hint_text("Debug adapter (optional)")
-                            .desired_width(160.0),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_language_debug_adapter_args)
-                            .hint_text("Debug adapter args")
-                            .desired_width(160.0),
-                    )
-                    .on_hover_text("Not for secrets — visible to other local processes (ps).");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_language_right_margin_column)
-                            .hint_text("Right margin column (blank = 120)")
-                            .desired_width(160.0),
-                    );
-                    if ui.button("Add").clicked() {
-                        self.add_custom_language();
-                    }
-                });
-                if let Some(err) = &self.language_settings_error {
-                    ui.colored_label(danger, err);
-                }
-                if ui.button("Close").clicked() {
-                    self.show_language_settings = false;
-                }
-            });
-        if !open {
-            self.show_language_settings = false;
-        }
-    }
-
-    /// "Keymap…" settings window (`keymap.md` §3.5): scheme picker,
-    /// search field, one row per `keymap_filtered_ids()` id (effective
-    /// binding label, Edit/Reset), every `keymap::gestures()` entry
-    /// (display-only, `keymap.md` §6), Reset All / Export… / Import….
-    fn render_keymap_settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_keymap_settings {
+    /// Consolidated Settings window (`docs/features/settings-window.md`
+    /// G1) -- one `egui::Window` (not Modal: §4 of the doc, nothing
+    /// irreversible happens on a stray outside click), page tabs down the
+    /// left, dispatched by `self.settings_page`. Polls the keymap capture
+    /// flow unconditionally, before building the window, so an in-progress
+    /// capture is never silently dropped by switching pages mid-capture.
+    fn render_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings_window {
             return;
         }
         self.poll_keymap_capture(ctx);
-        let danger = self.theme.tokens().color.danger;
-        let mac_style = cfg!(target_os = "macos");
         let mut open = true;
-        egui::Window::new("Keymap…")
+        egui::Window::new("Settings")
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Scheme:");
-                    egui::ComboBox::from_id_salt("keymap_scheme")
-                        .selected_text(self.keymap.scheme.label())
-                        .show_ui(ui, |ui| {
-                            for scheme in crate::keymap::KeymapScheme::ALL {
-                                if ui
-                                    .selectable_label(self.keymap.scheme == scheme, scheme.label())
-                                    .clicked()
-                                {
-                                    self.keymap.scheme = scheme;
-                                }
+                    ui.vertical(|ui| {
+                        for page in SettingsPage::ALL {
+                            if ui
+                                .selectable_label(self.settings_page == page, page.label())
+                                .clicked()
+                            {
+                                self.settings_page = page;
                             }
-                        });
+                        }
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| match self.settings_page {
+                        SettingsPage::Appearance => self.render_appearance_settings_page(ui, ctx),
+                        SettingsPage::Editor => self.render_editor_settings_page(ui),
+                        SettingsPage::CodeStyle => self.render_code_style_settings_page(ui),
+                        SettingsPage::Languages => self.render_language_settings_page(ui),
+                        SettingsPage::Keymap => self.render_keymap_settings_page(ui),
+                    });
                 });
-                ui.text_edit_singleline(&mut self.keymap_search);
-                ui.separator();
-
-                let mut reset_clicked = None;
-                let mut edit_clicked = None;
-                for id in self.keymap_filtered_ids() {
-                    let cmd = command::commands().iter().find(|c| c.id == id).unwrap();
-                    let label = self
-                        .keymap
-                        .effective_binding(cmd.id)
-                        .map(|b| b.for_platform().label(mac_style))
-                        .unwrap_or_else(|| "—".to_string());
-                    let capturing = self.keymap_capture_target == Some(cmd.id);
-                    let pending = self.keymap_capture_pending.clone();
-                    ui.push_id(cmd.id, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("{} ({})", cmd.title, cmd.category));
-                            match (capturing, pending) {
-                                (true, None) => {
-                                    ui.label("Press a shortcut…");
-                                }
-                                (true, Some((chord, conflicts))) => {
-                                    ui.label(chord.label(mac_style));
-                                    if !conflicts.is_empty() {
-                                        ui.colored_label(
-                                            danger,
-                                            format!("Conflicts with: {}", conflicts.join(", ")),
-                                        );
-                                    }
-                                    if ui.button("Confirm").clicked() {
-                                        self.confirm_keymap_capture();
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        self.cancel_keymap_capture();
-                                    }
-                                }
-                                (false, _) => {
-                                    ui.label(label);
-                                    if ui.button("Edit").clicked() {
-                                        edit_clicked = Some(cmd.id);
-                                    }
-                                    ui.add_enabled_ui(self.keymap.is_customized(cmd.id), |ui| {
-                                        if ui.button("Reset").clicked() {
-                                            reset_clicked = Some(cmd.id);
-                                        }
-                                    });
-                                }
-                            }
-                        });
-                    });
-                }
-                if let Some(id) = edit_clicked {
-                    self.start_keymap_capture(id);
-                }
-                if let Some(id) = reset_clicked {
-                    self.reset_keymap_binding(id);
-                }
-
-                ui.separator();
-                for gesture in crate::keymap::gestures() {
-                    ui.push_id(gesture.id, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(format!(
-                                "{} ({}) — gesture",
-                                gesture.title, gesture.category
-                            ));
-                            ui.label(gesture.default.label(mac_style));
-                        });
-                    });
-                }
-
-                ui.separator();
-                if ui.button("Reset All").clicked() {
-                    self.keymap.reset_all();
-                }
-                if ui.button("Export…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().save_file() {
-                        if let Err(e) = self.export_keymap_to(&path) {
-                            self.keymap_import_error = Some(e.to_string());
-                        }
-                    }
-                }
-                if ui.button("Import…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        match self.import_keymap_from(&path) {
-                            Ok(report) => {
-                                self.keymap_import_error = None;
-                                if !report.skipped_unknown_ids.is_empty() {
-                                    self.error = Some(format!(
-                                        "Keymap import: unknown commands skipped: {}",
-                                        report.skipped_unknown_ids.join(", ")
-                                    ));
-                                }
-                            }
-                            Err(e) => self.keymap_import_error = Some(e),
-                        }
-                    }
-                }
-                if let Some(err) = &self.keymap_import_error {
-                    ui.colored_label(danger, err);
-                }
-                if ui.button("Close").clicked() {
-                    self.show_keymap_settings = false;
-                }
             });
         if !open {
-            self.show_keymap_settings = false;
+            self.show_settings_window = false;
+        }
+    }
+
+    /// Direct theme picker (`settings-window.md` §2.4) -- one row per
+    /// `Theme` variant, replacing `ToggleTheme`'s cycle-only `next()` as
+    /// this page's own interaction (the command itself is unchanged, still
+    /// available from the palette/menu).
+    fn render_appearance_settings_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Appearance");
+        ui.separator();
+        for theme in [Theme::Light, Theme::Dark, Theme::Ember] {
+            if ui
+                .selectable_label(self.theme == theme, theme.label())
+                .clicked()
+            {
+                self.theme = theme;
+                crate::theme::apply(ctx, self.theme);
+                self.flush_user_settings();
+            }
+        }
+    }
+
+    fn render_editor_settings_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Editor");
+        ui.separator();
+        if ui
+            .checkbox(&mut self.format_on_save, "Format on save")
+            .changed()
+        {
+            self.flush_user_settings();
+        }
+    }
+
+    /// Read-only diagnostic view of the active tab's already-resolved
+    /// `.editorconfig` (`settings-window.md` §2.4) -- no new I/O, no
+    /// override controls in v1, just what's already on `Tab::config`.
+    fn render_code_style_settings_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Code Style");
+        ui.separator();
+        let Some(tab) = self.active_tab.and_then(|idx| self.tabs.get(idx)) else {
+            ui.label("Open a file to see its effective code style.");
+            return;
+        };
+        let config = &tab.config;
+        let row = |ui: &mut egui::Ui, label: &str, value: String| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.label(value);
+            });
+        };
+        let shown = |v: Option<&dyn std::fmt::Debug>| match v {
+            Some(v) => format!("{v:?}"),
+            None => "(editor default)".to_string(),
+        };
+        row(
+            ui,
+            "Indent style:",
+            shown(
+                config
+                    .indent_style
+                    .as_ref()
+                    .map(|v| v as &dyn std::fmt::Debug),
+            ),
+        );
+        row(
+            ui,
+            "Indent size:",
+            shown(
+                config
+                    .indent_size
+                    .as_ref()
+                    .map(|v| v as &dyn std::fmt::Debug),
+            ),
+        );
+        row(
+            ui,
+            "Trim trailing whitespace:",
+            shown(
+                config
+                    .trim_trailing_whitespace
+                    .as_ref()
+                    .map(|v| v as &dyn std::fmt::Debug),
+            ),
+        );
+        row(
+            ui,
+            "Insert final newline:",
+            shown(
+                config
+                    .insert_final_newline
+                    .as_ref()
+                    .map(|v| v as &dyn std::fmt::Debug),
+            ),
+        );
+        row(
+            ui,
+            "End of line:",
+            shown(
+                config
+                    .end_of_line
+                    .as_ref()
+                    .map(|v| v as &dyn std::fmt::Debug),
+            ),
+        );
+        row(
+            ui,
+            "Charset:",
+            shown(config.charset.as_ref().map(|v| v as &dyn std::fmt::Debug)),
+        );
+    }
+
+    /// "Languages…" page (doc §3): a fixed, non-interactive row for the
+    /// built-in Rust config, each `custom_languages` entry with a "Remove"
+    /// button, a three-field add-form, and any `language_settings_error`
+    /// in red. Relocated from the former standalone `render_language_
+    /// settings_window` -- every detail unchanged except the window
+    /// wrapper itself: dispatch to this page is already gated by
+    /// `self.settings_page == Languages` in `render_settings_window`, so
+    /// the old `if !self.show_language_settings { return; }` guard here
+    /// would have been redundant at best -- and, discovered while porting
+    /// this body, actively wrong: reaching this page via the left-hand tab
+    /// list (e.g. after `ShowSettings`/`⌘,`, which never sets
+    /// `show_language_settings`) would otherwise render nothing at all.
+    /// `show_language_settings` itself is untouched everywhere else
+    /// (`ShowLanguageSettings` still sets it, §2.5) since nothing else
+    /// reads it; only this dead/harmful gate is dropped. "Close" now closes
+    /// the whole Settings window rather than a flag nothing gates on.
+    fn render_language_settings_page(&mut self, ui: &mut egui::Ui) {
+        let danger = self.theme.tokens().color.danger;
+        ui.label("Rust (.rs) — rust-analyzer (built-in)");
+        ui.separator();
+
+        let mut remove = None;
+        for (idx, lang) in self.custom_languages.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} (.{}) — {} [{}]",
+                    lang.name,
+                    lang.extension,
+                    command_line(&lang.command, &lang.args),
+                    if self.lsp.is_running_for_extension(&lang.extension) {
+                        "running"
+                    } else {
+                        "stopped"
+                    }
+                ));
+                if ui.button("Remove").clicked() {
+                    remove = Some(idx);
+                }
+            });
+        }
+        if let Some(idx) = remove {
+            self.remove_custom_language(idx);
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.new_language_name);
+            ui.text_edit_singleline(&mut self.new_language_extension);
+            ui.text_edit_singleline(&mut self.new_language_command);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_language_args)
+                    .hint_text("Arguments")
+                    .desired_width(160.0),
+            )
+            .on_hover_text("Not for secrets — visible to other local processes (ps).");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_language_debug_adapter_command)
+                    .hint_text("Debug adapter (optional)")
+                    .desired_width(160.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_language_debug_adapter_args)
+                    .hint_text("Debug adapter args")
+                    .desired_width(160.0),
+            )
+            .on_hover_text("Not for secrets — visible to other local processes (ps).");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_language_right_margin_column)
+                    .hint_text("Right margin column (blank = 120)")
+                    .desired_width(160.0),
+            );
+            if ui.button("Add").clicked() {
+                self.add_custom_language();
+            }
+        });
+        if let Some(err) = &self.language_settings_error {
+            ui.colored_label(danger, err);
+        }
+        if ui.button("Close").clicked() {
+            self.show_settings_window = false;
+        }
+    }
+
+    /// "Keymap…" page (`keymap.md` §3.5): scheme picker, search field, one
+    /// row per `keymap_filtered_ids()` id (effective binding label,
+    /// Edit/Reset), every `keymap::gestures()` entry (display-only,
+    /// `keymap.md` §6), Reset All / Export… / Import…. Relocated the same
+    /// way `render_language_settings_page` was, including dropping the
+    /// former `show_keymap_settings` rendering guard for the identical
+    /// reason (see that method's doc comment) -- `poll_keymap_capture` no
+    /// longer runs here either, since `render_settings_window` now calls
+    /// it once, unconditionally, before dispatching to any page.
+    fn render_keymap_settings_page(&mut self, ui: &mut egui::Ui) {
+        let danger = self.theme.tokens().color.danger;
+        let mac_style = cfg!(target_os = "macos");
+        ui.horizontal(|ui| {
+            ui.label("Scheme:");
+            egui::ComboBox::from_id_salt("keymap_scheme")
+                .selected_text(self.keymap.scheme.label())
+                .show_ui(ui, |ui| {
+                    for scheme in crate::keymap::KeymapScheme::ALL {
+                        if ui
+                            .selectable_label(self.keymap.scheme == scheme, scheme.label())
+                            .clicked()
+                        {
+                            self.keymap.scheme = scheme;
+                            self.flush_user_settings();
+                        }
+                    }
+                });
+        });
+        ui.text_edit_singleline(&mut self.keymap_search);
+        ui.separator();
+
+        let mut reset_clicked = None;
+        let mut edit_clicked = None;
+        for id in self.keymap_filtered_ids() {
+            let cmd = command::commands().iter().find(|c| c.id == id).unwrap();
+            let label = self
+                .keymap
+                .effective_binding(cmd.id)
+                .map(|b| b.for_platform().label(mac_style))
+                .unwrap_or_else(|| "—".to_string());
+            let capturing = self.keymap_capture_target == Some(cmd.id);
+            let pending = self.keymap_capture_pending.clone();
+            ui.push_id(cmd.id, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} ({})", cmd.title, cmd.category));
+                    match (capturing, pending) {
+                        (true, None) => {
+                            ui.label("Press a shortcut…");
+                        }
+                        (true, Some((chord, conflicts))) => {
+                            ui.label(chord.label(mac_style));
+                            if !conflicts.is_empty() {
+                                ui.colored_label(
+                                    danger,
+                                    format!("Conflicts with: {}", conflicts.join(", ")),
+                                );
+                            }
+                            if ui.button("Confirm").clicked() {
+                                self.confirm_keymap_capture();
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.cancel_keymap_capture();
+                            }
+                        }
+                        (false, _) => {
+                            ui.label(label);
+                            if ui.button("Edit").clicked() {
+                                edit_clicked = Some(cmd.id);
+                            }
+                            ui.add_enabled_ui(self.keymap.is_customized(cmd.id), |ui| {
+                                if ui.button("Reset").clicked() {
+                                    reset_clicked = Some(cmd.id);
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+        }
+        if let Some(id) = edit_clicked {
+            self.start_keymap_capture(id);
+        }
+        if let Some(id) = reset_clicked {
+            self.reset_keymap_binding(id);
+        }
+
+        ui.separator();
+        for gesture in crate::keymap::gestures() {
+            ui.push_id(gesture.id, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{} ({}) — gesture",
+                        gesture.title, gesture.category
+                    ));
+                    ui.label(gesture.default.label(mac_style));
+                });
+            });
+        }
+
+        ui.separator();
+        if ui.button("Reset All").clicked() {
+            self.keymap.reset_all();
+            self.flush_user_settings();
+        }
+        if ui.button("Export…").clicked() {
+            if let Some(path) = rfd::FileDialog::new().save_file() {
+                if let Err(e) = self.export_keymap_to(&path) {
+                    self.keymap_import_error = Some(e.to_string());
+                }
+            }
+        }
+        if ui.button("Import…").clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                match self.import_keymap_from(&path) {
+                    Ok(report) => {
+                        self.keymap_import_error = None;
+                        if !report.skipped_unknown_ids.is_empty() {
+                            self.error = Some(format!(
+                                "Keymap import: unknown commands skipped: {}",
+                                report.skipped_unknown_ids.join(", ")
+                            ));
+                        }
+                        self.flush_user_settings();
+                    }
+                    Err(e) => self.keymap_import_error = Some(e),
+                }
+            }
+        }
+        if let Some(err) = &self.keymap_import_error {
+            ui.colored_label(danger, err);
+        }
+        if ui.button("Close").clicked() {
+            self.show_settings_window = false;
         }
     }
 
@@ -4769,8 +4916,8 @@ impl IdeApp {
     /// Project tool window (the slim tree) -- the tree itself is skipped
     /// entirely, not just hidden, when `show_project_tool_window` is
     /// `false` (the same `if !self.show_x { return; }` shape
-    /// `render_language_settings_window` already uses for a window,
-    /// applied here to a permanent panel).
+    /// `render_settings_window` already uses for a window, applied here to
+    /// a permanent panel).
     fn render_project_rail(&mut self, ui: &mut egui::Ui) {
         let open = self.is_tool_window_open(ToolWindow::Project);
         let showing_run = self.is_tool_window_open(ToolWindow::Bottom)
@@ -5242,8 +5389,7 @@ impl eframe::App for IdeApp {
         if !self.zen_mode {
             self.render_top_bar(ui);
         }
-        self.render_language_settings_window(&ctx);
-        self.render_keymap_settings_window(&ctx);
+        self.render_settings_window(&ctx);
 
         if self.project.is_none() {
             egui::CentralPanel::default().show(ui, |ui| self.render_welcome(ui));
