@@ -130,9 +130,41 @@ impl AgentPanel {
     /// `app/render.rs` already has a real diff-rendering function,
     /// `render_diff(ui, tokens, diffs: &[FileDiff])`, used for the
     /// refactor-preview/workspace-edit popups; the approval popup reuses
-    /// it directly instead of TUI's plain-text `diff_to_lines`).
+    /// it directly via `std::slice::from_ref`, the exact call convention
+    /// every existing `render_diff` call site already uses -- instead of
+    /// TUI's plain-text `diff_to_lines`).
+    ///
+    /// **Security-critical, not a mechanical detail**: unlike TUI's own
+    /// `pending_approval_preview` (`crates/tui/src/agent_panel.rs`,
+    /// already merged), which reads the "old" file content via a raw
+    /// `self.root.join(path)` + `std::fs::read_to_string` with **no path
+    /// validation**, this method's `EditFile` branch MUST validate `path`
+    /// via `ide_dap::path::validate_path(&self.root, path)` -- the same
+    /// check `ToolExecutor::execute` itself already applies -- before
+    /// ever touching disk. A path that fails validation returns
+    /// `AgentApprovalPreview::Text("path escapes the project root")`,
+    /// never a read.
+    ///
+    /// Why this matters and isn't hypothetical: `AgentTool::EditFile`'s
+    /// `path` is model-supplied and can be steered by indirect prompt
+    /// injection (T56 §4's own named threat model -- adversarial content
+    /// in a file/search-result/Docker log the agent already read). In
+    /// `Approve` mode, `AwaitingApproval` fires and this method runs
+    /// automatically the moment the popup renders, *before* a human
+    /// decides anything -- an unvalidated read at that point discloses
+    /// arbitrary local file content (e.g. `path:
+    /// "../../../../etc/passwd"`) into the UI with zero user action
+    /// beyond the popup appearing. TUI's own `hacker` pass
+    /// (`docs/security-findings/tui-local-agent-2026-09-08.md`) never
+    /// actually exercised this specific function despite `agent_panel.rs`
+    /// being nominally in its stated scope -- this is a real, present-day
+    /// gap in the already-shipped TUI code, independent of this port,
+    /// flagged here (`rev` finding 1) so the GUI does not inherit it
+    /// silently; the TUI original needs the identical fix as a separate
+    /// follow-up, not covered by this doc's own `rust-ui-dev` role.
     /// `RunShellCommand`/`DebugControl`/everything else: same one-line
-    /// `describe_tool` string TUI already produces.
+    /// `describe_tool` string TUI already produces (pure formatting, no
+    /// filesystem access, nothing to validate).
     pub fn pending_approval_preview(&self) -> AgentApprovalPreview;
 
     pub fn poll(&mut self) -> Option<DebugAction>;
@@ -141,15 +173,19 @@ impl AgentPanel {
 /// `EditFile`'s preview needs a real `FileDiff` for `render_diff`;
 /// everything else is one descriptive line -- both cases the same popup
 /// renders, so this replaces TUI's `Vec<String>` with an enum rather than
-/// stringifying the diff too.
+/// stringifying the diff too. Unboxed (`FileDiff` is an ordinary,
+/// not-especially-large struct, and every existing `render_diff` call
+/// site already passes `&FileDiff`/`std::slice::from_ref` unboxed -- a
+/// `Box` here would only fight that convention for no documented reason).
 pub enum AgentApprovalPreview {
-    Diff(Box<ide_core::FileDiff>),
+    Diff(ide_core::FileDiff),
     Text(String),
     /// `EditFile` targeting a path `ide_core::diff_text` returns no
-    /// textual diff for (e.g. binary content) -- same fallback TUI's
-    /// `"EditFile {path} (no textual diff)"` line covers, kept as its own
-    /// variant here instead of collapsing into `Text` so `render_diff`
-    /// is never handed a diff-shaped `Text` string to mis-render.
+    /// textual diff for (e.g. binary content), **or** a path that fails
+    /// `validate_path` (see `pending_approval_preview`'s doc comment
+    /// above) -- both are "no diff to show," represented as text rather
+    /// than collapsed into `Text` so `render_diff` is never handed a
+    /// diff-shaped `Text` string to mis-render.
     NoDiff(String),
 }
 ```
@@ -250,11 +286,13 @@ variants).
   `render_discard_confirm_popup`/`render_branches_popup`/
   `render_worktrees_popup` already sit in (`app/render.rs`, ~line 5134):
   early-returns if `self.agent.pending_approval` is `None`; otherwise an
-  `egui::Window::new("Approve agent action?")` showing
+  `egui::Modal::new(...)` (see §4 — deliberately `Modal`, not `Window`,
+  the one new widget this feature introduces to the crate) showing
   `pending_approval_preview()`'s content (`AgentApprovalPreview::Diff` via
-  the existing `Self::render_diff(ui, tokens, &[*diff])`; `Text`/`NoDiff`
-  via `ui.label`) with `Approve`/`Deny` buttons calling
-  `self.agent.approve_pending()`/`self.agent.deny_pending()`.
+  the existing `Self::render_diff(ui, tokens, std::slice::from_ref(diff))`
+  — the exact call convention every other `render_diff` site already
+  uses; `Text`/`NoDiff` via `ui.label`) with `Approve`/`Deny` buttons
+  calling `self.agent.approve_pending()`/`self.agent.deny_pending()`.
 - `self.poll_agent()` (§2.2) added to the same unconditional per-frame
   poll block `self.ai.poll()`/`self.poll_fim()` sit in — not gated on the
   Agent tab being visible, same rationale G9 already established for
@@ -317,16 +355,29 @@ the same named, accepted residual risk in `Auto` mode. This doc adds
 nothing to that list and removes nothing from it — `ide-agent` is
 consumed as a sealed unit.
 
-One GUI-specific addition: **the approval popup must render before any
-other input in the frame reaches the agent panel's own input field** —
-mirrors T56's TUI requirement that the approval popup "outrank every
-other check" for keyboard focus (`crates/tui/src/app.rs`'s `pending_
-approval.is_some()` early-return ahead of every other key-dispatch path).
-In `egui`, an `egui::Window` already captures pointer/keyboard focus while
-open by default, so this is enforced by the widget itself rather than a
-hand-written priority check — worth stating explicitly rather than
-assuming it's automatic, since `hacker`/`rev` should confirm this
-(§ Constraints for the review, not a runtime assertion this doc adds).
+One GUI-specific addition: **the approval popup must block input to
+everything else while open** — mirrors T56's TUI requirement that the
+approval popup "outrank every other check" for keyboard focus
+(`crates/tui/src/app.rs`'s `pending_approval.is_some()` early-return
+ahead of every other key-dispatch path). Verified this is **not** true of
+a plain `egui::Window` by default in this crate's egui version (0.36.1):
+`egui::Modal`'s own doc comment describes itself as "similar to `Window`
+but... with a backdrop that blocks input to the rest of the UI," implying
+(and confirmed by reading the type) that plain `Window` does not block
+anything — every existing confirm popup in this crate (`render_discard_
+confirm_popup`, `render_branches_popup`, etc.) already uses plain,
+non-modal `Window`, relying instead on each popup's own state machine
+(e.g. `pending_discard`) rather than true input-blocking. This feature
+uses `egui::Modal` instead (§2.4) — a widget this crate has never used
+before, introduced here deliberately: this is the one popup in the whole
+app gating irreversible, model-proposed subprocess execution and file
+mutation, a categorically higher stake than "discard my own edit," and is
+worth the one-off inconsistency with every other (non-modal) confirm
+dialog in this crate rather than relying purely on `AgentPanel::submit`'s
+existing `is_in_flight()` no-op guard as the only backstop. That guard
+does still hold regardless (a stray click reaching the agent's own Send
+button underneath would be a no-op even without `Modal`), so this is
+defense in depth, not the sole mechanism preventing a double-dispatch.
 
 `hacker` pass mandatory, same reasoning as T56 §4: this is the first GUI
 feature where a model's own output can directly cause subprocess execution
@@ -369,4 +420,48 @@ view instead of TUI's plain-text `@@ -n +n @@`/`+`/`-` lines.
 
 ## Revision notes
 
-None yet — first draft, not yet reviewed.
+`rev` DOCUMENTATION REVIEW (round 1) found two security findings and one
+quality finding; all three fixed in place above:
+
+1. **[security: Medium] §2.1** — as originally drafted, `pending_approval_
+   preview`'s `EditFile` branch didn't specify how the "old" file content
+   for the diff was read, which would have led the implementing role to
+   copy TUI's own `pending_approval_preview` verbatim — and that function
+   (`crates/tui/src/agent_panel.rs`, already merged) reads via a raw
+   `self.root.join(path)` + `std::fs::read_to_string` with **no path
+   validation**, a gap T56's own `hacker` pass never actually exercised
+   despite `agent_panel.rs` being nominally in its scope. Since
+   `EditFile`'s `path` is model-supplied and can be steered by indirect
+   prompt injection (T56 §4's own named threat model), an unvalidated
+   read here discloses arbitrary local file content into the UI
+   automatically, before a human decides anything, in `Approve` mode.
+   Fixed: `pending_approval_preview` now must validate `path` via
+   `ide_dap::path::validate_path(&self.root, path)` before any read,
+   falling back to `AgentApprovalPreview::Text("path escapes the project
+   root")` on failure. Flagged separately (not part of this doc's own
+   scope) that the TUI original has the identical live gap and needs the
+   same fix as its own follow-up.
+2. **[security: Low] §4** — the original text claimed "an `egui::Window`
+   already captures pointer/keyboard focus while open by default," which
+   is factually wrong for this crate's egui 0.36.1 (`egui::Modal`'s own
+   doc comment implies plain `Window` does not block anything, and this
+   crate has never used `Modal` anywhere). Fixed: §4 now states this
+   correctly and §2.4's approval popup uses `egui::Modal` instead of
+   `Window` — a deliberate, named exception to this crate's otherwise
+   universal non-modal-popup convention, justified by this being the one
+   popup gating irreversible subprocess execution/file mutation.
+3. **[quality] §2.1** — `AgentApprovalPreview::Diff(Box<ide_core::
+   FileDiff>)`'s `Box` was unexplained and didn't actually compose with
+   the doc's own `Self::render_diff(ui, tokens, &[*diff])` snippet, which
+   doesn't type-check against a boxed value the way every real
+   `render_diff` call site (`std::slice::from_ref(diff: &FileDiff)`,
+   unboxed) does. Fixed: dropped the `Box`, cited `std::slice::from_ref`
+   explicitly.
+
+**[controversial, resolved]** Introducing `egui::Modal` for exactly one
+popup is a real, visible interaction inconsistency with every other
+confirm dialog in this crate (all non-modal). Resolved in this pass by
+naming the asymmetry explicitly in §4 rather than leaving it an unstated
+implementation detail — the justification (this is the one popup gating
+irreversible, model-proposed actions) stands on its own, not something
+requiring a separate user decision.
