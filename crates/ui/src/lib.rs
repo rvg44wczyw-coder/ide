@@ -4,6 +4,7 @@
 //! for its default (no-flag) GUI path, symmetric with how it calls
 //! `ide_tui::main` for `--tui` (`docs/features/unified-binary.md`).
 
+mod agent_panel;
 mod ai_panel;
 mod app;
 mod cargo_panel;
