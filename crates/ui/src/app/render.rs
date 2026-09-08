@@ -395,6 +395,11 @@ impl IdeApp {
         } else if escape && self.show_go_to_line {
             self.show_go_to_line = false;
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        } else if escape && self.show_settings_window {
+            // `docs/features/settings-window.md` §3.3: Escape closes the
+            // Settings window, same as its titlebar close button.
+            self.show_settings_window = false;
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         } else if escape && self.file_structure_owns_escape() {
             self.close_file_structure();
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
